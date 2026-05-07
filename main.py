@@ -1,301 +1,223 @@
+from telethon import TelegramClient, events
+from telethon.tl.types import PeerChannel
 import os
 import re
-from dotenv import load_dotenv
-from telethon import TelegramClient, events
 
-load_dotenv()
+# =========================
+# CONFIGURAÇÕES
+# =========================
 
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
-BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-TARGET_CHANNEL = os.getenv("TARGET_CHANNEL")
+# SESSÃO REAL DA SUA CONTA TELEGRAM
+SESSION_NAME = "corner_sessao"
+
+# CANAL DESTINO
+CANAL_DESTINO = "@CoutipsIPS"
+
+# =========================
+# CLIENT TELEGRAM
+# =========================
 
 client = TelegramClient(
-    "coutips_ips_session",
+    SESSION_NAME,
     API_ID,
     API_HASH
-).start(bot_token=BOT_TOKEN)
+)
 
-
-# =========================
-# AUXILIARES
-# =========================
-
-def extract_value(pattern, text, default=0):
-
-    match = re.search(pattern, text, re.MULTILINE)
-
-    if match:
-        try:
-            return float(match.group(1).replace(",", "."))
-        except:
-            return default
-
-    return default
-
-
-def contains(text, word):
-    return word.lower() in text.lower()
-
-
-def extract_match_name(text):
-
-    match = re.search(
-        r"Jogo:\s*\*?(.*?)\*?(?:🏆|Competição:)",
-        text,
-        re.IGNORECASE | re.DOTALL
-    )
-
-    if match:
-        return match.group(1).strip()
-
-    return "Jogo"
-
-
-def extract_bet365_link(text):
-
-    links = re.findall(r"https://[^\s]+", text)
-
-    for link in links:
-        if "bet365" in link.lower():
-            return link
-
-    return ""
-
-
-def extract_cornerpro_link(text):
-
-    links = re.findall(r"https://[^\s]+", text)
-
-    for link in links:
-        if "cornerprobet" in link.lower():
-            return link
-
-    return ""
-
+print("🚀 COUTIPS IPS ONLINE - USERBOT")
+print(f"📤 Canal destino: {CANAL_DESTINO}")
 
 # =========================
-# SCORE HT
+# FUNÇÃO SCORE HT
 # =========================
 
-def calculate_ht_score(text):
+def analisar_ht(msg):
 
-    score = 0
+    try:
 
-    ult5 = extract_value(r"Ultimos 5':\s*(\d+)", text)
-    ult10 = extract_value(r"Ultimos 10':\s*(\d+)", text)
+        tempo_match = re.search(r"Tempo:\s*(\d+)", msg)
+        if not tempo_match:
+            return None
 
-    tempo = extract_value(r"Tempo:\s*(\d+)", text)
+        tempo = int(tempo_match.group(1))
 
-    if ult5 >= 5:
-        score += 22
+        if tempo < 25 or tempo > 45:
+            return None
 
-    if ult10 >= 8:
-        score += 28
+        ataques_10 = re.search(r"Ultimos 10':.*?(\d+).*?(\d+)", msg)
 
-    if 22 <= tempo <= 35:
-        score += 15
+        if not ataques_10:
+            return None
 
-    if contains(text, "0 x 0"):
-        score += 15
+        casa10 = int(ataques_10.group(1))
+        fora10 = int(ataques_10.group(2))
 
-    elif contains(text, "0 x 1"):
-        score += 12
+        score = max(casa10, fora10) * 7
 
-    elif contains(text, "1 x 1"):
-        score += 10
+        if score < 70:
+            print(f"[HT] BLOQUEADO ({score}%)")
+            return None
 
-    elif contains(text, "2 x 0"):
-        score -= 12
+        jogo = re.search(r"Jogo:\s*(.+)", msg)
+        resultado = re.search(r"Resultado:\s*(.+)", msg)
 
-    elif contains(text, "3 x 0"):
-        score -= 25
+        jogo = jogo.group(1) if jogo else "Jogo"
+        resultado = resultado.group(1) if resultado else "0x0"
 
-    if contains(text, "Último golo: 22"):
-        score -= 20
+        texto = f"""
+📊 COUTIPS IPS HT
 
-    if contains(text, "Último golo: 23"):
-        score -= 20
+🏟 {jogo}
 
-    if contains(text, "Último golo: 24"):
-        score -= 20
+⏱ Tempo: {tempo}'
+⚽ Placar: {resultado}
 
-    if contains(text, "Último golo: 25"):
-        score -= 18
+🎯 Chance de GOL: {score}%
 
-    if contains(text, "Último golo: 26"):
-        score -= 15
+✅ ENTRADA HT
 
-    return max(0, min(score, 100))
+📌 Mercado:
+Over HT
 
-
-# =========================
-# SCORE FT
-# =========================
-
-def calculate_ft_score(text):
-
-    score = 0
-
-    ult5 = extract_value(r"Ultimos 5':\s*(\d+)", text)
-    ult10 = extract_value(r"Ultimos 10':\s*(\d+)", text)
-
-    tempo = extract_value(r"Tempo:\s*(\d+)", text)
-
-    if ult5 >= 4:
-        score += 20
-
-    if ult10 >= 7:
-        score += 28
-
-    if 68 <= tempo <= 76:
-        score += 15
-
-    if contains(text, "1 x 1"):
-        score += 20
-
-    elif contains(text, "0 x 0"):
-        score += 20
-
-    elif contains(text, "2 x 1"):
-        score += 15
-
-    elif contains(text, "1 x 2"):
-        score += 15
-
-    elif contains(text, "2 x 0"):
-        score -= 18
-
-    elif contains(text, "3 x 0"):
-        score -= 35
-
-    elif contains(text, "4 x 1"):
-        score -= 40
-
-    if contains(text, "Último golo: 68"):
-        score -= 20
-
-    if contains(text, "Último golo: 69"):
-        score -= 25
-
-    if contains(text, "Último golo: 70"):
-        score -= 30
-
-    return max(0, min(score, 100))
-
-
-# =========================
-# MENSAGEM
-# =========================
-
-def build_message(game, score, mode, bet365_link, corner_link):
-
-    verdict = "❌ NÃO ENTRAR"
-
-    if score >= 85:
-        verdict = "✅ ENTRADA PREMIUM"
-
-    elif score >= 75:
-        verdict = "✅ ENTRADA FORTE"
-
-    elif score >= 68:
-        verdict = "⚠️ ENTRADA MODERADA"
-
-    return f"""
-📊 COUTIPS IPS {mode}
-
-🏟 {game}
-
-🎯 Chance COUTIPS: {score}%
-
-{verdict}
-
-🔗 Bet365:
-{bet365_link}
-
-📈 CornerPro:
-{corner_link}
-
-⚠️ Gestão:
-1% da banca.
+📤 Canal oficial:
+{CANAL_DESTINO}
 """
 
+        return texto
+
+    except Exception as e:
+        print(f"ERRO HT: {e}")
+        return None
 
 # =========================
-# EVENTOS
+# FUNÇÃO SCORE FT
+# =========================
+
+def analisar_ft(msg):
+
+    try:
+
+        tempo_match = re.search(r"Tempo:\s*(\d+)", msg)
+        if not tempo_match:
+            return None
+
+        tempo = int(tempo_match.group(1))
+
+        if tempo < 65 or tempo > 75:
+            return None
+
+        ultimo_gol = re.search(r"Último golo:\s*(\d+)", msg)
+
+        if ultimo_gol:
+
+            minuto_gol = int(ultimo_gol.group(1))
+
+            if minuto_gol >= 55:
+                print("[FT] BLOQUEADO GOL RECENTE")
+                return None
+
+        ataques_10 = re.search(r"Ultimos 10':.*?(\d+).*?(\d+)", msg)
+
+        if not ataques_10:
+            return None
+
+        casa10 = int(ataques_10.group(1))
+        fora10 = int(ataques_10.group(2))
+
+        score = max(casa10, fora10) * 8
+
+        if score < 80:
+            print(f"[FT] BLOQUEADO ({score}%)")
+            return None
+
+        jogo = re.search(r"Jogo:\s*(.+)", msg)
+        resultado = re.search(r"Resultado:\s*(.+)", msg)
+        competicao = re.search(r"Competição:\s*(.+)", msg)
+
+        jogo = jogo.group(1) if jogo else "Jogo"
+        resultado = resultado.group(1) if resultado else "0x0"
+        competicao = competicao.group(1) if competicao else "Liga"
+
+        texto = f"""
+📊 COUTIPS IPS FT
+
+🏟 {jogo}
+🏆 {competicao}
+
+⏱ Tempo: {tempo}'
+⚽ Placar: {resultado}
+
+🎯 Chance de GOL: {score}%
+
+✅ ENTRADA PREMIUM
+
+📌 Mercado:
+Over 1.5 FT
+
+📌 Odd mínima:
+1.75+
+
+⚠ Gestão:
+1% da banca
+
+🚨 APOSTE COM RESPONSABILIDADE
+"""
+
+        return texto
+
+    except Exception as e:
+        print(f"ERRO FT: {e}")
+        return None
+
+# =========================
+# EVENTO NOVA MENSAGEM
 # =========================
 
 @client.on(events.NewMessage)
 async def handler(event):
 
-    text = event.raw_text
+    try:
 
-    if "BOT IPS HT" in text.upper():
+        texto = event.raw_text
 
-        score = calculate_ht_score(text)
+        if "IPS PÓS 70 TESTE" in texto:
 
-        if score >= 68:
+            print("📥 ALERTA FT RECEBIDO")
 
-            game = extract_match_name(text)
+            resposta = analisar_ft(texto)
 
-            bet365_link = extract_bet365_link(text)
-            corner_link = extract_cornerpro_link(text)
+            if resposta:
 
-            message = build_message(
-                game,
-                score,
-                "HT",
-                bet365_link,
-                corner_link
-            )
+                await client.send_message(
+                    CANAL_DESTINO,
+                    resposta
+                )
 
-            await client.send_message(
-                TARGET_CHANNEL,
-                message
-            )
+                print("✅ FT ENVIADO")
 
-            print(f"[HT] ENVIADO -> {game} ({score}%)")
+        elif "BOT IPS HT TESTE" in texto:
 
-        else:
-            print(f"[HT] BLOQUEADO ({score}%)")
+            print("📥 ALERTA HT RECEBIDO")
 
+            resposta = analisar_ht(texto)
 
-    elif "PÓS 70" in text.upper() or "POS 70" in text.upper():
+            if resposta:
 
-        score = calculate_ft_score(text)
+                await client.send_message(
+                    CANAL_DESTINO,
+                    resposta
+                )
 
-        if score >= 68:
+                print("✅ HT ENVIADO")
 
-            game = extract_match_name(text)
-
-            bet365_link = extract_bet365_link(text)
-            corner_link = extract_cornerpro_link(text)
-
-            message = build_message(
-                game,
-                score,
-                "FT",
-                bet365_link,
-                corner_link
-            )
-
-            await client.send_message(
-                TARGET_CHANNEL,
-                message
-            )
-
-            print(f"[FT] ENVIADO -> {game} ({score}%)")
-
-        else:
-            print(f"[FT] BLOQUEADO ({score}%)")
-
+    except Exception as e:
+        print(f"ERRO GERAL: {e}")
 
 # =========================
-# START
+# INICIAR BOT
 # =========================
 
-print("🚀 COUTIPS IPS ONLINE...")
-print(f"📤 Canal: {TARGET_CHANNEL}")
-
+client.start()
 client.run_until_disconnected()
