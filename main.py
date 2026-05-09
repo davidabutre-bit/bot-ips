@@ -413,7 +413,7 @@ def montar_mensagem(jogo, estrategia, score, metricas):
 COUTIPS — leitura ao vivo com pressão, contexto e disciplina."""
 
 
-@client.on(events.NewMessage(chats="CornerProBot"))
+@client.on(events.NewMessage)
 async def handler(event):
     if event.out:
         return
