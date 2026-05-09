@@ -949,6 +949,15 @@ async def processar_evento(event, origem="nova"):
 
     texto = event.raw_text or ""
 
+    # =====================================================
+    # BLOQUEIO GOAT — IPS NÃO PROCESSA ALERTAS GOAT
+    # =====================================================
+    texto_upper = texto.upper()
+
+    if "GOAT_HT" in texto_upper or "GOAT_FT" in texto_upper or "GOAT_" in texto_upper:
+        log("🐐 GOAT ignorado pelo IPS.")
+        return
+
     log(f"📥 EVENTO RECEBIDO DO TELEGRAM | origem={origem}")
 
     if not texto.strip():
@@ -1045,6 +1054,7 @@ async def main():
     log(f"📡 Canal destino: {TARGET_CHANNEL}")
     log(f"⏳ Janela de decisão por jogo: {JANELA_DECISAO_SEGUNDOS}s")
     log("⚠️ Confirme no Railway que existe apenas 1 instância/replica ativa.")
+    log("🐐 Filtro GOAT ativo: IPS ignora GOAT_HT / GOAT_FT.")
 
     await client.start()
 
