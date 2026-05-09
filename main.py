@@ -18,22 +18,39 @@ API_ID = int(API_ID)
 
 client = TelegramClient("coutips_ips_session", API_ID, API_HASH)
 
+# =========================================================
+# NOVA ESTRUTURA OFICIAL COUTIPS
+# =========================================================
+# HT_PREMIUM   = antigo ARCE HT
+# HT_MODERADO  = antigo ColtHT / IPS HT
+# FT_PREMIUM   = antigo CHAMA 3.0
+# FT_MODERADO  = antigo Coltips Pós-70 / IPS FT
+# =========================================================
+
 CORTES = {
-    "IPS HT": 70,
-    "IPS FT": 71,
-    "CHAMA 3.0": 74,
-    "ARCE HT": 70,
+    "HT_PREMIUM": 75,
+    "HT_MODERADO": 73,
+    "FT_PREMIUM": 78,
+    "FT_MODERADO": 76,
 }
 
+BOTS_PREMIUM = ["HT_PREMIUM", "FT_PREMIUM"]
+BOTS_MODERADOS = ["HT_MODERADO", "FT_MODERADO"]
+
 PRIORIDADE = {
-    "ARCE HT": ["IPS HT"],
-    "CHAMA 3.0": ["IPS FT"],
+    "HT_PREMIUM": ["HT_MODERADO"],
+    "FT_PREMIUM": ["FT_MODERADO"],
 }
 
 COOLDOWN_SEGUNDOS = 600
 CACHE_MAX_SEGUNDOS = 3600
+
 ultimos_jogos = {}
 
+
+# =========================================================
+# FUNÇÕES BASE
+# =========================================================
 
 def normalizar(texto):
     return texto.replace("*", "").replace("_", "").replace("**", "").strip()
@@ -70,29 +87,49 @@ def extrair_link_bet365(texto):
     return ""
 
 
+# =========================================================
+# DETECÇÃO NOVA DOS BOTS
+# =========================================================
+
 def detectar_estrategia(texto):
     t = texto.upper()
 
-    if "ARCE" in t:
-        return "ARCE HT"
+    # Premium HT — antigo ARCE HT
+    if "HT_PREMIUM" in t or "ARCE" in t:
+        return "HT_PREMIUM"
 
-    if "CHAMA" in t:
-        return "CHAMA 3.0"
+    # Moderado HT — antigo ColtHT / IPS HT
+    if "HT_MODERADO" in t or "COLTHT" in t or "IPS HT" in t:
+        return "HT_MODERADO"
 
-    if "HT" in t or "1ºT" in t or "1T" in t or "INTERVALO" in t:
-        return "IPS HT"
+    # Premium FT — antigo CHAMA 3.0
+    if "FT_PREMIUM" in t or "CHAMA" in t:
+        return "FT_PREMIUM"
 
-    return "IPS FT"
+    # Moderado FT — antigo Coltips Pós-70 / IPS FT
+    if "FT_MODERADO" in t or "IPS FT" in t or "PÓS-70" in t or "POS-70" in t:
+        return "FT_MODERADO"
+
+    # Segurança: se o texto for claramente HT
+    if "1ºT" in t or "1T" in t or "INTERVALO" in t:
+        return "HT_MODERADO"
+
+    # Padrão final
+    return "FT_MODERADO"
 
 
 def mensagem_valida(texto):
     t = texto.upper()
+
     if "ALERTA ESTRATÉGIA" not in t and "ALERTA ESTRATEGIA" not in t:
         return False
+
     if "JOGO:" not in t:
         return False
+
     if "TEMPO:" not in t:
         return False
+
     return True
 
 
@@ -122,6 +159,25 @@ def extrair_resultado(texto):
     return f"{m.group(1)} x {m.group(2)}"
 
 
+def extrair_gols_placar(placar):
+    m = re.search(r"([0-9]+)\s*x\s*([0-9]+)", placar)
+    if not m:
+        return None, None
+    return int(m.group(1)), int(m.group(2))
+
+
+def mercado_dinamico(placar):
+    gols_casa, gols_fora = extrair_gols_placar(placar)
+
+    if gols_casa is None or gols_fora is None:
+        return "Over 0.5 Gol"
+
+    total = gols_casa + gols_fora
+    linha = total + 0.5
+
+    return f"Over {linha:.1f} Gol"
+
+
 def extrair_odds(texto):
     m = re.search(
         r"Odds.*?:\s*([0-9.]+)\s*/\s*([0-9.]+)\s*/\s*([0-9.]+)",
@@ -130,6 +186,7 @@ def extrair_odds(texto):
     )
     if not m:
         return 0, 0, 0
+
     try:
         return float(m.group(1)), float(m.group(2)), float(m.group(3))
     except Exception:
@@ -160,10 +217,15 @@ def extrair_metricas(texto):
         ultimo_gol = pegar_numero(r"Ultimo golo:\s*(\d+)", texto_limpo, 0)
     if ultimo_gol == 0:
         ultimo_gol = pegar_numero(r"Último gol:\s*(\d+)", texto_limpo, 0)
+    if ultimo_gol == 0:
+        ultimo_gol = pegar_numero(r"Ultimo gol:\s*(\d+)", texto_limpo, 0)
+
+    mercado = mercado_dinamico(placar)
 
     return {
         "tempo": tempo,
         "placar": placar,
+        "mercado": mercado,
         "ataques_perigosos": ataques_perigosos,
         "ataques": ataques,
         "cantos": cantos,
@@ -179,20 +241,26 @@ def extrair_metricas(texto):
     }
 
 
+# =========================================================
+# SCORE COUTIPS
+# =========================================================
+
 def favorito_score(metricas):
     odd_casa, _, odd_fora = metricas["odds"]
 
     bonus = 0
 
     if odd_casa and odd_casa <= 1.30:
-        bonus += 9
+        bonus += 8
     elif odd_casa and odd_casa <= 1.45:
-        bonus += 7
-    elif odd_casa and odd_casa <= 1.55:
-        bonus += 5
+        bonus += 6
+    elif odd_casa and odd_casa <= 1.60:
+        bonus += 4
 
-    if odd_fora and odd_fora <= 1.50:
-        bonus += 7
+    if odd_fora and odd_fora <= 1.45:
+        bonus += 6
+    elif odd_fora and odd_fora <= 1.60:
+        bonus += 4
 
     return bonus
 
@@ -202,28 +270,50 @@ def dominio_score(metricas):
     rb_casa, rb_fora = metricas["remates_baliza"]
     cantos_casa, cantos_fora = metricas["cantos"]
     posse_casa, posse_fora = metricas["posse"]
+    ataques_casa, ataques_fora = metricas["ataques"]
+
+    ap_total = ap_casa + ap_fora
+    rb_total = rb_casa + rb_fora
+    cantos_total = cantos_casa + cantos_fora
+    ataques_total = ataques_casa + ataques_fora
 
     score = 0
 
-    if ap_casa + ap_fora >= 20:
-        score += 5
+    if ap_total >= 18:
+        score += 4
+    if ap_total >= 25:
+        score += 4
+    if ap_total >= 35:
+        score += 4
+
     if abs(ap_casa - ap_fora) >= 8:
-        score += 7
+        score += 5
     if abs(ap_casa - ap_fora) >= 15:
         score += 5
 
-    if rb_casa + rb_fora >= 4:
-        score += 8
-    if abs(rb_casa - rb_fora) >= 3:
-        score += 6
+    if ataques_total >= 70:
+        score += 3
+    if ataques_total >= 90:
+        score += 3
 
-    if cantos_casa + cantos_fora >= 5:
+    if rb_total >= 3:
         score += 5
-    if abs(cantos_casa - cantos_fora) >= 3:
+    if rb_total >= 5:
+        score += 5
+
+    if abs(rb_casa - rb_fora) >= 3:
         score += 4
+
+    if cantos_total >= 5:
+        score += 4
+    if cantos_total >= 8:
+        score += 3
+
+    if abs(cantos_casa - cantos_fora) >= 3:
+        score += 3
 
     if abs(posse_casa - posse_fora) >= 12:
-        score += 4
+        score += 3
 
     return score
 
@@ -232,40 +322,58 @@ def momentum_score(metricas):
     u5_casa, u5_fora = metricas["ultimos5"]
     u10_casa, u10_fora = metricas["ultimos10"]
 
+    u5_total = u5_casa + u5_fora
+    u10_total = u10_casa + u10_fora
+
     score = 0
 
-    if u5_casa + u5_fora >= 4:
+    if u5_total >= 3:
+        score += 4
+    if u5_total >= 5:
+        score += 4
+
+    if u10_total >= 7:
         score += 5
-    if u10_casa + u10_fora >= 8:
-        score += 7
+    if u10_total >= 10:
+        score += 4
 
     if abs(u10_casa - u10_fora) >= 4:
-        score += 5
+        score += 4
+
+    if abs(u5_casa - u5_fora) >= 3:
+        score += 3
 
     return score
 
 
 def relogio_score(metricas, estrategia):
     tempo = metricas["tempo"]
-    score = 0
 
-    if estrategia in ["IPS HT", "ARCE HT"]:
-        if 22 <= tempo <= 35:
-            score += 8
-        elif 36 <= tempo <= 45:
-            score += 3
-        elif tempo < 18:
-            score -= 8
+    if estrategia in ["HT_PREMIUM", "HT_MODERADO"]:
+        if 25 <= tempo <= 35:
+            return 9
+        if 36 <= tempo <= 42:
+            return 5
+        if 18 <= tempo <= 24:
+            return 2
+        if tempo < 18:
+            return -10
+        return -4
 
-    else:
-        if 65 <= tempo <= 76:
-            score += 9
-        elif 77 <= tempo <= 82:
-            score += 3
-        elif tempo >= 83:
-            score -= 10
+    if estrategia in ["FT_PREMIUM", "FT_MODERADO"]:
+        if 68 <= tempo <= 76:
+            return 9
+        if 77 <= tempo <= 80:
+            return 4
+        if 81 <= tempo <= 83:
+            return -4
+        if tempo >= 84:
+            return -12
+        if tempo < 65:
+            return -6
+        return 2
 
-    return score
+    return 0
 
 
 def risco_gol_recente(metricas):
@@ -278,9 +386,9 @@ def risco_gol_recente(metricas):
     diferenca = tempo - ultimo_gol
 
     if diferenca <= 2:
-        return -12
+        return -18
     if diferenca <= 5:
-        return -6
+        return -9
 
     return 0
 
@@ -288,19 +396,28 @@ def risco_gol_recente(metricas):
 def fake_pressure_penalty(metricas):
     ap_total = sum(metricas["ataques_perigosos"])
     rb_total = sum(metricas["remates_baliza"])
+    remates_lado_total = sum(metricas["remates_lado"])
+    u5_total = sum(metricas["ultimos5"])
+    u10_total = sum(metricas["ultimos10"])
+
+    penalidade = 0
 
     if ap_total >= 25 and rb_total <= 1:
-        return -12
+        penalidade -= 10
 
-    if ap_total >= 18 and rb_total <= 0:
-        return -15
+    if ap_total >= 18 and rb_total == 0:
+        penalidade -= 12
 
-    return 0
+    if ap_total >= 25 and remates_lado_total <= 2 and rb_total <= 1:
+        penalidade -= 6
+
+    if u10_total <= 3 and u5_total <= 1:
+        penalidade -= 7
+
+    return penalidade
 
 
-def calcular_score(texto, estrategia):
-    metricas = extrair_metricas(texto)
-
+def score_por_tipo_bot(metricas, estrategia):
     score = 50
 
     score += dominio_score(metricas)
@@ -309,23 +426,73 @@ def calcular_score(texto, estrategia):
     score += risco_gol_recente(metricas)
     score += fake_pressure_penalty(metricas)
 
-    if estrategia == "IPS HT":
-        score += favorito_score(metricas) * 0.8
+    fav = favorito_score(metricas)
+
+    if estrategia == "HT_PREMIUM":
+        score += fav
+        score += 6
+
+    elif estrategia == "HT_MODERADO":
+        score += int(fav * 0.7)
         score += 3
 
-    elif estrategia == "IPS FT":
+    elif estrategia == "FT_PREMIUM":
+        score += int(fav * 0.6)
+        score += 6
+
+    elif estrategia == "FT_MODERADO":
+        score += int(fav * 0.4)
         score += 2
 
-    elif estrategia == "CHAMA 3.0":
-        score += favorito_score(metricas) * 0.7
-        score += 8
+    return score
 
-    elif estrategia == "ARCE HT":
-        score += favorito_score(metricas)
-        score += 8
 
-    return int(max(0, min(score, 95))), metricas
+def ajuste_confianca(metricas, estrategia, score):
+    rb_total = sum(metricas["remates_baliza"])
+    ap_total = sum(metricas["ataques_perigosos"])
+    u5_total = sum(metricas["ultimos5"])
+    u10_total = sum(metricas["ultimos10"])
 
+    # Reduz score inflado sem finalização
+    if score >= 88 and rb_total <= 1:
+        score -= 8
+
+    # FT precisa ser mais rígido porque o relógio pesa
+    if estrategia in ["FT_PREMIUM", "FT_MODERADO"]:
+        if metricas["tempo"] >= 81 and u5_total <= 2:
+            score -= 8
+        if rb_total == 0:
+            score -= 7
+
+    # Premium precisa de contexto mais limpo
+    if estrategia in ["HT_PREMIUM", "FT_PREMIUM"]:
+        if ap_total < 18:
+            score -= 5
+        if u10_total < 6:
+            score -= 5
+
+    # Moderado pode passar com volume, mas não com jogo morto
+    if estrategia in ["HT_MODERADO", "FT_MODERADO"]:
+        if u10_total <= 3:
+            score -= 6
+
+    return score
+
+
+def calcular_score(texto, estrategia):
+    metricas = extrair_metricas(texto)
+
+    score = score_por_tipo_bot(metricas, estrategia)
+    score = ajuste_confianca(metricas, estrategia, score)
+
+    score = int(max(0, min(score, 95)))
+
+    return score, metricas
+
+
+# =========================================================
+# ANTI-DUPLICIDADE / PRIORIDADE
+# =========================================================
 
 def limpar_cache():
     agora = time.time()
@@ -338,6 +505,13 @@ def verificar_prioridade(jogo, estrategia):
     limpar_cache()
     agora = time.time()
 
+    chave_atual = f"{jogo}_{estrategia}"
+
+    if chave_atual in ultimos_jogos:
+        if agora - ultimos_jogos[chave_atual] <= COOLDOWN_SEGUNDOS:
+            return False, "Bloqueado por duplicidade do mesmo bot"
+
+    # Se for moderado e já houve premium recente no mesmo jogo, bloqueia
     for bot_premium, bots_bloqueados in PRIORIDADE.items():
         if estrategia in bots_bloqueados:
             chave_premium = f"{jogo}_{bot_premium}"
@@ -345,48 +519,63 @@ def verificar_prioridade(jogo, estrategia):
                 if agora - ultimos_jogos[chave_premium] <= COOLDOWN_SEGUNDOS:
                     return False, f"Bloqueado por prioridade: {bot_premium}"
 
-    chave_atual = f"{jogo}_{estrategia}"
-
-    if chave_atual in ultimos_jogos:
-        if agora - ultimos_jogos[chave_atual] <= COOLDOWN_SEGUNDOS:
-            return False, "Bloqueado por duplicidade do mesmo bot"
-
+    # Se for premium, ele pode passar mesmo se moderado já apareceu antes.
+    # Isso preserva a prioridade do sinal mais forte.
     ultimos_jogos[chave_atual] = agora
 
     return True, "OK"
 
 
-def faixa_score(score, estrategia):
-    if estrategia == "CHAMA 3.0":
-        if score >= 92:
-            return "DIAMANTE / ELITE"
-        if score >= 85:
-            return "PREMIUM"
-        return "BOA"
+# =========================================================
+# CLASSIFICAÇÃO
+# =========================================================
 
-    if estrategia == "ARCE HT":
+def faixa_score(score, estrategia):
+    if estrategia == "HT_PREMIUM":
         if score >= 89:
             return "ELITE HT"
         if score >= 82:
             return "PREMIUM HT"
         return "BOA HT"
 
-    if estrategia == "IPS HT":
+    if estrategia == "HT_MODERADO":
         if score >= 88:
             return "ELITE HT"
         if score >= 81:
             return "PREMIUM HT"
         return "BOA HT"
 
-    if score >= 90:
-        return "ELITE FT"
-    if score >= 84:
-        return "PREMIUM FT"
-    return "BOA FT"
+    if estrategia == "FT_PREMIUM":
+        if score >= 92:
+            return "DIAMANTE / ELITE"
+        if score >= 85:
+            return "PREMIUM FT"
+        return "BOA FT"
+
+    if estrategia == "FT_MODERADO":
+        if score >= 90:
+            return "ELITE FT"
+        if score >= 84:
+            return "PREMIUM FT"
+        return "BOA FT"
+
+    return "BOA"
+
+
+def nome_publico_estrategia(estrategia):
+    nomes = {
+        "HT_PREMIUM": "HT PREMIUM",
+        "HT_MODERADO": "HT MODERADO",
+        "FT_PREMIUM": "FT PREMIUM",
+        "FT_MODERADO": "FT MODERADO",
+    }
+
+    return nomes.get(estrategia, estrategia)
 
 
 def montar_mensagem(jogo, estrategia, score, metricas):
     categoria = faixa_score(score, estrategia)
+    nome_estrategia = nome_publico_estrategia(estrategia)
 
     link_bet365 = ""
     if metricas.get("bet365"):
@@ -398,8 +587,8 @@ def montar_mensagem(jogo, estrategia, score, metricas):
 ⏱ Tempo: {metricas['tempo']}'
 📊 Placar: {metricas['placar']}
 
-🎯 Mercado: Over 0.5 Gol
-📌 Estratégia: {estrategia}
+🎯 Mercado: {metricas['mercado']}
+📌 Estratégia: {nome_estrategia}
 🔥 Chance COUTIPS de Gol: {score}%
 🏆 Classificação: {categoria}
 
@@ -412,6 +601,10 @@ def montar_mensagem(jogo, estrategia, score, metricas):
 
 COUTIPS — leitura ao vivo com pressão, contexto e disciplina."""
 
+
+# =========================================================
+# HANDLER PRINCIPAL
+# =========================================================
 
 @client.on(events.NewMessage)
 async def handler(event):
@@ -435,11 +628,14 @@ async def handler(event):
         jogo = extrair_jogo(texto)
 
         score, metricas = calcular_score(texto, estrategia)
-        corte = CORTES.get(estrategia, 71)
+        corte = CORTES.get(estrategia, 76)
 
         print(f"🎯 Estratégia detectada: {estrategia}")
         print(f"⚽ Jogo: {jogo}")
-        print(f"📊 Score calculado: {score}%")
+        print(f"⏱ Tempo: {metricas['tempo']}'")
+        print(f"📊 Placar: {metricas['placar']}")
+        print(f"🎯 Mercado calculado: {metricas['mercado']}")
+        print(f"🔥 Score calculado: {score}%")
         print(f"📌 Corte mínimo: {corte}%")
 
         permitido, motivo = verificar_prioridade(jogo, estrategia)
@@ -469,7 +665,7 @@ async def handler(event):
 
 
 print("🚀 COUTIPS ONLINE - SCORE CONTEXTUAL ATIVO")
-print("📊 Estratégias ativas: IPS FT | IPS HT | CHAMA 3.0 | ARCE HT")
+print("📊 Estratégias ativas: HT_PREMIUM | HT_MODERADO | FT_PREMIUM | FT_MODERADO")
 print(f"📡 Canal destino: {TARGET_CHANNEL}")
 
 client.start()
