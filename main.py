@@ -6,6 +6,7 @@ import re
 import time
 import asyncio
 import traceback
+import html
 
 load_dotenv()
 
@@ -25,13 +26,6 @@ CORTES = {
     "HT_MODERADO": 73,
     "FT_PREMIUM": 78,
     "FT_MODERADO": 76,
-}
-
-PRIORIDADE_BOT = {
-    "HT_PREMIUM": 4,
-    "FT_PREMIUM": 4,
-    "HT_MODERADO": 2,
-    "FT_MODERADO": 2,
 }
 
 COOLDOWN_SEGUNDOS = 600
@@ -107,6 +101,25 @@ def extrair_link_bet365(texto):
     if m:
         return m.group(0).strip()
     return ""
+
+
+def bloquear_categoria_base(texto):
+    t = texto.upper()
+
+    padroes_bloqueados = [
+        r"\bU19\b",
+        r"\bU20\b",
+        r"\bSUB[-\s]?19\b",
+        r"\bSUB[-\s]?20\b",
+        r"\bUNDER[-\s]?19\b",
+        r"\bUNDER[-\s]?20\b",
+    ]
+
+    for padrao in padroes_bloqueados:
+        if re.search(padrao, t):
+            return True
+
+    return False
 
 
 def limpar_memoria_interna():
@@ -700,7 +713,7 @@ def melhor_alerta(alertas):
     return sorted(
         alertas,
         key=lambda a: (
-            PRIORIDADE_BOT.get(a["estrategia"], 0),
+            1 if "PREMIUM" in a["estrategia"] else 0,
             a["score"],
             a["metricas"]["tempo"],
         ),
@@ -774,20 +787,30 @@ def montar_mensagem(jogo, estrategia, score, metricas):
     categoria = faixa_score(score, estrategia)
     nome_estrategia = nome_publico_estrategia(estrategia)
 
+    jogo_safe = html.escape(str(jogo))
+    placar_safe = html.escape(str(metricas["placar"]))
+    mercado_safe = html.escape(str(metricas["mercado"]))
+    categoria_safe = html.escape(str(categoria))
+
+    if "PREMIUM" in estrategia:
+        linha_estrategia = f"👑 <b>{html.escape(nome_estrategia)}</b> 👑"
+    else:
+        linha_estrategia = f"📌 Estratégia: {html.escape(nome_estrategia)}"
+
     link_bet365 = ""
     if metricas.get("bet365"):
-        link_bet365 = f"\n🔗 Bet365: {metricas['bet365']}"
+        link_bet365 = f"\n🔗 Bet365: {html.escape(metricas['bet365'])}"
 
     return f"""🚀 ENTRADA COUTIPS
 
-⚽ Jogo: {jogo}
+⚽ Jogo: {jogo_safe}
 ⏱ Tempo: {metricas['tempo']}'
-📊 Placar: {metricas['placar']}
+📊 Placar: {placar_safe}
 
-🎯 Mercado: {metricas['mercado']}
-📌 Estratégia: {nome_estrategia}
+🎯 Mercado: {mercado_safe}
+{linha_estrategia}
 🔥 Chance COUTIPS de Gol: {score}%
-🏆 Classificação: {categoria}
+🏆 Classificação: {categoria_safe}
 
 ✅ Leitura aprovada por pressão ofensiva contextual.
 📈 Critérios: intensidade, domínio, finalização, relógio e contexto.
@@ -817,7 +840,7 @@ async def trabalhador_envio():
                 alerta["metricas"],
             )
 
-            await client.send_message(TARGET_CHANNEL, mensagem)
+            await client.send_message(TARGET_CHANNEL, mensagem, parse_mode="html")
             marcar_enviado(alerta["chave_jogo"])
 
             log(
@@ -839,7 +862,7 @@ async def trabalhador_envio():
                     alerta["metricas"],
                 )
 
-                await client.send_message(TARGET_CHANNEL, mensagem)
+                await client.send_message(TARGET_CHANNEL, mensagem, parse_mode="html")
                 marcar_enviado(alerta["chave_jogo"])
 
                 log(
@@ -934,6 +957,10 @@ async def processar_evento(event, origem="nova"):
 
     if not mensagem_valida(texto):
         log("ℹ️ Mensagem ignorada: não parece alerta CornerPro.")
+        return
+
+    if bloquear_categoria_base(texto):
+        log("⛔ BLOQUEADO CATEGORIA BASE | Sub-19/Sub-20 não permitido")
         return
 
     try:
