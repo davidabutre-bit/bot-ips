@@ -200,6 +200,13 @@ def extrair_jogo(texto):
     return "Jogo não identificado"
 
 
+def extrair_competicao(texto):
+    m = re.search(r"Competição:\s*(.+)", texto, re.IGNORECASE)
+    if m:
+        return limpar_linha(m.group(1).split("\n")[0])
+    return ""
+
+
 def extrair_tempo(texto):
     return pegar_numero(r"Tempo:\s*(\d+)", texto, 0)
 
@@ -245,6 +252,57 @@ def extrair_odds(texto):
         return 0, 0, 0
 
 
+def extrair_ultimo_gol_lado(texto):
+    """
+    Lê formatos como:
+    Último golo: 55' Casa
+    Último golo: 55’ Fora
+    Ultimo gol: 55 Casa
+    """
+    t = texto.upper()
+
+    padroes = [
+        r"ÚLTIMO\s+GOLO:\s*\d+\s*['’]?\s*(CASA|FORA|HOME|AWAY)",
+        r"ULTIMO\s+GOLO:\s*\d+\s*['’]?\s*(CASA|FORA|HOME|AWAY)",
+        r"ÚLTIMO\s+GOL:\s*\d+\s*['’]?\s*(CASA|FORA|HOME|AWAY)",
+        r"ULTIMO\s+GOL:\s*\d+\s*['’]?\s*(CASA|FORA|HOME|AWAY)",
+    ]
+
+    for p in padroes:
+        m = re.search(p, t, re.IGNORECASE)
+        if m:
+            lado = m.group(1).upper()
+            if lado in ["CASA", "HOME"]:
+                return "CASA"
+            if lado in ["FORA", "AWAY"]:
+                return "FORA"
+
+    return "DESCONHECIDO"
+
+
+def extrair_ultimos_cantos_lados(texto):
+    """
+    Lê algo como:
+    Últimos cantos: 66' Fora,63' Fora
+    Retorna lista de tuplas: [(66, "FORA"), (63, "FORA")]
+    """
+    t = texto.upper()
+    m = re.search(r"ÚLTIMOS\s+CANTOS:\s*(.+)", t, re.IGNORECASE)
+    if not m:
+        m = re.search(r"ULTIMOS\s+CANTOS:\s*(.+)", t, re.IGNORECASE)
+    if not m:
+        return []
+
+    linha = m.group(1).split("\n")[0]
+    eventos = []
+
+    for minuto, lado in re.findall(r"(\d+)\s*['’]?\s*(CASA|FORA|HOME|AWAY)", linha):
+        lado_final = "CASA" if lado in ["CASA", "HOME"] else "FORA"
+        eventos.append((int(minuto), lado_final))
+
+    return eventos
+
+
 def extrair_metricas(texto):
     texto_limpo = normalizar(texto)
 
@@ -282,6 +340,7 @@ def extrair_metricas(texto):
     heatmap = pegar_par(r"heatmapFull:Casa=(\d+)\s*/\s*Fora=(\d+)", texto_limpo)
     xg = pegar_float_par(r"xg:Casa=([0-9.,]+)\s*/\s*Fora=([0-9.,]+)", texto_limpo)
     xgl = pegar_float_par(r"xgl:Casa=([0-9.,]+)\s*/\s*Fora=([0-9.,]+)", texto_limpo)
+    xgi = pegar_float_par(r"xgi:Casa=([0-9.,]+)\s*/\s*Fora=([0-9.,]+)", texto_limpo)
 
     mercado = mercado_dinamico(placar)
 
@@ -289,9 +348,11 @@ def extrair_metricas(texto):
         "tempo": tempo,
         "placar": placar,
         "mercado": mercado,
+        "competicao": extrair_competicao(texto_limpo),
         "ataques_perigosos": ataques_perigosos,
         "ataques": ataques,
         "cantos": cantos,
+        "ultimos_cantos_lados": extrair_ultimos_cantos_lados(texto_limpo),
         "posse": posse,
         "remates_baliza": remates_baliza,
         "remates_lado": remates_lado,
@@ -300,12 +361,188 @@ def extrair_metricas(texto):
         "ultimos5": ultimos5,
         "ultimos10": ultimos10,
         "ultimo_gol": ultimo_gol,
+        "ultimo_gol_lado": extrair_ultimo_gol_lado(texto_limpo),
         "chance_golo": chance_golo,
         "heatmap": heatmap,
         "xg": xg,
         "xgl": xgl,
+        "xgi": xgi,
         "bet365": extrair_link_bet365(texto_limpo),
     }
+
+
+# =========================================================
+# LIGAS
+# =========================================================
+
+def classificar_liga(competicao):
+    c = (competicao or "").lower()
+
+    ligas_premium = [
+        "netherlands", "eredivisie", "belgium", "belgian",
+        "germany 2", "2. bundesliga", "denmark", "danish",
+    ]
+
+    ligas_moderadas = [
+        "india", "indian", "china", "norway", "sweden",
+        "finland", "mls", "japan", "south africa",
+        "andorra", "germany",
+    ]
+
+    ligas_perigosas = [
+        "bolivia", "paraguay", "peru", "romania",
+        "greece", "turkey",
+    ]
+
+    for termo in ligas_perigosas:
+        if termo in c:
+            return "PERIGOSA"
+
+    for termo in ligas_premium:
+        if termo in c:
+            return "PREMIUM"
+
+    for termo in ligas_moderadas:
+        if termo in c:
+            return "MODERADA"
+
+    return "NEUTRA"
+
+
+def liga_score(metricas):
+    liga = classificar_liga(metricas.get("competicao", ""))
+
+    if liga == "PREMIUM":
+        return 4
+    if liga == "MODERADA":
+        return 0
+    if liga == "PERIGOSA":
+        return -7
+    return 0
+
+
+# =========================================================
+# LEITURA CONTEXTUAL
+# =========================================================
+
+def lado_favorito(metricas):
+    odd_casa, _, odd_fora = metricas["odds"]
+
+    if not odd_casa or not odd_fora:
+        return "DESCONHECIDO", 0
+
+    if odd_casa < odd_fora:
+        return "CASA", odd_casa
+
+    if odd_fora < odd_casa:
+        return "FORA", odd_fora
+
+    return "EQUILIBRADO", odd_casa
+
+
+def lado_zebra(metricas):
+    favorito, _ = lado_favorito(metricas)
+    if favorito == "CASA":
+        return "FORA"
+    if favorito == "FORA":
+        return "CASA"
+    return "DESCONHECIDO"
+
+
+def lado_dominante(metricas):
+    ap_casa, ap_fora = metricas["ataques_perigosos"]
+    u5_casa, u5_fora = metricas["ultimos5"]
+    u10_casa, u10_fora = metricas["ultimos10"]
+    rb_casa, rb_fora = metricas["remates_baliza"]
+    rl_casa, rl_fora = metricas["remates_lado"]
+    cantos_casa, cantos_fora = metricas["cantos"]
+    heat_casa, heat_fora = metricas.get("heatmap", (0, 0))
+    chance_casa, chance_fora = metricas.get("chance_golo", (0, 0))
+    xg_casa, xg_fora = metricas.get("xg", (0.0, 0.0))
+
+    casa = 0
+    fora = 0
+
+    casa += ap_casa * 1.2
+    fora += ap_fora * 1.2
+
+    casa += u5_casa * 2.0
+    fora += u5_fora * 2.0
+
+    casa += u10_casa * 1.4
+    fora += u10_fora * 1.4
+
+    casa += rb_casa * 3.5
+    fora += rb_fora * 3.5
+
+    casa += rl_casa * 1.2
+    fora += rl_fora * 1.2
+
+    casa += cantos_casa * 0.8
+    fora += cantos_fora * 0.8
+
+    casa += chance_casa * 1.2
+    fora += chance_fora * 1.2
+
+    casa += xg_casa * 6
+    fora += xg_fora * 6
+
+    if heat_casa > 0 or heat_fora > 0:
+        casa += heat_casa * 0.12
+        fora += heat_fora * 0.12
+
+    diferenca = casa - fora
+
+    if diferenca >= 8:
+        return "CASA", diferenca
+    if diferenca <= -8:
+        return "FORA", abs(diferenca)
+
+    return "EQUILIBRADO", abs(diferenca)
+
+
+def lado_sofrendo_pressao(metricas):
+    dominante, _ = lado_dominante(metricas)
+
+    if dominante == "CASA":
+        return "FORA"
+    if dominante == "FORA":
+        return "CASA"
+
+    return "DESCONHECIDO"
+
+
+def pressao_viva(metricas):
+    u5_total = sum(metricas["ultimos5"])
+    u10_total = sum(metricas["ultimos10"])
+    rb_total = sum(metricas["remates_baliza"])
+    rl_total = sum(metricas["remates_lado"])
+    ap_total = sum(metricas["ataques_perigosos"])
+    xg_total = sum(metricas.get("xg", (0.0, 0.0)))
+
+    if u5_total >= 5:
+        return True
+
+    if u10_total >= 9 and u5_total >= 3:
+        return True
+
+    if ap_total >= 30 and (rb_total >= 3 or rl_total >= 7 or xg_total >= 0.75):
+        return True
+
+    return False
+
+
+def lado_com_vermelho(metricas):
+    vermelho_casa, vermelho_fora = metricas.get("vermelhos", (0, 0))
+
+    if vermelho_casa > vermelho_fora:
+        return "CASA"
+    if vermelho_fora > vermelho_casa:
+        return "FORA"
+    if vermelho_casa > 0 and vermelho_fora > 0:
+        return "AMBOS"
+
+    return "NENHUM"
 
 
 # =========================================================
@@ -317,17 +554,27 @@ def favorito_score(metricas):
 
     bonus = 0
 
-    if odd_casa and odd_casa <= 1.30:
-        bonus += 8
-    elif odd_casa and odd_casa <= 1.45:
-        bonus += 6
-    elif odd_casa and odd_casa <= 1.60:
-        bonus += 4
+    if odd_casa:
+        if odd_casa <= 1.35:
+            bonus += 8
+        elif odd_casa <= 1.50:
+            bonus += 5
+        elif odd_casa <= 1.70:
+            bonus += 3
+        elif odd_casa <= 2.00:
+            bonus += 1
 
-    if odd_fora and odd_fora <= 1.45:
-        bonus += 6
-    elif odd_fora and odd_fora <= 1.60:
-        bonus += 4
+    if odd_fora:
+        if odd_fora <= 1.35:
+            bonus += 11
+        elif odd_fora <= 1.50:
+            bonus += 9
+        elif odd_fora <= 1.55:
+            bonus += 7
+        elif odd_fora <= 1.70:
+            bonus += 4
+        elif odd_fora <= 2.00:
+            bonus += 1
 
     return bonus
 
@@ -340,12 +587,14 @@ def dominio_score(metricas):
     heat_casa, heat_fora = metricas.get("heatmap", (0, 0))
     chance_casa, chance_fora = metricas.get("chance_golo", (0, 0))
     xg_casa, xg_fora = metricas.get("xg", (0.0, 0.0))
+    xgi_casa, xgi_fora = metricas.get("xgi", (0.0, 0.0))
 
     ap_total = ap_casa + ap_fora
     rb_total = rb_casa + rb_fora
     cantos_total = cantos_casa + cantos_fora
     ataques_total = ataques_casa + ataques_fora
     xg_total = xg_casa + xg_fora
+    xgi_total = xgi_casa + xgi_fora
 
     score = 0
 
@@ -372,7 +621,7 @@ def dominio_score(metricas):
         score += 4
 
     if abs(rb_casa - rb_fora) >= 3:
-        score += 4
+        score += 3
 
     if cantos_total >= 5:
         score += 3
@@ -393,6 +642,11 @@ def dominio_score(metricas):
     if xg_total >= 1.00:
         score += 3
 
+    if xgi_total >= 1.50:
+        score += 2
+    if xgi_total >= 2.30:
+        score += 2
+
     return score
 
 
@@ -409,11 +663,15 @@ def momentum_score(metricas):
         score += 3
     if u5_total >= 5:
         score += 3
+    if u5_total >= 8:
+        score += 2
 
     if u10_total >= 7:
         score += 4
     if u10_total >= 10:
         score += 3
+    if u10_total >= 14:
+        score += 2
 
     if abs(u10_casa - u10_fora) >= 4:
         score += 3
@@ -454,25 +712,123 @@ def relogio_score(metricas, estrategia):
     return 0
 
 
-def risco_gol_recente(metricas):
+def ajuste_vermelho_contextual(metricas):
+    liga = classificar_liga(metricas.get("competicao", ""))
+    vermelho = lado_com_vermelho(metricas)
+    dominante, forca_dom = lado_dominante(metricas)
+    favorito, _ = lado_favorito(metricas)
+    zebra = lado_zebra(metricas)
+    vivo = pressao_viva(metricas)
+
+    if vermelho in ["NENHUM", "AMBOS"] or dominante == "EQUILIBRADO":
+        return 0, "SEM_VERMELHO_RELEVANTE"
+
+    peso_liga = 1
+
+    if liga == "PREMIUM":
+        peso_liga = 1.25
+    elif liga == "MODERADA":
+        peso_liga = 1.0
+    elif liga == "PERIGOSA":
+        peso_liga = 0.55
+
+    # Vermelho no lado que está sofrendo pressão:
+    # a pressão do adversário ganha validade, pois existe superioridade numérica real.
+    if vermelho != dominante and vivo:
+        bonus = int(7 * peso_liga)
+
+        if dominante == zebra:
+            bonus += int(3 * peso_liga)
+
+        if vermelho == favorito:
+            bonus += int(2 * peso_liga)
+
+        return bonus, "VERMELHO_ABRIU_PRESSAO"
+
+    # Vermelho no lado que está pressionando:
+    # exige cautela, porque a pressão pode ser menos sustentável.
+    if vermelho == dominante:
+        return -6, "VERMELHO_NO_LADO_PRESSAO"
+
+    return 0, "SEM_AJUSTE_VERMELHO"
+
+
+def ajuste_gol_recente_contextual(metricas):
     tempo = metricas["tempo"]
     ultimo_gol = metricas["ultimo_gol"]
+    lado_gol = metricas.get("ultimo_gol_lado", "DESCONHECIDO")
 
     if ultimo_gol <= 0:
-        return 0
+        return 0, "SEM_GOL_RECENTE"
 
-    diferenca = tempo - ultimo_gol
+    minutos = tempo - ultimo_gol
 
-    if diferenca < 0:
-        return -10
+    if minutos < 0:
+        return -10, "GOL_INCONSISTENTE"
 
-    if diferenca <= 2:
-        return -18
+    dominante, forca_dom = lado_dominante(metricas)
+    pressionado = lado_sofrendo_pressao(metricas)
+    favorito, _ = lado_favorito(metricas)
+    zebra = lado_zebra(metricas)
+    vivo = pressao_viva(metricas)
 
-    if diferenca <= 5:
-        return -9
+    # Gol muito recente: precisa interpretar, não bloquear cegamente.
+    if minutos <= 2:
+        if lado_gol != "DESCONHECIDO":
+            if lado_gol == pressionado and dominante != "EQUILIBRADO" and vivo:
+                return 10, "GOL_TIME_PRESSIONADO_ABRIU_JOGO"
 
-    return 0
+            if lado_gol == zebra and dominante == favorito and vivo:
+                return 12, "GOL_ZEBRA_CONTRA_FLUXO"
+
+            if lado_gol == dominante:
+                return -16, "PRESSAO_PREMIADA_RECENTE"
+
+        return -8, "GOL_RECENTE_SEM_CONFIRMACAO"
+
+    # Gol até 5 minutos.
+    if minutos <= 5:
+        if lado_gol != "DESCONHECIDO":
+            if lado_gol == pressionado and dominante != "EQUILIBRADO" and vivo:
+                return 8, "GOL_TIME_PRESSIONADO_ABRIU_JOGO"
+
+            if lado_gol == zebra and dominante == favorito and vivo:
+                return 10, "GOL_ZEBRA_CONTRA_FLUXO"
+
+            if lado_gol == dominante and not vivo:
+                return -12, "PRESSAO_PREMIADA_MORREU"
+
+            if lado_gol == dominante and vivo:
+                return -3, "PRESSAO_PREMIADA_MAS_VIVA"
+
+        return -4, "GOL_RECENTE_CAUTELA"
+
+    # Gol entre 6 e 10 minutos.
+    if minutos <= 10:
+        if lado_gol != "DESCONHECIDO":
+            if lado_gol == pressionado and dominante != "EQUILIBRADO" and vivo:
+                return 5, "GOL_CONTRA_FLUXO_CONTEXTO_BOM"
+
+            if lado_gol == zebra and dominante == favorito and vivo:
+                return 7, "GOL_ZEBRA_ABRIU_JOGO"
+
+            if lado_gol == favorito and dominante != lado_gol and vivo:
+                return 3, "FAVORITO_MARCOU_MAS_OPONENTE_PRESSIONA"
+
+            if lado_gol == dominante and not vivo:
+                return -6, "GOL_MATOU_RITMO"
+
+        return 0, "GOL_ANTIGO_OK"
+
+    # Gol antigo: não trava se a pressão recente nasceu depois.
+    if minutos > 10:
+        if lado_gol != "DESCONHECIDO":
+            if dominante != lado_gol and vivo:
+                return 3, "PRESSAO_POS_GOL_VALIDADA"
+
+        return 0, "GOL_ANTIGO_OK"
+
+    return 0, "GOL_ANTIGO_OK"
 
 
 def fake_pressure_penalty(metricas):
@@ -482,6 +838,9 @@ def fake_pressure_penalty(metricas):
     u5_total = sum(metricas["ultimos5"])
     u10_total = sum(metricas["ultimos10"])
     xg_total = sum(metricas.get("xg", (0.0, 0.0)))
+    xgi_total = sum(metricas.get("xgi", (0.0, 0.0)))
+    vermelho = lado_com_vermelho(metricas)
+    dominante, _ = lado_dominante(metricas)
 
     penalidade = 0
 
@@ -495,10 +854,18 @@ def fake_pressure_penalty(metricas):
         penalidade -= 6
 
     if u10_total <= 3 and u5_total <= 1:
-        penalidade -= 7
+        penalidade -= 8
 
     if ap_total >= 25 and xg_total <= 0.20:
         penalidade -= 8
+
+    if ap_total >= 25 and xg_total <= 0.35 and xgi_total <= 0.60 and rb_total <= 1:
+        penalidade -= 6
+
+    # Se a pressão forte vem do adversário de um time com vermelho,
+    # reduzimos a punição de fake pressure porque existe causa real para a pressão.
+    if vermelho != "NENHUM" and dominante != "EQUILIBRADO" and vermelho != dominante and penalidade < 0:
+        penalidade = int(penalidade * 0.55)
 
     return penalidade
 
@@ -509,26 +876,39 @@ def score_por_tipo_bot(metricas, estrategia):
     score += dominio_score(metricas)
     score += momentum_score(metricas)
     score += relogio_score(metricas, estrategia)
-    score += risco_gol_recente(metricas)
     score += fake_pressure_penalty(metricas)
+    score += liga_score(metricas)
+
+    ajuste_gol, motivo_gol = ajuste_gol_recente_contextual(metricas)
+    score += ajuste_gol
+    metricas["motivo_gol_contextual"] = motivo_gol
+
+    ajuste_vermelho, motivo_vermelho = ajuste_vermelho_contextual(metricas)
+    score += ajuste_vermelho
+    metricas["motivo_vermelho_contextual"] = motivo_vermelho
+
+    metricas["lado_favorito"] = lado_favorito(metricas)[0]
+    metricas["lado_zebra"] = lado_zebra(metricas)
+    metricas["lado_dominante"] = lado_dominante(metricas)[0]
+    metricas["lado_vermelho"] = lado_com_vermelho(metricas)
 
     fav = favorito_score(metricas)
 
     if estrategia == "HT_PREMIUM":
         score += fav
-        score += 7
+        score += 6
 
     elif estrategia == "HT_MODERADO":
-        score += int(fav * 0.7)
-        score += 4
+        score += int(fav * 0.65)
+        score += 3
 
     elif estrategia == "FT_PREMIUM":
-        score += int(fav * 0.6)
-        score += 7
+        score += int(fav * 0.60)
+        score += 6
 
     elif estrategia == "FT_MODERADO":
-        score += int(fav * 0.4)
-        score += 4
+        score += int(fav * 0.40)
+        score += 3
 
     return score
 
@@ -537,13 +917,15 @@ def ajuste_confianca(metricas, estrategia, score):
     rb_total = sum(metricas["remates_baliza"])
     ap_total = sum(metricas["ataques_perigosos"])
     u10_total = sum(metricas["ultimos10"])
+    u5_total = sum(metricas["ultimos5"])
     xg_total = sum(metricas.get("xg", (0.0, 0.0)))
+    liga = classificar_liga(metricas.get("competicao", ""))
 
     if score >= 88 and rb_total <= 1:
         score -= 8
 
     if estrategia in ["FT_PREMIUM", "FT_MODERADO"]:
-        if metricas["tempo"] >= 81 and sum(metricas["ultimos5"]) <= 2:
+        if metricas["tempo"] >= 81 and u5_total <= 2:
             score -= 8
         if rb_total == 0:
             score -= 7
@@ -560,6 +942,9 @@ def ajuste_confianca(metricas, estrategia, score):
 
     if xg_total <= 0.15 and rb_total <= 1:
         score -= 7
+
+    if liga == "PERIGOSA" and score >= 86:
+        score -= 4
 
     return score
 
@@ -634,17 +1019,34 @@ def teto_contextual(metricas, estrategia, score):
         minutos_desde_gol = tempo - ultimo_gol
 
     forca_premium = calcular_forca_premium(metricas)
+    motivo_gol = metricas.get("motivo_gol_contextual", "")
+    motivo_vermelho = metricas.get("motivo_vermelho_contextual", "")
+    liga = classificar_liga(metricas.get("competicao", ""))
 
-    premium_real = forca_premium >= 5 and minutos_desde_gol > 3
+    premium_real = forca_premium >= 5 and minutos_desde_gol > 2
     massacre_forte = forca_premium >= 4
     jogo_bom = u10_total >= 8 or dif_ap >= 10 or rb_total >= 3 or xg_total >= 0.45
 
     if minutos_desde_gol < 0:
         score = min(score, 82)
+
     elif minutos_desde_gol <= 2:
-        score = min(score, 78)
+        if motivo_gol in ["GOL_ZEBRA_CONTRA_FLUXO", "GOL_TIME_PRESSIONADO_ABRIU_JOGO"]:
+            score = min(score, 90)
+        elif motivo_gol == "PRESSAO_PREMIADA_RECENTE":
+            score = min(score, 78)
+        else:
+            score = min(score, 82)
+
     elif minutos_desde_gol <= 5:
-        score = min(score, 84)
+        if motivo_gol in ["GOL_ZEBRA_CONTRA_FLUXO", "GOL_TIME_PRESSIONADO_ABRIU_JOGO"]:
+            score = min(score, 91)
+        elif motivo_gol in ["PRESSAO_PREMIADA_MORREU", "PRESSAO_PREMIADA_RECENTE"]:
+            score = min(score, 80)
+        elif motivo_gol == "PRESSAO_PREMIADA_MAS_VIVA":
+            score = min(score, 86)
+        else:
+            score = min(score, 84)
 
     if rb_total <= 1:
         score = min(score, 82)
@@ -652,9 +1054,23 @@ def teto_contextual(metricas, estrategia, score):
     if dif_ap <= 5 and dif_rb <= 1 and dif_cantos <= 1:
         score = min(score, 81)
 
+    if xg_total <= 0.25 and rb_total <= 1:
+        score = min(score, 80)
+
+    if liga == "PERIGOSA":
+        if not premium_real:
+            score = min(score, 82)
+        else:
+            score = min(score, 86)
+
+    # Vermelho em liga boa pode liberar um pouco o teto porque explica a pressão.
+    if motivo_vermelho == "VERMELHO_ABRIU_PRESSAO" and liga in ["PREMIUM", "MODERADA"]:
+        if estrategia in ["FT_PREMIUM", "FT_MODERADO"]:
+            score = min(score + 2, 90)
+
     if estrategia == "HT_MODERADO":
         if premium_real:
-            score = min(score, 87)
+            score = min(score, 86)
         elif jogo_bom:
             score = min(score, 84)
         else:
@@ -663,7 +1079,7 @@ def teto_contextual(metricas, estrategia, score):
     elif estrategia == "FT_MODERADO":
         if diferenca_placar >= 3:
             score = min(score, 82)
-        elif tempo >= 80:
+        elif tempo >= 80 and motivo_vermelho != "VERMELHO_ABRIU_PRESSAO":
             score = min(score, 81)
         elif premium_real:
             score = min(score, 86)
@@ -673,18 +1089,22 @@ def teto_contextual(metricas, estrategia, score):
             score = min(score, 79)
 
     elif estrategia == "HT_PREMIUM":
-        if premium_real:
-            score = min(score, 94)
-        elif massacre_forte:
+        if premium_real and motivo_gol in ["GOL_ZEBRA_CONTRA_FLUXO", "GOL_TIME_PRESSIONADO_ABRIU_JOGO"]:
+            score = min(score, 92)
+        elif premium_real:
             score = min(score, 90)
+        elif massacre_forte:
+            score = min(score, 87)
         else:
-            score = min(score, 86)
+            score = min(score, 84)
 
     elif estrategia == "FT_PREMIUM":
-        if premium_real and tempo <= 80 and diferenca_placar <= 2:
-            score = min(score, 94)
+        if premium_real and motivo_gol in ["GOL_ZEBRA_CONTRA_FLUXO", "GOL_TIME_PRESSIONADO_ABRIU_JOGO"] and tempo <= 80:
+            score = min(score, 92)
+        elif premium_real and tempo <= 80 and diferenca_placar <= 2:
+            score = min(score, 90)
         elif premium_real:
-            score = min(score, 89)
+            score = min(score, 88)
         elif jogo_bom:
             score = min(score, 86)
         else:
@@ -744,28 +1164,28 @@ def faixa_score(score, estrategia):
     if estrategia == "HT_PREMIUM":
         if score >= 90:
             return "ELITE HT"
-        if score >= 82:
+        if score >= 84:
             return "PREMIUM HT"
         return "BOA HT"
 
     if estrategia == "HT_MODERADO":
-        if score >= 86:
+        if score >= 84:
             return "MUITO FORTE HT"
-        if score >= 81:
+        if score >= 79:
             return "FORTE HT"
         return "BOA HT"
 
     if estrategia == "FT_PREMIUM":
-        if score >= 92:
-            return "DIAMANTE / ELITE"
-        if score >= 85:
+        if score >= 90:
+            return "ELITE FT"
+        if score >= 84:
             return "PREMIUM FT"
         return "BOA FT"
 
     if estrategia == "FT_MODERADO":
-        if score >= 86:
+        if score >= 84:
             return "MUITO FORTE FT"
-        if score >= 81:
+        if score >= 80:
             return "FORTE FT"
         return "BOA FT"
 
@@ -783,6 +1203,45 @@ def nome_publico_estrategia(estrategia):
     return nomes.get(estrategia, estrategia)
 
 
+def texto_liga_publico(metricas):
+    liga = classificar_liga(metricas.get("competicao", ""))
+
+    if liga == "PREMIUM":
+        return "🟢 Liga Premium"
+    if liga == "MODERADA":
+        return "🟡 Liga Moderada"
+    if liga == "PERIGOSA":
+        return "🔴 Liga Perigosa"
+    return "⚪ Liga Neutra"
+
+
+def texto_contexto_gol(metricas):
+    motivo = metricas.get("motivo_gol_contextual", "")
+    motivo_vermelho = metricas.get("motivo_vermelho_contextual", "")
+
+    textos = []
+
+    if motivo in ["GOL_ZEBRA_CONTRA_FLUXO", "GOL_TIME_PRESSIONADO_ABRIU_JOGO"]:
+        textos.append("🔥 Contexto extra: gol contra o fluxo aumentou a urgência ofensiva.")
+
+    elif motivo == "GOL_CONTRA_FLUXO_CONTEXTO_BOM":
+        textos.append("🔥 Contexto extra: time pressionado marcou, mas o jogo segue aberto.")
+
+    elif motivo == "PRESSAO_PREMIADA_MAS_VIVA":
+        textos.append("⚠️ Contexto: pressão já foi premiada, mas segue viva.")
+
+    elif motivo == "FAVORITO_MARCOU_MAS_OPONENTE_PRESSIONA":
+        textos.append("🔥 Contexto extra: gol anterior não matou o jogo; adversário segue pressionando.")
+
+    if motivo_vermelho == "VERMELHO_ABRIU_PRESSAO":
+        textos.append("🟥 Contexto extra: superioridade numérica reforça a pressão ofensiva.")
+
+    if not textos:
+        return ""
+
+    return "\n" + "\n".join(textos)
+
+
 def montar_mensagem(jogo, estrategia, score, metricas):
     categoria = faixa_score(score, estrategia)
     nome_estrategia = nome_publico_estrategia(estrategia)
@@ -791,17 +1250,24 @@ def montar_mensagem(jogo, estrategia, score, metricas):
     placar_safe = html.escape(str(metricas["placar"]))
     mercado_safe = html.escape(str(metricas["mercado"]))
     categoria_safe = html.escape(str(categoria))
+    liga_safe = html.escape(texto_liga_publico(metricas))
 
     if "PREMIUM" in estrategia:
-        linha_estrategia = f"👑 <b>{html.escape(nome_estrategia)}</b> 👑"
+        linha_titulo = "👑 ALERTA PREMIUM COUTIPS 👑"
+        linha_estrategia = f"🔥 <b>{html.escape(nome_estrategia)}</b>"
+        linha_leitura = "✅ Leitura premium por pressão convertível, aceleração e contexto vivo."
     else:
+        linha_titulo = "🚀 ENTRADA COUTIPS"
         linha_estrategia = f"📌 Estratégia: {html.escape(nome_estrategia)}"
+        linha_leitura = "✅ Leitura aprovada por pressão ofensiva contextual."
+
+    contexto_gol = texto_contexto_gol(metricas)
 
     link_bet365 = ""
     if metricas.get("bet365"):
         link_bet365 = f"\n🔗 Bet365: {html.escape(metricas['bet365'])}"
 
-    return f"""🚀 ENTRADA COUTIPS
+    return f"""{linha_titulo}
 
 ⚽ Jogo: {jogo_safe}
 ⏱ Tempo: {metricas['tempo']}'
@@ -809,15 +1275,16 @@ def montar_mensagem(jogo, estrategia, score, metricas):
 
 🎯 Mercado: {mercado_safe}
 {linha_estrategia}
+{liga_safe}
 🔥 Chance COUTIPS de Gol: {score}%
 🏆 Classificação: {categoria_safe}
 
-✅ Leitura aprovada por pressão ofensiva contextual.
-📈 Critérios: intensidade, domínio, finalização, relógio e contexto.
+{linha_leitura}
+📈 Critérios: pressão viva, domínio, finalização, relógio e contexto.{contexto_gol}
 
 📌 Entrar somente se a odd estiver acima de 1.60.
 💰 Gestão recomendada: 1% da banca.
-⛔ Não entrar se saiu gol nos últimos 2–3 minutos.{link_bet365}
+⚠️ Confirmar mercado e odd ao vivo antes da entrada.{link_bet365}
 
 COUTIPS — leitura ao vivo com pressão, contexto e disciplina."""
 
@@ -949,9 +1416,6 @@ async def processar_evento(event, origem="nova"):
 
     texto = event.raw_text or ""
 
-    # =====================================================
-    # BLOQUEIO GOAT — IPS NÃO PROCESSA ALERTAS GOAT
-    # =====================================================
     texto_upper = texto.upper()
 
     if "GOAT_HT" in texto_upper or "GOAT_FT" in texto_upper or "GOAT_" in texto_upper:
@@ -994,7 +1458,13 @@ async def processar_evento(event, origem="nova"):
         log(
             f"📊 PROCESSADO | {estrategia} | {score}% | "
             f"Corte {corte}% | {jogo} | {metricas['tempo']}' | "
-            f"{metricas['placar']} | {metricas['mercado']}"
+            f"{metricas['placar']} | {metricas['mercado']} | "
+            f"Liga={classificar_liga(metricas.get('competicao', ''))} | "
+            f"Fav={metricas.get('lado_favorito')} | Dom={metricas.get('lado_dominante')} | "
+            f"Gol={metricas.get('ultimo_gol')} {metricas.get('ultimo_gol_lado')} | "
+            f"GolCtx={metricas.get('motivo_gol_contextual', '')} | "
+            f"Vermelho={metricas.get('lado_vermelho')} | "
+            f"VermCtx={metricas.get('motivo_vermelho_contextual', '')}"
         )
 
         if score < corte:
@@ -1049,12 +1519,13 @@ async def handler_mensagem_editada(event):
 async def main():
     global tarefa_envio
 
-    log("🚀 COUTIPS ONLINE - SCORE CONTEXTUAL ATIVO")
+    log("🚀 COUTIPS ONLINE - SCORE CONTEXTUAL 2.1 ATIVO")
     log("📊 Estratégias ativas: HT_PREMIUM | HT_MODERADO | FT_PREMIUM | FT_MODERADO")
     log(f"📡 Canal destino: {TARGET_CHANNEL}")
     log(f"⏳ Janela de decisão por jogo: {JANELA_DECISAO_SEGUNDOS}s")
     log("⚠️ Confirme no Railway que existe apenas 1 instância/replica ativa.")
     log("🐐 Filtro GOAT ativo: IPS ignora GOAT_HT / GOAT_FT.")
+    log("🧠 Score 2.1: gol Casa/Fora, favorito/zebra, vermelho contextual, liga e pressão convertível.")
 
     await client.start()
 
