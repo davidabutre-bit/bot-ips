@@ -16,14 +16,10 @@ API_ID = os.getenv("API_ID")
 API_HASH = os.getenv("API_HASH")
 
 # Canal de gols
-# No Railway, use TARGET_CHANNEL_GOLS=@CoutipsIPS
- # Mantém compatibilidade com TARGET_CHANNEL antigo, se ainda existir.
-TARGET_CHANNEL_GOLS = os.getenv("TARGET_CHANNEL_GOLS", os.getenv("TARGET_CHANNEL", "@CoutipsIPS"))
+TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "@CoutipsIPS")
 
 # Canal de cantos / GOAT CORNERS
-# No Railway, use TARGET_CHANNEL_CANTOS=@Goat_Bot01
-# Mantém compatibilidade com TARGET_CHANNEL_CANTOS antigo, se ainda existir.
-TARGET_CHANNEL_CANTOS = os.getenv("TARGET_CHANNEL_CANTOS", os.getenv("CORNERS_CHANNEL", "@Goat_Bot01"))
+CORNERS_CHANNEL = os.getenv("CORNERS_CHANNEL", "@Goat_Bot01")
 
 if not API_ID or not API_HASH:
     raise RuntimeError("API_ID ou API_HASH não configurado.")
@@ -1744,7 +1740,7 @@ async def trabalhador_envio():
                     alerta["score_gol"],
                     alerta["metricas"],
                 )
-                destino = TARGET_CHANNEL_GOLS
+                destino = TARGET_CHANNEL
                 score_log = alerta["score_gol"]
 
             elif mercado == "CANTO":
@@ -1754,7 +1750,7 @@ async def trabalhador_envio():
                     alerta["score_canto"],
                     alerta["metricas"],
                 )
-                destino = TARGET_CHANNEL_CANTOS
+                destino = CORNERS_CHANNEL
                 score_log = alerta["score_canto"]
 
             else:
@@ -1783,10 +1779,10 @@ async def trabalhador_envio():
 
                 if mercado == "GOL":
                     mensagem = montar_mensagem_gol(alerta["jogo"], alerta["estrategia"], alerta["score_gol"], alerta["metricas"])
-                    destino = TARGET_CHANNEL_GOLS
+                    destino = TARGET_CHANNEL
                 else:
                     mensagem = montar_mensagem_canto(alerta["jogo"], alerta["estrategia"], alerta["score_canto"], alerta["metricas"])
-                    destino = TARGET_CHANNEL_CANTOS
+                    destino = CORNERS_CHANNEL
 
                 await client.send_message(destino, mensagem, parse_mode="html")
                 marcar_enviado(item["chave_envio"])
@@ -1999,8 +1995,8 @@ async def main():
 
     log("🚀 COUTIPS / GOAT ONLINE - SCORE CONTEXTUAL 3.0 ATIVO")
     log("📊 Estratégias ativas: BOT_HT | BOT_HT CONFIRMAÇÃO | BOT_FT | BOT_FT CONFIRMAÇÃO")
-    log(f"⚽ Canal gols: {TARGET_CHANNEL_GOLS}")
-    log(f"🚩 Canal cantos: {TARGET_CHANNEL_CANTOS}")
+    log(f"⚽ Canal gols: {TARGET_CHANNEL}")
+    log(f"🚩 Canal cantos: {CORNERS_CHANNEL}")
     log(f"🎯 Corte gol: {CORTE_GOL}% | Corte canto: {CORTE_CANTO}%")
     log(f"⏳ Janela de decisão por jogo: {JANELA_DECISAO_SEGUNDOS}s")
     log("⚠️ Confirme no Railway que existe apenas 1 instância/replica ativa.")
