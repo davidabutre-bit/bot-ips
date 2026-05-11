@@ -12,7 +12,8 @@ load_dotenv()
 
 API_ID = os.getenv("API_ID")
 API_HASH = os.getenv("API_HASH")
-TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "@CoutipsIPS")
+TARGET_CHANNEL_GOLS = os.getenv("TARGET_CHANNEL_GOLS", "@CoutipsIPS")
+TARGET_CHANNEL_CANTOS = os.getenv("TARGET_CHANNEL_CANTOS", "@Goat_Bot01")
 
 if not API_ID or not API_HASH:
     raise RuntimeError("API_ID ou API_HASH não configurado.")
