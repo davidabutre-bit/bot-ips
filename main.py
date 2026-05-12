@@ -23,14 +23,14 @@ if not API_ID or not API_HASH:
 API_ID = int(API_ID)
 client = TelegramClient("coutips_ips_session", API_ID, API_HASH)
 
-CORTE_GOL = int(os.getenv("CORTE_GOL", "75"))
-CORTE_CANTO = int(os.getenv("CORTE_CANTO", "75"))
+CORTE_GOL = int(os.getenv("CORTE_GOL", "85"))
+CORTE_CANTO = int(os.getenv("CORTE_CANTO", "85"))
 COOLDOWN_SEGUNDOS = int(os.getenv("COOLDOWN_SEGUNDOS", "600"))
 CACHE_MAX_SEGUNDOS = int(os.getenv("CACHE_MAX_SEGUNDOS", "3600"))
 JANELA_DECISAO_SEGUNDOS = float(os.getenv("JANELA_DECISAO_SEGUNDOS", "8"))
 INTERVALO_ENVIO_SEGUNDOS = float(os.getenv("INTERVALO_ENVIO_SEGUNDOS", "5"))
 CONFIRMACAO_DELTA_FORTE = int(os.getenv("CONFIRMACAO_DELTA_FORTE", "8"))
-CONFIRMACAO_SCORE_MINIMO = int(os.getenv("CONFIRMACAO_SCORE_MINIMO", "75"))
+CONFIRMACAO_SCORE_MINIMO = int(os.getenv("CONFIRMACAO_SCORE_MINIMO", "85"))
 WATCHDOG_SEGUNDOS = int(os.getenv("WATCHDOG_SEGUNDOS", "60"))
 
 ultimas_leituras_por_jogo = {}
@@ -256,7 +256,11 @@ def extrair_pressao_alfa(texto):
     if not m:
         m = re.search(r"Indice de Pressao:(.+)", sem, re.IGNORECASE | re.DOTALL)
     if not m:
-        return {"ip_pico_casa": 0.0, "ip_pico_fora": 0.0, "ip_consec_18_casa": 0, "ip_consec_18_fora": 0, "ip_consec_22_casa": 0, "ip_consec_22_fora": 0}
+        return {"ip_pico_casa": 0.0, "ip_pico_fora": 0.0,
+                "ip_consec_10_casa": 0, "ip_consec_10_fora": 0,
+                "ip_consec_15_casa": 0, "ip_consec_15_fora": 0,
+                "ip_consec_18_casa": 0, "ip_consec_18_fora": 0,
+                "ip_consec_22_casa": 0, "ip_consec_22_fora": 0}
     bloco = m.group(1).split("https://")[0]
     casa_vals, fora_vals = [], []
     for seg in bloco.split(";"):
@@ -281,6 +285,10 @@ def extrair_pressao_alfa(texto):
     return {
         "ip_pico_casa": max(casa_vals) if casa_vals else 0.0,
         "ip_pico_fora": max(fora_vals) if fora_vals else 0.0,
+        "ip_consec_10_casa": consec(casa_vals, 10),
+        "ip_consec_10_fora": consec(fora_vals, 10),
+        "ip_consec_15_casa": consec(casa_vals, 15),
+        "ip_consec_15_fora": consec(fora_vals, 15),
         "ip_consec_18_casa": consec(casa_vals, 18),
         "ip_consec_18_fora": consec(fora_vals, 18),
         "ip_consec_22_casa": consec(casa_vals, 22),
@@ -442,26 +450,51 @@ def favorito_score(metricas):
 
 
 def score_padrao_alfa(metricas, estrategia):
+    """Radar-base oficial ALFA/HERTA.
+
+    A partir desta versão, o score não tenta aprovar jogo "bonito".
+    Ele só libera nota alta quando existe pressão sustentada e convertível.
+
+    Regra operacional combinada:
+    - FT e HT: IP 15+ por 5 minutos consecutivos como trava-base para 85+.
+    - Picos 18/20/22 servem como bônus, não como substitutos de continuidade.
+    """
     p = metricas.get("pressao_alfa", {})
     ch_c, ch_f = metricas.get("chance_golo", (0, 0))
     ip_pico = max(p.get("ip_pico_casa", 0), p.get("ip_pico_fora", 0))
+    c15 = max(p.get("ip_consec_15_casa", 0), p.get("ip_consec_15_fora", 0))
+    c18 = max(p.get("ip_consec_18_casa", 0), p.get("ip_consec_18_fora", 0))
+    c22 = max(p.get("ip_consec_22_casa", 0), p.get("ip_consec_22_fora", 0))
     chance_max = max(ch_c, ch_f)
     dom, _ = lado_dominante(metricas)
     lado_chance = "CASA" if ch_c >= ch_f else "FORA"
     extra = 3 if dom == lado_chance and dom != "EQUILIBRADO" else 0
-    if eh_ft(estrategia):
-        c22 = max(p.get("ip_consec_22_casa", 0), p.get("ip_consec_22_fora", 0)); c18 = max(p.get("ip_consec_18_casa", 0), p.get("ip_consec_18_fora", 0))
-        if c22 >= 3 and chance_max >= 10: return 26 + extra, "ALFA_FT_FORTE"
-        if ip_pico >= 22 and chance_max >= 10: return 20 + extra, "ALFA_FT_QUASE_FORTE"
-        if c18 >= 3 and chance_max >= 8: return 15 + extra, "ALFA_FT_RESSALVA"
-        if ip_pico >= 18 and chance_max >= 8: return 10 + extra, "ALFA_FT_OBSERVACAO"
-    if eh_ht(estrategia):
-        c18 = max(p.get("ip_consec_18_casa", 0), p.get("ip_consec_18_fora", 0))
-        if c18 >= 3 and chance_max >= 6: return 26 + extra, "ALFA_HT_FORTE"
-        if ip_pico >= 18 and chance_max >= 6: return 20 + extra, "ALFA_HT_QUASE_FORTE"
-        if ip_pico >= 15 and chance_max >= 5: return 11 + extra, "ALFA_HT_RESSALVA"
-    return 0, "SEM_PADRAO_ALFA"
 
+    # Sem 15+ sustentado, o jogo pode até ser observado, mas não vira ALFA forte.
+    if c15 < 5:
+        if ip_pico >= 22 and chance_max >= 10:
+            return 8 + extra, "ALFA_OBSERVACAO_SEM_CONTINUIDADE"
+        return 0, "SEM_PADRAO_ALFA"
+
+    if eh_ft(estrategia):
+        if c22 >= 3 and chance_max >= 14:
+            return 30 + extra, "ALFA_FT_DIAMANTE"
+        if c18 >= 3 and chance_max >= 10:
+            return 26 + extra, "ALFA_FT_FORTE"
+        if chance_max >= 8:
+            return 20 + extra, "ALFA_FT_BASE"
+        return 12 + extra, "ALFA_FT_PRESSAO_SEM_CHANCE"
+
+    if eh_ht(estrategia):
+        if c22 >= 3 and chance_max >= 10:
+            return 30 + extra, "ALFA_HT_DIAMANTE"
+        if c18 >= 3 and chance_max >= 6:
+            return 26 + extra, "ALFA_HT_FORTE"
+        if chance_max >= 5:
+            return 18 + extra, "ALFA_HT_BASE"
+        return 10 + extra, "ALFA_HT_PRESSAO_SEM_CHANCE"
+
+    return 0, "SEM_PADRAO_ALFA"
 
 def dominio_score_gol(metricas):
     apc, apf = metricas["ataques_perigosos"]; rbc, rbf = metricas["remates_baliza"]; rlc, rlf = metricas["remates_lado"]; rdac, rdaf = metricas.get("remates_dentro_area", (0,0)); cc, cf = metricas["cantos"]; atc, atf = metricas["ataques"]; hc, hf = metricas.get("heatmap", (0,0)); chc, chf = metricas.get("chance_golo", (0,0)); xgc, xgf = metricas.get("xg", (0,0)); xic, xif = metricas.get("xgi", (0,0)); p = metricas.get("pressao_alfa", {})
@@ -558,7 +591,7 @@ def fake_pressure_penalty_gol(metricas):
     if ap >= 25 and xg <= .35 and xgi <= .60 and rb <= 1: pen -= 6
     if cant >= 4 and rb <= 1 and xg <= .35: pen -= 6
     if rda == 0 and rb <= 1 and ap >= 20: pen -= 5
-    if padrao in ["ALFA_FT_FORTE","ALFA_HT_FORTE","ALFA_FT_QUASE_FORTE","ALFA_HT_QUASE_FORTE"]: pen = int(pen*.55)
+    if padrao in ["ALFA_FT_DIAMANTE","ALFA_HT_DIAMANTE","ALFA_FT_FORTE","ALFA_HT_FORTE","ALFA_FT_BASE","ALFA_HT_BASE"]: pen = int(pen*.55)
     return pen
 
 
@@ -578,7 +611,7 @@ def score_delta_confirmacao(metricas, estrategia, chave_jogo):
 
 def ajuste_confianca_gol(metricas, estrategia, score):
     rb=sum(metricas["remates_baliza"]); rda=sum(metricas.get("remates_dentro_area",(0,0))); ap=sum(metricas["ataques_perigosos"]); u10=sum(metricas["ultimos10"]); u5=sum(metricas["ultimos5"]); xg=sum(metricas.get("xg",(0,0))); liga=classificar_liga(metricas.get("competicao","")); padrao=metricas.get("padrao_alfa","")
-    red=.55 if padrao in ["ALFA_FT_FORTE","ALFA_HT_FORTE","ALFA_FT_QUASE_FORTE","ALFA_HT_QUASE_FORTE"] else 1
+    red=.55 if padrao in ["ALFA_FT_DIAMANTE","ALFA_HT_DIAMANTE","ALFA_FT_FORTE","ALFA_HT_FORTE","ALFA_FT_BASE","ALFA_HT_BASE"] else 1
     if score >= 88 and rb <= 1: score -= int(10*red)
     if score >= 85 and rb <= 1 and rda <= 1: score -= int(7*red)
     if eh_ft(estrategia) and metricas["tempo"] >= 81 and u5 <= 2: score -= 8
@@ -599,9 +632,104 @@ def calcular_forca_premium_gol(metricas):
     return pts
 
 
+def modelo_herta_aprovado(metricas, estrategia):
+    """Trava de identidade: só permite 85+ quando o jogo parece Hertha/Hapoel/Betis.
+
+    O objetivo é eliminar pressão falsa, pressão antiga e domínio sem urgência.
+    """
+    p = metricas.get("pressao_alfa", {})
+    c15 = max(p.get("ip_consec_15_casa", 0), p.get("ip_consec_15_fora", 0))
+    c18 = max(p.get("ip_consec_18_casa", 0), p.get("ip_consec_18_fora", 0))
+    c22 = max(p.get("ip_consec_22_casa", 0), p.get("ip_consec_22_fora", 0))
+    ip_pico = max(p.get("ip_pico_casa", 0), p.get("ip_pico_fora", 0))
+
+    u5c, u5f = metricas.get("ultimos5", (0, 0))
+    u10c, u10f = metricas.get("ultimos10", (0, 0))
+    u5 = u5c + u5f
+    u10 = u10c + u10f
+    apc, apf = metricas.get("ataques_perigosos", (0, 0))
+    rbc, rbf = metricas.get("remates_baliza", (0, 0))
+    rlc, rlf = metricas.get("remates_lado", (0, 0))
+    rdac, rdaf = metricas.get("remates_dentro_area", (0, 0))
+    chc, chf = metricas.get("chance_golo", (0, 0))
+    cc, cf = metricas.get("cantos", (0, 0))
+    xgc, xgf = metricas.get("xg", (0.0, 0.0))
+    rb = rbc + rbf
+    rl = rlc + rlf
+    rda = rdac + rdaf
+    chance_max = max(chc, chf)
+    xg = xgc + xgf
+    dif_ap = abs(apc - apf)
+    dif_u5 = abs(u5c - u5f)
+    dif_u10 = abs(u10c - u10f)
+    cant = cc + cf
+    dom, _ = lado_dominante(metricas)
+    fav, _ = lado_favorito(metricas)
+    placar_casa, placar_fora = extrair_gols_placar(metricas.get("placar", ""))
+    empate_ou_apertado = True
+    if placar_casa is not None:
+        empate_ou_apertado = abs(placar_casa - placar_fora) <= 1
+
+    pressao_sustentada = c15 >= 5
+    pressao_alta = c18 >= 3 or c22 >= 2 or ip_pico >= 24
+    recente_vivo = (u5 >= 5 and u10 >= 8) or (eh_ht(estrategia) and u5 >= 4 and u10 >= 7)
+    direcional = dif_u5 >= 4 or dif_u10 >= 6 or dif_ap >= 12 or dom in ["CASA", "FORA"]
+    producao = rb >= 3 or chance_max >= 10 or rda >= 3 or rl >= 7 or xg >= 0.50 or cant >= 5
+    contexto = empate_ou_apertado or metricas.get("motivo_gol_contextual") in [
+        "GOL_ZEBRA_CONTRA_FLUXO", "GOL_TIME_PRESSIONADO_ABRIU_JOGO",
+        "GOL_CONTRA_FLUXO_CONTEXTO_BOM", "FAVORITO_MARCOU_MAS_OPONENTE_PRESSIONA"
+    ]
+
+    # CHAMA/FT precisa ser quase inevitável. HT/ARCE aceita um pouco mais de variância,
+    # mas ainda precisa de vida recente + produção mínima.
+    if eh_ft(estrategia):
+        return pressao_sustentada and recente_vivo and direcional and producao and contexto
+    if eh_ht(estrategia):
+        return pressao_sustentada and (recente_vivo or pressao_alta) and (direcional or producao) and producao
+    return False
+
+
+def aplicar_travas_herta(metricas, estrategia, score):
+    """Teto final anti-inflação.
+
+    Abaixo de 85 não envia. Para chegar a 85+, precisa passar no modelo Herta.
+    """
+    p = metricas.get("pressao_alfa", {})
+    c15 = max(p.get("ip_consec_15_casa", 0), p.get("ip_consec_15_fora", 0))
+    u5 = sum(metricas.get("ultimos5", (0, 0)))
+    u10 = sum(metricas.get("ultimos10", (0, 0)))
+    rb = sum(metricas.get("remates_baliza", (0, 0)))
+    rl = sum(metricas.get("remates_lado", (0, 0)))
+    rda = sum(metricas.get("remates_dentro_area", (0, 0)))
+    xg = sum(metricas.get("xg", (0.0, 0.0)))
+    chance_max = max(metricas.get("chance_golo", (0, 0)))
+    motivo = metricas.get("motivo_gol_contextual", "")
+
+    if not modelo_herta_aprovado(metricas, estrategia):
+        score = min(score, 84)
+
+    # Travas específicas contra jogo bonito, mas frio.
+    if c15 < 5:
+        score = min(score, 82)
+    if eh_ft(estrategia) and (u5 < 5 or u10 < 8):
+        score = min(score, 83)
+    if rb <= 1 and chance_max < 10 and xg < 0.45:
+        score = min(score, 82)
+    if rb == 0 and rda <= 1:
+        score = min(score, 78)
+    if motivo in ["PRESSAO_PREMIADA_RECENTE", "PRESSAO_PREMIADA_MORREU", "GOL_MATOU_RITMO"]:
+        score = min(score, 78)
+
+    # Diamante só para cenário fora da curva.
+    if score >= 92:
+        if not (modelo_herta_aprovado(metricas, estrategia) and (u5 >= 7 or chance_max >= 14 or rb >= 5 or xg >= 0.75)):
+            score = min(score, 91)
+
+    return score
+
 def teto_contextual_gol(metricas, estrategia, score):
     tempo=metricas["tempo"]; placar=metricas["placar"]; apc,apf=metricas["ataques_perigosos"]; rbc,rbf=metricas["remates_baliza"]; cc,cf=metricas["cantos"]; u10c,u10f=metricas["ultimos10"]; xgc,xgf=metricas.get("xg",(0,0)); rdac,rdaf=metricas.get("remates_dentro_area",(0,0)); rb=rbc+rbf; rda=rdac+rdaf; u10=u10c+u10f; xg=xgc+xgf; dif_ap=abs(apc-apf); dif_rb=abs(rbc-rbf); dif_c=abs(cc-cf); gc,gf=extrair_gols_placar(placar); dif_placar=abs(gc-gf) if gc is not None else 0; ug=metricas["ultimo_gol"]; minutos=tempo-ug if ug>0 else 999; forca=calcular_forca_premium_gol(metricas); motivo=metricas.get("motivo_gol_contextual",""); liga=classificar_liga(metricas.get("competicao","")); padrao=metricas.get("padrao_alfa",""); delta=metricas.get("motivo_delta_contextual","")
-    premium = forca >= 5 and minutos > 2; bom = u10 >= 8 or dif_ap >= 10 or rb >= 3 or xg >= .45 or rda >= 3; forte = padrao in ["ALFA_FT_FORTE","ALFA_HT_FORTE","ALFA_FT_QUASE_FORTE","ALFA_HT_QUASE_FORTE"]
+    premium = forca >= 5 and minutos > 2; bom = u10 >= 8 or dif_ap >= 10 or rb >= 3 or xg >= .45 or rda >= 3; forte = padrao in ["ALFA_FT_DIAMANTE","ALFA_HT_DIAMANTE","ALFA_FT_FORTE","ALFA_HT_FORTE","ALFA_FT_BASE","ALFA_HT_BASE"]
     if minutos < 0: score=min(score,75)
     elif minutos <= 2:
         if motivo in ["GOL_ZEBRA_CONTRA_FLUXO","GOL_TIME_PRESSIONADO_ABRIU_JOGO"]: score=min(score,92)
@@ -634,7 +762,9 @@ def score_gol(metricas, estrategia, chave_jogo):
     d,md=score_delta_confirmacao(metricas, estrategia, chave_jogo); score += d; metricas["motivo_delta_contextual"] = md
     metricas["lado_favorito"] = lado_favorito(metricas)[0]; metricas["lado_zebra"] = lado_zebra(metricas); metricas["lado_dominante"] = lado_dominante(metricas)[0]; metricas["lado_vermelho"] = lado_com_vermelho(metricas)
     score += int(favorito_score(metricas) * (.65 if eh_confirmacao(estrategia) else .75)) + (4 if eh_confirmacao(estrategia) else 5)
-    score = ajuste_confianca_gol(metricas, estrategia, score); score = teto_contextual_gol(metricas, estrategia, score)
+    score = ajuste_confianca_gol(metricas, estrategia, score)
+    score = teto_contextual_gol(metricas, estrategia, score)
+    score = aplicar_travas_herta(metricas, estrategia, score)
     if not tempo_operacional_valido(metricas, estrategia): score=min(score,72)
     return int(max(0,min(score,99))), metricas
 
@@ -727,7 +857,7 @@ def confirmacao_melhorou_forte(alerta):
     if delta_ctx == "CONFIRMACAO_MELHOROU" and max(score_gol, score_canto) >= CONFIRMACAO_SCORE_MINIMO:
         return True
 
-    if padrao in ["ALFA_FT_FORTE", "ALFA_HT_FORTE"] and max(score_gol, score_canto) >= 82:
+    if padrao in ["ALFA_FT_FORTE", "ALFA_HT_FORTE"] and max(score_gol, score_canto) >= 85:
         return True
 
     return False
@@ -751,16 +881,21 @@ def salvar_ultima_leitura(chave_jogo, alerta):
 
 
 def faixa_publica(score):
-    if score >= 98: return "👑 ENTRADA LENDÁRIA 👑"
-    if score >= 89: return "💎 ENTRADA DIAMANTE 💎"
-    if score >= 81: return "🔥 ENTRADA ELITE 🔥"
-    if score >= 75: return "🚨 ENTRADA FORTE 🚨"
-    return "⚠️ OBSERVAÇÃO"
-
+    if score >= 92:
+        return f"💎 ENTRADA DIAMANTE — {score}% 💎"
+    if score >= 85:
+        return f"🔥 ENTRADA ELITE — {score}% 🔥"
+    return "⚠️ OBSERVAÇÃO INTERNA"
 
 def nome_publico_bot(estrategia):
-    return {"ALFA_HT":"ALFA HT", "ALFA_HT_CONFIRMACAO":"ALFA HT CONFIRMAÇÃO", "ARCE_HT":"ALFA HT / ARCE", "ALFA_FT":"ALFA FT", "ALFA_FT_CONFIRMACAO":"ALFA FT CONFIRMAÇÃO", "CHAMA_FT":"ALFA FT / CHAMA"}.get(estrategia, estrategia)
-
+    return {
+        "ALFA_HT": "ALFA HT",
+        "ALFA_HT_CONFIRMACAO": "ALFA HT CONFIRMAÇÃO",
+        "ARCE_HT": "ALFA HT",
+        "ALFA_FT": "ALFA FT",
+        "ALFA_FT_CONFIRMACAO": "ALFA FT CONFIRMAÇÃO",
+        "CHAMA_FT": "ALFA FT",
+    }.get(estrategia, estrategia)
 
 def texto_liga_publico(metricas):
     liga=classificar_liga(metricas.get("competicao",""))
@@ -769,8 +904,8 @@ def texto_liga_publico(metricas):
 
 def texto_contexto_gol(metricas):
     motivo=metricas.get("motivo_gol_contextual",""); verm=metricas.get("motivo_vermelho_contextual",""); delta=metricas.get("motivo_delta_contextual",""); padrao=metricas.get("padrao_alfa",""); textos=[]
-    if padrao in ["ALFA_FT_FORTE","ALFA_HT_FORTE"]: textos.append("🧠 Padrão ALFA: IP sustentado + Chance de Gol dentro da base histórica.")
-    elif padrao in ["ALFA_FT_QUASE_FORTE","ALFA_HT_QUASE_FORTE","ALFA_FT_RESSALVA","ALFA_HT_RESSALVA"]: textos.append("⚠️ Padrão ALFA: contexto forte, mas com ressalva em algum ponto da régua.")
+    if padrao in ["ALFA_FT_DIAMANTE","ALFA_HT_DIAMANTE","ALFA_FT_FORTE","ALFA_HT_FORTE"]: textos.append("🧠 Padrão ALFA: IP sustentado + Chance de Gol dentro da base histórica.")
+    elif padrao in ["ALFA_FT_BASE","ALFA_HT_BASE","ALFA_FT_PRESSAO_SEM_CHANCE","ALFA_HT_PRESSAO_SEM_CHANCE","ALFA_OBSERVACAO_SEM_CONTINUIDADE"]: textos.append("⚠️ Padrão ALFA: contexto forte, mas com ressalva em algum ponto da régua.")
     if motivo in ["GOL_ZEBRA_CONTRA_FLUXO","GOL_TIME_PRESSIONADO_ABRIU_JOGO"]: textos.append("🔥 Contexto extra: gol contra o fluxo aumentou a urgência ofensiva.")
     elif motivo == "GOL_CONTRA_FLUXO_CONTEXTO_BOM": textos.append("🔥 Contexto extra: time pressionado marcou, mas o jogo segue aberto.")
     elif motivo == "PRESSAO_PREMIADA_MAS_VIVA": textos.append("⚠️ Contexto: pressão já foi premiada, mas segue viva.")
@@ -804,7 +939,7 @@ def montar_mensagem_gol(jogo, estrategia, score, metricas):
 {html.escape(texto_liga_publico(metricas))}
 
 🔥 Leitura ALFA:
-Pressão ofensiva viva, padrão contextual aprovado e cenário voltado para novo gol.{ctx}
+Pressão ofensiva viva, padrão ALFA aprovado e cenário voltado para novo gol.{ctx}
 
 📌 Entrar somente se a odd estiver acima de 1.60.
 💰 Gestão recomendada: 1% da banca.
