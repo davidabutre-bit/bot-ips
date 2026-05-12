@@ -16,6 +16,4 @@ client = TelegramClient(
 
 client.start()
 
-print("SESSAO CRIADA COM SUCESSO")
-
-client.disconnect()
+print("SESSION GERADA COM SUCESSO")
