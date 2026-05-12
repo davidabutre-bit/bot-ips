@@ -15,6 +15,7 @@ API_ID = os.getenv("API_ID")
 API_HASH = os.getenv("API_HASH")
 TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "@CoutipsIPS")
 CORNERS_CHANNEL = os.getenv("CORNERS_CHANNEL", "@Goat_Bot01")
+CONFIRMATION_CHANNEL = os.getenv("CONFIRMATION_CHANNEL", "@ALFA_CON")
 
 if not API_ID or not API_HASH:
     raise RuntimeError("API_ID ou API_HASH não configurado.")
@@ -26,8 +27,10 @@ CORTE_GOL = int(os.getenv("CORTE_GOL", "75"))
 CORTE_CANTO = int(os.getenv("CORTE_CANTO", "75"))
 COOLDOWN_SEGUNDOS = int(os.getenv("COOLDOWN_SEGUNDOS", "600"))
 CACHE_MAX_SEGUNDOS = int(os.getenv("CACHE_MAX_SEGUNDOS", "3600"))
-JANELA_DECISAO_SEGUNDOS = float(os.getenv("JANELA_DECISAO_SEGUNDOS", "4"))
-INTERVALO_ENVIO_SEGUNDOS = float(os.getenv("INTERVALO_ENVIO_SEGUNDOS", "1.8"))
+JANELA_DECISAO_SEGUNDOS = float(os.getenv("JANELA_DECISAO_SEGUNDOS", "8"))
+INTERVALO_ENVIO_SEGUNDOS = float(os.getenv("INTERVALO_ENVIO_SEGUNDOS", "5"))
+CONFIRMACAO_DELTA_FORTE = int(os.getenv("CONFIRMACAO_DELTA_FORTE", "8"))
+CONFIRMACAO_SCORE_MINIMO = int(os.getenv("CONFIRMACAO_SCORE_MINIMO", "75"))
 WATCHDOG_SEGUNDOS = int(os.getenv("WATCHDOG_SEGUNDOS", "60"))
 
 ultimas_leituras_por_jogo = {}
@@ -689,8 +692,45 @@ def calcular_scores(texto, estrategia, chave_jogo):
     return gol,canto,tipo,metricas
 
 
+def prioridade_estrategia(estrategia):
+    # Hierarquia oficial:
+    # 1) ARCE_HT / CHAMA_FT
+    # 2) ALFA_HT / ALFA_FT
+    # 3) ALFA_HT_CONFIRMACAO / ALFA_FT_CONFIRMACAO
+    if estrategia in ["ARCE_HT", "CHAMA_FT"]:
+        return 3
+    if estrategia in ["ALFA_HT", "ALFA_FT"]:
+        return 2
+    if estrategia in ["ALFA_HT_CONFIRMACAO", "ALFA_FT_CONFIRMACAO"]:
+        return 1
+    return 0
+
+
 def prioridade_alerta(alerta):
-    return (1 if eh_confirmacao(alerta["estrategia"]) else 0, max(alerta.get("score_gol",0), alerta.get("score_canto",0)), alerta["metricas"]["tempo"])
+    return (
+        prioridade_estrategia(alerta["estrategia"]),
+        max(alerta.get("score_gol", 0), alerta.get("score_canto", 0)),
+        alerta["metricas"]["tempo"],
+    )
+
+
+def confirmacao_melhorou_forte(alerta):
+    if not eh_confirmacao(alerta.get("estrategia", "")):
+        return False
+
+    metricas = alerta.get("metricas", {})
+    delta_ctx = metricas.get("motivo_delta_contextual", "")
+    score_gol = alerta.get("score_gol", 0)
+    score_canto = alerta.get("score_canto", 0)
+    padrao = metricas.get("padrao_alfa", "")
+
+    if delta_ctx == "CONFIRMACAO_MELHOROU" and max(score_gol, score_canto) >= CONFIRMACAO_SCORE_MINIMO:
+        return True
+
+    if padrao in ["ALFA_FT_FORTE", "ALFA_HT_FORTE"] and max(score_gol, score_canto) >= 82:
+        return True
+
+    return False
 
 
 def melhor_alerta(alertas):
@@ -802,10 +842,11 @@ async def trabalhador_envio():
         item = await fila_envio.get()
         try:
             alerta=item["alerta"]; mercado=item["mercado"]
+            destino_override = item.get("destino")
             if mercado == "GOL":
-                mensagem=montar_mensagem_gol(alerta["jogo"], alerta["estrategia"], alerta["score_gol"], alerta["metricas"]); destino=TARGET_CHANNEL; score_log=alerta["score_gol"]
+                mensagem=montar_mensagem_gol(alerta["jogo"], alerta["estrategia"], alerta["score_gol"], alerta["metricas"]); destino=destino_override or TARGET_CHANNEL; score_log=alerta["score_gol"]
             elif mercado == "CANTO":
-                mensagem=montar_mensagem_canto(alerta["jogo"], alerta["estrategia"], alerta["score_canto"], alerta["metricas"]); destino=CORNERS_CHANNEL; score_log=alerta["score_canto"]
+                mensagem=montar_mensagem_canto(alerta["jogo"], alerta["estrategia"], alerta["score_canto"], alerta["metricas"]); destino=destino_override or CORNERS_CHANNEL; score_log=alerta["score_canto"]
             else:
                 log(f"⚠️ Mercado desconhecido na fila: {mercado}"); fila_envio.task_done(); continue
             await client.send_message(destino, mensagem, parse_mode="html")
@@ -823,24 +864,85 @@ async def trabalhador_envio():
 async def decidir_e_enviar(chave_jogo):
     try:
         await asyncio.sleep(JANELA_DECISAO_SEGUNDOS)
-        alertas=pendentes_por_jogo.pop(chave_jogo, []); tarefas_decisao.pop(chave_jogo, None)
-        if not alertas:
-            log(f"ℹ️ Nenhum alerta pendente para {chave_jogo}"); return
-        escolhido=melhor_alerta(alertas); mercados=[]
-        if escolhido["score_gol"] >= CORTE_GOL: mercados.append("GOL")
-        if escolhido["score_canto"] >= CORTE_CANTO: mercados.append("CANTO")
-        if not mercados:
-            log(f"⛔ BLOQUEADO FINAL | Gol={escolhido['score_gol']}% Canto={escolhido['score_canto']}% | {escolhido['jogo']}"); return
-        if len(alertas) > 1:
-            log(f"🏆 PRIORIDADE APLICADA | Escolhido: {escolhido['estrategia']} | Recebidos: {', '.join(a['estrategia'] for a in alertas)} | Jogo: {escolhido['jogo']}")
-        for mercado in mercados:
-            chave_envio=f"{chave_jogo}_{mercado}"
-            if ja_enviado_recentemente(chave_envio):
-                log(f"⛔ BLOQUEADO POR COOLDOWN {mercado} | {escolhido['jogo']}"); continue
-            await fila_envio.put({"alerta": escolhido, "mercado": mercado, "chave_envio": chave_envio})
-    except Exception as e:
-        log(f"❌ ERRO NA JANELA DE DECISÃO: {e}"); log(traceback.format_exc())
+        alertas=pendentes_por_jogo.pop(chave_jogo, [])
+        tarefas_decisao.pop(chave_jogo, None)
 
+        if not alertas:
+            log(f"ℹ️ Nenhum alerta pendente para {chave_jogo}")
+            return
+
+        escolhido=melhor_alerta(alertas)
+        confirmacoes=[a for a in alertas if eh_confirmacao(a.get("estrategia", ""))]
+
+        mercados=[]
+        if escolhido["score_gol"] >= CORTE_GOL:
+            mercados.append("GOL")
+        if escolhido["score_canto"] >= CORTE_CANTO:
+            mercados.append("CANTO")
+
+        if len(alertas) > 1:
+            log(
+                f"🏆 PRIORIDADE APLICADA | Escolhido: {escolhido['estrategia']} | "
+                f"Recebidos: {', '.join(a['estrategia'] for a in alertas)} | Jogo: {escolhido['jogo']}"
+            )
+
+        # Envio principal: ARCE/CHAMA primeiro; depois ALFA normal; confirmação só se melhorou forte.
+        if mercados:
+            if eh_confirmacao(escolhido["estrategia"]) and not confirmacao_melhorou_forte(escolhido):
+                log(
+                    f"🟡 CONFIRMAÇÃO SEM MELHORA FORTE | Não vai ao canal principal | "
+                    f"{escolhido['estrategia']} | Gol={escolhido['score_gol']}% | "
+                    f"Canto={escolhido['score_canto']}% | {escolhido['jogo']}"
+                )
+            else:
+                for mercado in mercados:
+                    chave_envio=f"{chave_jogo}_{mercado}_MAIN"
+                    if ja_enviado_recentemente(chave_envio):
+                        log(f"⛔ BLOQUEADO POR COOLDOWN {mercado} | {escolhido['jogo']}")
+                        continue
+                    await fila_envio.put({"alerta": escolhido, "mercado": mercado, "chave_envio": chave_envio})
+        else:
+            log(
+                f"⛔ BLOQUEADO FINAL | Gol={escolhido['score_gol']}% "
+                f"Canto={escolhido['score_canto']}% | {escolhido['jogo']}"
+            )
+
+        # Confirmações: se melhoraram forte, podem repetir no principal.
+        # Se não melhoraram forte, vão somente para o canal técnico de confirmação.
+        for conf in confirmacoes:
+            if conf is escolhido and eh_confirmacao(escolhido["estrategia"]) and confirmacao_melhorou_forte(conf):
+                continue
+
+            conf_mercados=[]
+            if conf["score_gol"] >= CONFIRMACAO_SCORE_MINIMO:
+                conf_mercados.append("GOL")
+            if conf["score_canto"] >= CONFIRMACAO_SCORE_MINIMO:
+                conf_mercados.append("CANTO")
+
+            if not conf_mercados:
+                continue
+
+            destino = TARGET_CHANNEL if confirmacao_melhorou_forte(conf) else CONFIRMATION_CHANNEL
+            tipo_destino = "PRINCIPAL" if destino == TARGET_CHANNEL else "TÉCNICO"
+
+            for mercado in conf_mercados:
+                chave_envio=f"{chave_jogo}_{mercado}_{conf['estrategia']}_{tipo_destino}"
+                if ja_enviado_recentemente(chave_envio):
+                    continue
+                await fila_envio.put({
+                    "alerta": conf,
+                    "mercado": mercado,
+                    "chave_envio": chave_envio,
+                    "destino": destino,
+                })
+                log(
+                    f"📌 CONFIRMAÇÃO PARA CANAL {tipo_destino} | {conf['estrategia']} | "
+                    f"{mercado} | Gol={conf['score_gol']}% | Canto={conf['score_canto']}% | {conf['jogo']}"
+                )
+
+    except Exception as e:
+        log(f"❌ ERRO NA JANELA DE DECISÃO: {e}")
+        log(traceback.format_exc())
 
 async def watchdog_envio():
     global tarefa_envio
@@ -897,10 +999,12 @@ async def main():
     log("📊 Estratégias ativas: ALFA_HT | ALFA_HT CONFIRMAÇÃO | ALFA_FT | ALFA_FT CONFIRMAÇÃO | ARCE_HT | CHAMA_FT")
     log(f"⚽ Canal gols: {TARGET_CHANNEL}")
     log(f"🚩 Canal cantos: {CORNERS_CHANNEL}")
+    log(f"🧪 Canal técnico de confirmação: {CONFIRMATION_CHANNEL}")
     log(f"🎯 Corte gol: {CORTE_GOL}% | Corte canto: {CORTE_CANTO}%")
     log(f"⏳ Janela de decisão por jogo: {JANELA_DECISAO_SEGUNDOS}s")
+    log(f"📤 Intervalo entre envios: {INTERVALO_ENVIO_SEGUNDOS}s")
     log("⚠️ Confirme no Railway que existe apenas 1 instância/replica ativa.")
-    log("🧠 Score ALFA: IP sustentado, Chance de Gol, favorito em campo, ARCE/CHAMA no radar, gol recente e pressão convertível.")
+    log("🧠 Score ALFA: IP sustentado, Chance de Gol, favorito em campo, ARCE/CHAMA no radar, confirmação técnica e pressão convertível.")
     await client.start()
     log("✅ TELEGRAM CONECTADO COM SUCESSO")
     tarefa_envio=asyncio.create_task(trabalhador_envio())
