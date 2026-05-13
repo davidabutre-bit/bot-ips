@@ -21,7 +21,7 @@ if not API_ID or not API_HASH:
     raise RuntimeError("API_ID ou API_HASH não configurado.")
 
 API_ID = int(API_ID)
-client = TelegramClient("coutips_ips_session", API_ID, API_HASH)
+client = TelegramClient("coutips_v2_session", API_ID, API_HASH)
 
 CORTE_GOL = int(os.getenv("CORTE_GOL", "85"))
 CORTE_CANTO = int(os.getenv("CORTE_CANTO", "85"))
