@@ -31,7 +31,7 @@ async def testar_openai():
 
     try:
         resposta = client_ai.responses.create(
-            model="gpt-5.5-mini",
+            model="gpt-5.4-mini",
             input="Responda apenas: OPENAI OK"
         )
 
