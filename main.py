@@ -1152,13 +1152,12 @@ def score_classificacao_institucional(metricas, estrategia):
     chance = q["chance"]
 
     if perfil == "RADAR_CONFIAVEL":
-    score = 70
+       score = 70
 
 elif perfil == "CONFIRMACAO":
-    score = 72
-
+       score = 72
 else:
-    score = 66
+       score = 66
 
 # Pressão recente e continuidade valem mais que acumulado.
 score += min(q["pressao_recente"] * 2, 6)
