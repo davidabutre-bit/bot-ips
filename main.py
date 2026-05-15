@@ -1154,7 +1154,7 @@ def score_classificacao_institucional(metricas, estrategia):
     if perfil == "RADAR_CONFIAVEL":
        score = 70
 
-elif perfil == "CONFIRMACAO":
+    elif perfil == "CONFIRMACAO":
        score = 72
 else:
        score = 66
