@@ -8,11 +8,14 @@ import asyncio
 import traceback
 import html
 import unicodedata
+from openai import OpenAI
 
 load_dotenv()
 
 API_ID = os.getenv("API_ID")
 API_HASH = os.getenv("API_HASH")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+client_ai = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "@CoutipsIPS")
 CORNERS_CHANNEL = os.getenv("CORNERS_CHANNEL", "@Goat_Bot01")
 CONFIRMATION_CHANNEL = os.getenv("CONFIRMATION_CHANNEL", "@ALFA_CON")
