@@ -36,7 +36,7 @@ CORTE_GOL_FT = int(os.getenv("CORTE_GOL_FT", "82"))
 
 # Confirmação usa o mesmo funil dos bots principais, mas aceita corte menor
 # porque aparece em minuto mais caótico: fim do HT ou reta final do FT.
-CORTE_CONFIRMACAO_GOL_HT = int(os.getenv("CORTE_CONFIRMACAO_GOL_HT", "85"))
+CORTE_CONFIRMACAO_GOL_HT = int(os.getenv("CORTE_CONFIRMACAO_GOL_HT", "82"))
 CORTE_CONFIRMACAO_GOL_FT = int(os.getenv("CORTE_CONFIRMACAO_GOL_FT", "82"))
 CORTE_CONFIRMACAO_GOL = int(os.getenv("CORTE_CONFIRMACAO_GOL", str(CORTE_CONFIRMACAO_GOL_HT)))
 
@@ -1152,16 +1152,18 @@ def score_classificacao_institucional(metricas, estrategia):
     chance = q["chance"]
 
     if perfil == "RADAR_CONFIAVEL":
-        score = 80
-    elif perfil == "CONFIRMACAO":
-        score = 82
-    else:
-        score = 76
+    score = 70
 
-    # Pressão recente e continuidade valem mais que acumulado.
-    score += min(q["pressao_recente"] * 3, 10)
-    score += min(q["continuidade"] * 3, 10)
-    score += min(q["consequencia"] * 3, 12)
+elif perfil == "CONFIRMACAO":
+    score = 72
+
+else:
+    score = 66
+
+# Pressão recente e continuidade valem mais que acumulado.
+score += min(q["pressao_recente"] * 2, 6)
+score += min(q["continuidade"] * 2, 6)
+score += min(q["consequencia"] * 2, 8)
 
     if dados["u5"] >= 6:
         score += 3
