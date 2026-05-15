@@ -24,6 +24,22 @@ if not API_ID or not API_HASH:
     raise RuntimeError("API_ID ou API_HASH não configurado.")
 
 API_ID = int(API_ID)
+async def testar_openai():
+    if not client_ai:
+        print("❌ OPENAI_API_KEY não encontrada.")
+        return
+
+    try:
+        resposta = client_ai.responses.create(
+            model="gpt-5.5-mini",
+            input="Responda apenas: OPENAI OK"
+        )
+
+        print("✅ RESPOSTA OPENAI:")
+        print(resposta.output_text)
+
+    except Exception as e:
+        print(f"❌ ERRO OPENAI: {e}")
 client = TelegramClient("coutips_v2_session", API_ID, API_HASH)
 
 # =========================================================
