@@ -1156,13 +1156,13 @@ def score_classificacao_institucional(metricas, estrategia):
 
     elif perfil == "CONFIRMACAO":
        score = 72
-else:
+    else:
        score = 66
 
-# Pressão recente e continuidade valem mais que acumulado.
-score += min(q["pressao_recente"] * 2, 6)
-score += min(q["continuidade"] * 2, 6)
-score += min(q["consequencia"] * 2, 8)
+    # Pressão recente e continuidade valem mais que acumulado.
+        score += min(q["pressao_recente"] * 2, 6)
+        score += min(q["continuidade"] * 2, 6)
+        score += min(q["consequencia"] * 2, 8)
 
     if dados["u5"] >= 6:
         score += 3
