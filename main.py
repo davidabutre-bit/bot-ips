@@ -41,6 +41,7 @@ async def testar_openai():
     except Exception as e:
         print(f"❌ ERRO OPENAI: {e}")
 client = TelegramClient("coutips_v2_session", API_ID, API_HASH)
+asyncio.run(testar_openai())
 
 # =========================================================
 # CONFIGURAÇÃO OFICIAL ATUAL
