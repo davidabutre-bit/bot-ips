@@ -46,7 +46,7 @@ try:
 except ValueError:
     raise RuntimeError("API_ID inválido — deve ser um número inteiro.")
 
-client = TelegramClient("coutips_v2_session", API_ID, API_HASH)
+client = TelegramClient("coutips_v2_session.session", API_ID, API_HASH)
 
 # =========================================================
 # CONFIGURAÇÃO OFICIAL ATUAL
