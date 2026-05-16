@@ -21,8 +21,8 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 
-API_ID = os.getenv("36525640")
-API_HASH = os.getenv("25bfdf0065ba1025cd97c226076d69b6")
+API_ID = os.getenv ("36525640")
+API_HASH = os.getenv "25bfdf0065ba1025cd97c226076d69b6"
 TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "@CoutipsIPS")
 CORNERS_CHANNEL = os.getenv("CORNERS_CHANNEL", "@Goat_Bot01")
 CONFIRMATION_CHANNEL = os.getenv("CONFIRMATION_CHANNEL", "@ALFA_CON")
