@@ -9,11 +9,11 @@ import traceback
 import html
 import unicodedata
 import logging
-import httpx  # cliente HTTP async para chamada à OpenAI
+import httpx
 
 load_dotenv()
 
-# Configura logging estruturado — nível configurável via env var LOG_LEVEL (padrão INFO)
+# Configura logging
 _LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
     level=getattr(logging, _LOG_LEVEL, logging.INFO),
@@ -21,51 +21,44 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 
-API_ID = os.getenv ("36525640")
-API_HASH = os.getenv "25bfdf0065ba1025cd97c226076d69b6"
+# ==================== SUAS CREDENCIAIS ====================
+API_ID = 36525640
+API_HASH = "25bfdf0065ba1025cd97c226076d69b6"
+
 TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "@CoutipsIPS")
 CORNERS_CHANNEL = os.getenv("CORNERS_CHANNEL", "@Goat_Bot01")
 CONFIRMATION_CHANNEL = os.getenv("CONFIRMATION_CHANNEL", "@ALFA_CON")
 
-# ── Integração OpenAI ─────────────────────────────────────────────────────────
-OPENAI_API_KEY = os.getenv("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", "")
+# OpenAI
+OPENAI_API_KEY = "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"
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 OPENAI_HABILITADO = os.getenv("OPENAI_HABILITADO", "true").lower() == "true"
 
-# ── Modo teste ────────────────────────────────────────────────────────────────
-# Quando True, envia APENAS para CONFIRMATION_CHANNEL (canal de teste).
-# TARGET_CHANNEL e outros canais ficam pausados.
-# Para voltar ao modo normal: MODO_TESTE=false no .env
+# Modo teste
 MODO_TESTE = os.getenv("MODO_TESTE", "true").lower() == "true"
 
+# Validação básica
 if not API_ID or not API_HASH:
     raise RuntimeError("API_ID ou API_HASH não configurado.")
 
 try:
-    API_ID = int(API_ID.strip())
+    API_ID = int(API_ID)
 except ValueError:
-    raise RuntimeError("API_ID inválido — deve ser um número inteiro sem espaços ou caracteres especiais.")
+    raise RuntimeError("API_ID inválido — deve ser um número inteiro.")
+
 client = TelegramClient("coutips_v2_session", API_ID, API_HASH)
 
 # =========================================================
 # CONFIGURAÇÃO OFICIAL ATUAL
 # =========================================================
-# Fase atual: SOMENTE GOLS.
-# Cantos continuam calculados internamente para log/contexto, mas NÃO são enviados.
-# Corte principal separado por tempo de jogo.
-# HT precisa ser mais raro/limpo; FT aceita mais caos emocional.
 CORTE_GOL = int(os.getenv("CORTE_GOL", "85"))
 CORTE_GOL_HT = int(os.getenv("CORTE_GOL_HT", "87"))
 CORTE_GOL_FT = int(os.getenv("CORTE_GOL_FT", "82"))
 
-# Confirmação usa o mesmo funil dos bots principais, mas aceita corte menor
-# porque aparece em minuto mais caótico: fim do HT ou reta final do FT.
 CORTE_CONFIRMACAO_GOL_HT = int(os.getenv("CORTE_CONFIRMACAO_GOL_HT", "85"))
 CORTE_CONFIRMACAO_GOL_FT = int(os.getenv("CORTE_CONFIRMACAO_GOL_FT", "82"))
 CORTE_CONFIRMACAO_GOL = int(os.getenv("CORTE_CONFIRMACAO_GOL", str(CORTE_CONFIRMACAO_GOL_HT)))
 
-# Alertas 80+ entram na janela de decisão como OBSERVAÇÃO interna.
-# O envio final continua respeitando o corte real: HT 87 / FT 82 / Confirmação HT 85 / Confirmação FT 82.
 CORTE_OBSERVACAO_JANELA = int(os.getenv("CORTE_OBSERVACAO_JANELA", "80"))
 CORTE_CANTO = 999  # DESATIVADO — cantos não são enviados na fase atual
 
