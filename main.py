@@ -2887,4 +2887,547 @@ def melhor_alerta(alertas):
 
 def ja_enviado_recentemente(chave_envio):
     agora = time.time()
-    return chave_envio in ultimos_enviados and agora - ultimos_enviados[chave_envio] <= COOLDOWN
+    return chave_envio in ultimos_enviados and agora - ultimos_enviados[chave_envio] <= COOLDOWN_SEGUNDOS
+
+
+def marcar_enviado(chave_envio):
+    ultimos_enviados[chave_envio] = time.time()
+
+
+def salvar_ultima_leitura(chave_jogo, alerta):
+    ultimas_leituras_por_jogo[chave_jogo] = {
+        "estrategia": alerta["estrategia"],
+        "metricas": alerta["metricas"],
+        "score_gol": alerta.get("score_gol", 0),
+        "score_canto": alerta.get("score_canto", 0),
+        "tipo_pressao": alerta.get("tipo_pressao", "BLOQUEIO"),
+        "recebido_em": time.time(),
+    }
+
+
+# =========================================================
+# MENSAGENS
+# =========================================================
+
+def faixa_publica(score):
+    if score >= 92:
+        return f"💎 ALFA — ENTRADA DIAMANTE ({score}%)"
+    if score >= 85:
+        return f"🔥 ALFA — ENTRADA VALIDADA ({score}%)"
+    if score >= 80:
+        return f"✅ ALFA — ENTRADA APROVADA ({score}%)"
+    return "⚠️ ALFA — OBSERVAÇÃO INTERNA"
+
+
+def nome_publico_bot(estrategia):
+    return {
+        "ALFA_HT": "ALFA HT",
+        "ALFA_HT_CONFIRMACAO": "ALFA HT CONFIRMAÇÃO",
+        "ARCE_HT": "ALFA HT",
+        "ALFA_FT": "ALFA FT",
+        "ALFA_FT_CONFIRMACAO": "ALFA FT CONFIRMAÇÃO",
+        "CHAMA_FT": "ALFA FT",
+    }.get(estrategia, estrategia)
+
+
+def texto_liga_publico(metricas):
+    liga = classificar_liga(metricas.get("competicao", ""))
+    if liga == "PREMIUM":
+        return "🟢 Liga Premium"
+    if liga == "MODERADA":
+        return "🟡 Liga Moderada"
+    if liga == "UNDER":
+        return "🟠 Liga Under"
+    if liga == "PERIGOSA":
+        return "🔴 Liga Perigosa"
+    return "⚪ Liga Neutra"
+
+
+def texto_contexto_gol(metricas):
+    motivo = metricas.get("motivo_gol_contextual", "")
+    verm = metricas.get("motivo_vermelho_contextual", "")
+    delta = metricas.get("motivo_delta_contextual", "")
+    padrao = metricas.get("padrao_alfa", "")
+
+    textos = []
+
+    if padrao in ["ALFA_FT_DIAMANTE", "ALFA_HT_DIAMANTE", "ALFA_FT_FORTE", "ALFA_HT_FORTE"]:
+        textos.append("🧠 Padrão ALFA: IP sustentado + Chance de Gol dentro da base histórica.")
+    elif padrao in ["ALFA_FT_BASE", "ALFA_HT_BASE", "ALFA_FT_PRESSAO_SEM_CHANCE", "ALFA_HT_PRESSAO_SEM_CHANCE", "ALFA_OBSERVACAO_SEM_CONTINUIDADE"]:
+        textos.append("⚠️ Padrão ALFA: contexto forte, mas com ressalva em algum ponto da régua.")
+
+    if motivo in ["GOL_ZEBRA_CONTRA_FLUXO", "GOL_TIME_PRESSIONADO_ABRIU_JOGO"]:
+        textos.append("🔥 Contexto extra: gol contra o fluxo aumentou a urgência ofensiva.")
+    elif motivo == "GOL_CONTRA_FLUXO_CONTEXTO_BOM":
+        textos.append("🔥 Contexto extra: time pressionado marcou, mas o jogo segue aberto.")
+    elif motivo == "PRESSAO_PREMIADA_MAS_VIVA":
+        textos.append("⚠️ Contexto: pressão já foi premiada, mas segue viva.")
+    elif motivo == "FAVORITO_MARCOU_MAS_OPONENTE_PRESSIONA":
+        textos.append("🔥 Contexto extra: gol anterior não matou o jogo; adversário segue pressionando.")
+    elif motivo == "GOL_EMPATE_FT_ABRIU_VIRADA":
+        textos.append("🔥 Contexto extra: empate tardio com pressão viva manteve cenário de virada.")
+    elif motivo in ["TRAVA_CONFIRMACAO_PRESSAO_PREMIADA_5M", "TRAVA_CONFIRMACAO_GOL_RECENTE_5M"]:
+        textos.append("⛔ Confirmação travada/rebaixada por gol recente.")
+
+    if delta == "CONFIRMACAO_MELHOROU":
+        textos.append("📈 Confirmação: pressão aumentou em relação ao primeiro gatilho.")
+    elif delta == "CONFIRMACAO_PIOROU":
+        textos.append("⚠️ Confirmação: pressão caiu em relação ao primeiro gatilho.")
+
+    if verm == "VERMELHO_ABRIU_PRESSAO":
+        textos.append("🟥 Contexto extra: superioridade numérica reforça a pressão ofensiva.")
+
+    if metricas.get("bonus_bot_confianca", 0) > 0:
+        textos.append("⭐ Bot de confiança: ARCE/CHAMA reforçou a leitura do sinal.")
+
+    return "\n" + "\n".join(textos) if textos else ""
+
+
+def montar_mensagem_gol(jogo, estrategia, score, metricas):
+    ctx = texto_contexto_gol(metricas)
+    link = f"\n🔗 Bet365: {html.escape(metricas['bet365'])}" if metricas.get("bet365") else ""
+
+    nome_bot = html.escape(nome_publico_bot(estrategia))
+    titulo = "🔁 ENTRADA CONFIRMADA" if eh_confirmacao(estrategia) else "🔥 ENTRADA VALIDADA"
+    motivo_pos_gol = metricas.get("motivo_pos_gol_institucional", "")
+    if motivo_pos_gol == "CONFIRMACAO_VALIDOU_MASSACRE_POS_GOL":
+        titulo = "🔁 ENTRADA CONFIRMADA"
+
+    leitura_base = "Pressão viva, domínio ofensivo e contexto aberto."
+    if motivo_pos_gol == "CONFIRMACAO_VALIDOU_MASSACRE_POS_GOL":
+        leitura_base = "Gol recente já foi absorvido. O favorito/dominante continuou pressionando forte."
+    elif metricas.get("motivo_funil") == "FUNIL_APROVADO":
+        leitura_base = "Jogo passou pelo funil ALFA: pressão, validação, travas e classificação."
+
+    return f"""{titulo}
+
+⚽ <b>COUTIPS {nome_bot}</b>
+
+🏟 <b>Jogo:</b> {html.escape(str(jogo))}
+⏱ <b>Minuto:</b> {metricas['tempo']}'
+⚽ <b>Placar:</b> {html.escape(str(metricas['placar']))}
+
+📊 <b>Chance ALFA:</b> {score}%
+🎯 <b>Entrada:</b> {html.escape(str(metricas['mercado']))}
+💰 <b>Odd mínima:</b> 1.60
+
+🧠 <b>Leitura:</b>
+{html.escape(leitura_base)}{ctx}
+
+📌 <b>Gestão:</b>
+Entrada padrão — 1% da banca.
+Evitar entrada se sair gol antes de apostar.{link}
+
+COUTIPS — leitura ao vivo com pressão, contexto e disciplina."""
+def montar_mensagem_canto(jogo, estrategia, score, metricas):
+    # DESATIVADO — cantos não são enviados na fase atual
+    # TODO: reimplementar quando cantos forem reabertos
+    return ""
+
+
+LOG_CSV_PATH = os.getenv("LOG_CSV_PATH", "alertas_enviados.csv")
+_CSV_CABECALHO = ["data_hora", "jogo", "estrategia", "minuto", "placar",
+                  "score", "mercado", "liga", "lado_dominante", "resultado"]
+
+
+def registrar_alerta_csv(alerta: dict):
+    """Registra alerta enviado em CSV para análise futura de resultados.
+
+    A coluna 'resultado' fica em branco — você preenche manualmente
+    após o jogo com: GOL, NAO_GOL ou INCONCLUSIVO.
+    """
+    m = alerta.get("metricas", {})
+    linha = {
+        "data_hora":     datetime.now().strftime("%d/%m/%Y %H:%M"),
+        "jogo":          alerta.get("jogo", ""),
+        "estrategia":    alerta.get("estrategia", ""),
+        "minuto":        m.get("tempo", ""),
+        "placar":        m.get("placar", ""),
+        "score":         alerta.get("score_gol", ""),
+        "mercado":       m.get("mercado", ""),
+        "liga":          m.get("competicao", ""),
+        "lado_dominante": m.get("lado_dominante", ""),
+        "resultado":     "",  # preencher manualmente após o jogo
+    }
+    try:
+        arquivo_existe = os.path.isfile(LOG_CSV_PATH)
+        with open(LOG_CSV_PATH, "a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=_CSV_CABECALHO)
+            if not arquivo_existe:
+                writer.writeheader()
+            writer.writerow(linha)
+        log(f"📋 Alerta registrado no CSV: {alerta.get('jogo')} | {alerta.get('score_gol')}%")
+    except Exception as e:
+        log(f"⚠️ Erro ao salvar CSV: {e}")
+
+
+# =========================================================
+# FILA / ENVIO
+# =========================================================
+
+async def trabalhador_envio():
+    log("📤 Fila de envio iniciada.")
+    log(f"📡 Canais ativos: principal={TARGET_CHANNEL} | confirmação={CONFIRMATION_CHANNEL}")
+
+    while True:
+        item = await fila_envio.get()
+
+        try:
+            # Descartar alertas que ficaram muito tempo na fila (ex: após FloodWait longo)
+            idade_item = time.time() - item.get("gerado_em", time.time())
+            if idade_item > 120:
+                log(
+                    f"🗑️ ALERTA EXPIRADO NA FILA | idade={int(idade_item)}s | "
+                    f"{item.get('alerta', {}).get('jogo', '?')} — descartado."
+                )
+                continue
+
+            alerta  = item["alerta"]
+            mercado = item["mercado"]
+
+            if mercado != "GOL":
+                log(f"⚠️ Mercado ignorado na fase atual: {mercado}")
+                continue
+
+            # ── Montar mensagem ───────────────────────────────────────────────
+            mensagem = montar_mensagem_gol(
+                alerta["jogo"],
+                alerta["estrategia"],
+                alerta["score_gol"],
+                alerta["metricas"],
+            )
+
+            # Definir destino — modo teste envia tudo para canal de confirmação
+            if MODO_TESTE:
+                destino = CONFIRMATION_CHANNEL
+            else:
+                destino = item.get("destino") or TARGET_CHANNEL
+
+            await client.send_message(destino, mensagem, parse_mode="html")
+            marcar_enviado(item["chave_envio"])
+            registrar_alerta_csv(alerta)
+
+            log(
+                f"✅ ENVIADO GOL | {alerta['estrategia']} | "
+                f"score={alerta['score_gol']}% | {alerta['jogo']} | canal={destino}"
+            )
+
+            await asyncio.sleep(INTERVALO_ENVIO_SEGUNDOS)
+
+        except FloodWaitError as e:
+            log(f"⛔ FLOOD WAIT: aguardando {e.seconds} segundos.")
+            await asyncio.sleep(e.seconds + 1)
+
+        except Exception as e:
+            log(f"❌ ERRO AO ENVIAR MENSAGEM: {e}")
+            log(traceback.format_exc())
+
+        finally:
+            fila_envio.task_done()
+
+
+async def decidir_e_enviar(chave_jogo):
+    try:
+        await asyncio.sleep(JANELA_DECISAO_SEGUNDOS)
+
+        # Lock ao fazer pop — garante que nenhuma mensagem nova
+        # adicione alertas enquanto a decisão está sendo tomada.
+        async with _lock_jogo(chave_jogo):
+            alertas = pendentes_por_jogo.pop(chave_jogo, [])
+            tarefas_decisao.pop(chave_jogo, None)
+
+        # Lock liberado — o resto do processamento é local e seguro.
+        if not alertas:
+            log(f"ℹ️ Nenhum alerta pendente para {chave_jogo}")
+            return
+
+        escolhido = melhor_alerta(alertas)
+        confirmacoes = [a for a in alertas if eh_confirmacao(a.get("estrategia", ""))]
+
+        mercados = []
+
+        # FASE ATUAL: SOMENTE GOL
+        corte_escolhido = corte_gol_estrategia(escolhido["estrategia"])
+        if escolhido["score_gol"] >= corte_escolhido:
+            mercados.append("GOL")
+
+        if len(alertas) > 1:
+            log(
+                f"🏆 PRIORIDADE APLICADA | Escolhido: {escolhido['estrategia']} | "
+                f"Recebidos: {', '.join(a['estrategia'] for a in alertas)} | Jogo: {escolhido['jogo']}"
+            )
+
+        if mercados:
+            if eh_confirmacao(escolhido["estrategia"]) and not confirmacao_melhorou_forte(escolhido):
+                log(
+                    f"🟡 CONFIRMAÇÃO SEM MELHORA FORTE | Não vai ao canal principal | "
+                    f"{escolhido['estrategia']} | Gol={escolhido['score_gol']}% | {escolhido['jogo']}"
+                )
+            else:
+                for mercado in mercados:
+                    chave_envio = f"{chave_jogo}_{mercado}_MAIN"
+
+                    if ja_enviado_recentemente(chave_envio):
+                        log(f"⛔ BLOQUEADO POR COOLDOWN {mercado} | {escolhido['jogo']}")
+                        continue
+
+                    try:
+                        fila_envio.put_nowait({
+                            "alerta": escolhido,
+                            "mercado": mercado,
+                            "chave_envio": chave_envio,
+                            "texto_original": escolhido.get("texto_original", ""),
+                            "gerado_em": time.time(),
+                        })
+                    except asyncio.QueueFull:
+                        log(f"⚠️ FILA CHEIA — alerta descartado: {escolhido['jogo']} | {mercado}")
+        else:
+            log(f"⛔ BLOQUEADO FINAL | Gol={escolhido['score_gol']}% | {escolhido['jogo']}")
+
+        # Confirmações: somente GOL.
+        # Se melhorou forte ou gol contra fluxo, vai ao principal.
+        # Caso contrário, se passar corte técnico, vai para canal técnico.
+        for conf in confirmacoes:
+            if conf is escolhido and eh_confirmacao(escolhido["estrategia"]) and confirmacao_melhorou_forte(conf):
+                continue
+
+            conf_mercados = []
+
+            corte_conf = corte_gol_estrategia(conf["estrategia"])
+            if conf["score_gol"] >= corte_conf:
+                conf_mercados.append("GOL")
+
+            if not conf_mercados:
+                continue
+
+            destino = TARGET_CHANNEL if confirmacao_melhorou_forte(conf) else CONFIRMATION_CHANNEL
+            tipo_destino = "PRINCIPAL" if destino == TARGET_CHANNEL else "TÉCNICO"
+
+            for mercado in conf_mercados:
+                chave_envio = f"{chave_jogo}_{mercado}_{conf['estrategia']}_{tipo_destino}"
+
+                if ja_enviado_recentemente(chave_envio):
+                    continue
+
+                try:
+                    fila_envio.put_nowait({
+                        "alerta": conf,
+                        "mercado": mercado,
+                        "chave_envio": chave_envio,
+                        "destino": destino,
+                        "texto_original": conf.get("texto_original", ""),
+                        "gerado_em": time.time(),
+                    })
+                except asyncio.QueueFull:
+                    log(f"⚠️ FILA CHEIA — confirmação descartada: {conf['jogo']} | {mercado}")
+
+                log(
+                    f"📌 CONFIRMAÇÃO PARA CANAL {tipo_destino} | {conf['estrategia']} | "
+                    f"{mercado} | Gol={conf['score_gol']}% | {conf['jogo']}"
+                )
+
+    except Exception as e:
+        log(f"❌ ERRO NA JANELA DE DECISÃO: {e}")
+        log(traceback.format_exc())
+
+
+async def watchdog_envio():
+    global tarefa_envio
+
+    while True:
+        await asyncio.sleep(WATCHDOG_SEGUNDOS)
+
+        try:
+            limpar_memoria_interna()
+
+            if tarefa_envio is None or tarefa_envio.done() or tarefa_envio.cancelled():
+                log("⚠️ Watchdog: fila de envio parada. Reiniciando trabalhador.")
+                tarefa_envio = asyncio.create_task(trabalhador_envio())
+
+            log(
+                f"🩺 WATCHDOG OK | fila={fila_envio.qsize()} | "
+                f"pendentes={len(pendentes_por_jogo)} | cache={len(ultimos_enviados)} | "
+                f"leituras={len(ultimas_leituras_por_jogo)}"
+            )
+
+        except Exception as e:
+            log(f"❌ ERRO NO WATCHDOG: {e}")
+            log(traceback.format_exc())
+
+
+# =========================================================
+# EVENTOS
+# =========================================================
+
+async def processar_evento(event, origem="nova"):
+    if event.out:
+        return
+
+    texto = event.raw_text or ""
+    log(f"📥 EVENTO RECEBIDO DO TELEGRAM | origem={origem}")
+
+    if not texto.strip():
+        log("ℹ️ Evento ignorado: texto vazio.")
+        return
+
+    if not mensagem_valida(texto):
+        log("ℹ️ Mensagem ignorada: não parece alerta CornerPro.")
+        return
+
+    if bloquear_categoria_base(texto):
+        log("⛔ BLOQUEADO CATEGORIA BASE | Sub-19/Sub-20 não permitido")
+        return
+
+    try:
+        msg_id = getattr(event.message, "id", None)
+        chat_id = getattr(event.message, "chat_id", None)
+        chave_msg = f"{chat_id}_{msg_id}_{origem}"
+
+        if chave_msg in mensagens_processadas:
+            log(f"ℹ️ Evento duplicado ignorado | msg={chave_msg}")
+            return
+
+        mensagens_processadas[chave_msg] = time.time()
+
+        estrategia = detectar_estrategia(texto)
+        jogo = extrair_jogo(texto)
+        chave_jogo = normalizar_chave_jogo(jogo)
+
+        sg, sc, tipo, metricas = calcular_scores(texto, estrategia, chave_jogo)
+
+        log(
+            f"📊 PROCESSADO | {estrategia} | Gol={sg}% | Canto={sc}% | Tipo={tipo} | "
+            f"{jogo} | {metricas['tempo']}' | {metricas['placar']} | {metricas['mercado']} | "
+            f"Liga={classificar_liga(metricas.get('competicao', ''))} | "
+            f"PadraoALFA={metricas.get('padrao_alfa', '')} | "
+            f"IP={metricas.get('pressao_alfa', {})} | "
+            f"Fav={metricas.get('lado_favorito')} | Dom={metricas.get('lado_dominante')} | "
+            f"Gol={metricas.get('ultimo_gol')} {metricas.get('ultimo_gol_lado')} | "
+            f"GolCtx={metricas.get('motivo_gol_contextual', '')} | "
+            f"Delta={metricas.get('motivo_delta_contextual', '')} | "
+            f"Vermelho={metricas.get('lado_vermelho')} | "
+            f"VermCtx={metricas.get('motivo_vermelho_contextual', '')} | "
+            f"NivelPressao={metricas.get('nivel_pressao_sustentada', '')} | "
+            f"Consequencia={metricas.get('tem_consequencia_ofensiva', '')}"
+        )
+
+        alerta = {
+            "jogo": jogo,
+            "chave_jogo": chave_jogo,
+            "estrategia": estrategia,
+            "score_gol": sg,
+            "score_canto": sc,
+            "tipo_pressao": tipo,
+            "metricas": metricas,
+            "texto_original": texto,
+            "recebido_em": time.time(),
+        }
+
+        salvar_ultima_leitura(chave_jogo, alerta)
+
+        corte_evento = corte_gol_estrategia(estrategia)
+        if sg < CORTE_OBSERVACAO_JANELA:
+            log(
+                f"⛔ BLOQUEADO POR SCORE | {estrategia} | "
+                f"Gol={sg}% < observação {CORTE_OBSERVACAO_JANELA}% | {jogo}"
+            )
+            return
+
+        if sg < corte_evento:
+            log(
+                f"🟡 OBSERVAÇÃO EM JANELA | {estrategia} | "
+                f"Gol={sg}% abaixo do corte real {corte_evento}% | {jogo}"
+            )
+
+        # Lock por jogo: garante que nova mensagem e edição simultânea
+        # do mesmo jogo não sobrescrevam pendentes_por_jogo uma da outra.
+        async with _lock_jogo(chave_jogo):
+            pendentes_por_jogo.setdefault(chave_jogo, []).append(alerta)
+
+            log(
+                f"⏳ ALERTA EM JANELA DE DECISÃO | {estrategia} | "
+                f"Gol={sg}% | aguardando {JANELA_DECISAO_SEGUNDOS}s | {jogo}"
+            )
+
+            if chave_jogo not in tarefas_decisao:
+                tarefas_decisao[chave_jogo] = asyncio.create_task(decidir_e_enviar(chave_jogo))
+
+    except Exception as e:
+        log(f"❌ ERRO NO PROCESSAMENTO DO ALERTA: {e}")
+        log(traceback.format_exc())
+
+
+@client.on(events.NewMessage(incoming=True))
+async def handler_nova_mensagem(event):
+    await processar_evento(event, origem="nova")
+
+
+@client.on(events.MessageEdited(incoming=True))
+async def handler_mensagem_editada(event):
+    await processar_evento(event, origem="editada")
+
+
+# =========================================================
+# PROTEÇÃO CONTRA INSTÂNCIA DUPLICADA
+# =========================================================
+
+import fcntl
+import socket
+
+def verificar_instancia_unica():
+    """Garante que apenas uma instância do bot está rodando.
+
+    Usa dois mecanismos combinados:
+    1. Arquivo de lock — bloqueia segunda instância no mesmo servidor
+    2. Socket exclusivo — detecta processo duplicado no mesmo host
+    """
+    lock_path = "/tmp/alfa_bot.lock"
+    try:
+        lock_file = open(lock_path, "w")
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        lock_file.write(str(os.getpid()))
+        lock_file.flush()
+        log(f"✅ Instância única confirmada (PID {os.getpid()})")
+        return lock_file  # mantém o arquivo aberto para manter o lock
+    except IOError:
+        log("❌ OUTRA INSTÂNCIA JÁ ESTÁ RODANDO — encerrando este processo.")
+        log("   Verifique no Railway se há mais de 1 réplica ativa em Settings.")
+        raise SystemExit(1)
+
+
+# =========================================================
+# START
+# =========================================================
+
+async def main():
+    global tarefa_envio
+
+    log("🚀 COUTIPS / ALFA ONLINE - SOMENTE GOLS ATIVO")
+    log("📊 Estratégias ativas: ALFA_HT | ALFA_HT CONFIRMAÇÃO | ALFA_FT | ALFA_FT CONFIRMAÇÃO | ARCE_HT | CHAMA_FT")
+    log(f"⚽ Canal gols: {TARGET_CHANNEL}")
+    log(f"🧪 Canal técnico de confirmação: {CONFIRMATION_CHANNEL}")
+    if MODO_TESTE:
+        log(f"🧪 MODO TESTE ATIVO — todos os alertas vão para {CONFIRMATION_CHANNEL}")
+    log(f"🎯 Cortes gol: HT={CORTE_GOL_HT}% | FT={CORTE_GOL_FT}% | Conf HT={CORTE_CONFIRMACAO_GOL_HT}% | Conf FT={CORTE_CONFIRMACAO_GOL_FT}% | Cantos desativados")
+    log(f"⏳ Janela de decisão por jogo: {JANELA_DECISAO_SEGUNDOS}s")
+    log(f"📤 Intervalo entre envios: {INTERVALO_ENVIO_SEGUNDOS}s")
+
+    await client.start()
+
+    log("✅ TELEGRAM CONECTADO COM SUCESSO")
+
+    tarefa_envio = asyncio.create_task(trabalhador_envio())
+    asyncio.create_task(watchdog_envio())
+
+    await client.run_until_disconnected()
+
+
+if __name__ == "__main__":
+    _lock = verificar_instancia_unica()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        log("🛑 Bot encerrado manualmente.")
+    except Exception as e:
+        log(f"❌ ERRO FATAL NO BOT: {e}")
+        log(traceback.format_exc())
