@@ -59,7 +59,6 @@ client = TelegramClient(
     "coutips_v2_session",
     API_ID,
     API_HASH,
-    receive_updates=True,
 )
 
 # =========================================================
@@ -3631,10 +3630,20 @@ async def main():
     log(f"⏳ Janela de decisão por jogo: {JANELA_DECISAO_SEGUNDOS}s")
     log(f"📤 Intervalo entre envios: {INTERVALO_ENVIO_SEGUNDOS}s")
 
-    await client.start()
-
-    # Força o cliente a buscar mensagens que chegaram enquanto estava offline
-    await client.catch_up()
+    # Retry para AuthKeyDuplicatedError — aguarda deploy antigo encerrar
+    for tentativa in range(1, 6):
+        try:
+            await client.start()
+            await client.catch_up()
+            break
+        except Exception as e:
+            if "AuthKeyDuplicated" in str(e) or "two different IP" in str(e):
+                log(f"⚠️ Deploy antigo ainda ativo (tentativa {tentativa}/5). Aguardando 30s...")
+                await asyncio.sleep(30)
+                if tentativa == 5:
+                    raise
+            else:
+                raise
 
     log("✅ TELEGRAM CONECTADO COM SUCESSO")
 
