@@ -3646,10 +3646,23 @@ async def main():
 
 if __name__ == "__main__":
     _lock = verificar_instancia_unica()
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        log("🛑 Bot encerrado manualmente.")
-    except Exception as e:
-        log(f"❌ ERRO FATAL NO BOT: {e}")
-        log(traceback.format_exc())
+    MAX_TENTATIVAS = 5
+    for tentativa in range(1, MAX_TENTATIVAS + 1):
+        try:
+            asyncio.run(main())
+            break
+        except KeyboardInterrupt:
+            log("🛑 Bot encerrado manualmente.")
+            break
+        except Exception as e:
+            erro = str(e)
+            if "AuthKeyDuplicated" in erro or "two different IP" in erro:
+                log(f"⚠️ Sessão duplicada detectada (tentativa {tentativa}/{MAX_TENTATIVAS}). Aguardando 30s para deploy antigo encerrar...")
+                import time as _t
+                _t.sleep(30)
+                if tentativa == MAX_TENTATIVAS:
+                    log("❌ Máximo de tentativas atingido. Encerrando.")
+            else:
+                log(f"❌ ERRO FATAL NO BOT: {e}")
+                log(traceback.format_exc())
+                break
