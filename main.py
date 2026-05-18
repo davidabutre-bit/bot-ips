@@ -3631,6 +3631,7 @@ async def main():
     log(f"📤 Intervalo entre envios: {INTERVALO_ENVIO_SEGUNDOS}s")
 
     # Retry para AuthKeyDuplicatedError — aguarda deploy antigo encerrar
+    import time as _time
     for tentativa in range(1, 6):
         try:
             await client.start()
@@ -3639,7 +3640,7 @@ async def main():
         except Exception as e:
             if "AuthKeyDuplicated" in str(e) or "two different IP" in str(e):
                 log(f"⚠️ Deploy antigo ainda ativo (tentativa {tentativa}/5). Aguardando 30s...")
-                await asyncio.sleep(30)
+                _time.sleep(30)
                 if tentativa == 5:
                     raise
             else:
@@ -3655,7 +3656,8 @@ async def main():
 
 if __name__ == "__main__":
     _lock = verificar_instancia_unica()
-    MAX_TENTATIVAS = 5
+    import time as _time
+    MAX_TENTATIVAS = 10
     for tentativa in range(1, MAX_TENTATIVAS + 1):
         try:
             asyncio.run(main())
@@ -3663,14 +3665,18 @@ if __name__ == "__main__":
         except KeyboardInterrupt:
             log("🛑 Bot encerrado manualmente.")
             break
-        except Exception as e:
-            erro = str(e)
-            if "AuthKeyDuplicated" in erro or "two different IP" in erro:
+        except RuntimeError as e:
+            if "event loop" in str(e) or "AuthKeyDuplicated" in str(e) or "two different IP" in str(e):
                 log(f"⚠️ Sessão duplicada detectada (tentativa {tentativa}/{MAX_TENTATIVAS}). Aguardando 30s para deploy antigo encerrar...")
-                import time as _t
-                _t.sleep(30)
-                if tentativa == MAX_TENTATIVAS:
-                    log("❌ Máximo de tentativas atingido. Encerrando.")
+                _time.sleep(30)
+            else:
+                log(f"❌ ERRO FATAL NO BOT: {e}")
+                log(traceback.format_exc())
+                break
+        except Exception as e:
+            if "AuthKeyDuplicated" in str(e) or "two different IP" in str(e):
+                log(f"⚠️ Sessão duplicada detectada (tentativa {tentativa}/{MAX_TENTATIVAS}). Aguardando 30s para deploy antigo encerrar...")
+                _time.sleep(30)
             else:
                 log(f"❌ ERRO FATAL NO BOT: {e}")
                 log(traceback.format_exc())
