@@ -9,11 +9,12 @@ import traceback
 import html
 import unicodedata
 import logging
-import httpx
+import csv
+from datetime import datetime
 
 load_dotenv()
 
-# Configura logging
+# Configura logging estruturado — nível configurável via env var LOG_LEVEL (padrão INFO)
 _LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
     level=getattr(logging, _LOG_LEVEL, logging.INFO),
@@ -21,45 +22,56 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 
-# ==================== SUAS CREDENCIAIS ====================
-API_ID = 36525640
-API_HASH = "25bfdf0065ba1025cd97c226076d69b6"
+API_ID = os.getenv("API_ID")
+API_HASH = os.getenv("API_HASH")
+# Nomes das variáveis alinhados com o Railway do David
+TARGET_CHANNEL = (
+    os.getenv("TARGET_CHANNEL")
+    or os.getenv("TARGET_CHANNEL_GOLS")
+    or "@CoutipsIPS"
+)
+CORNERS_CHANNEL = (
+    os.getenv("CORNERS_CHANNEL")
+    or os.getenv("TARGET_CHANNEL_CANTOS")
+    or "@Goat_Bot01"
+)
+CONFIRMATION_CHANNEL = (
+    os.getenv("CONFIRMATION_CHANNEL")
+    or os.getenv("TARGET_CHANNEL_CONFIRMACAO")
+    or "@ALFA_CON"
+)
 
-TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "@CoutipsIPS")
-CORNERS_CHANNEL = os.getenv("CORNERS_CHANNEL", "@Goat_Bot01")
-CONFIRMATION_CHANNEL = os.getenv("CONFIRMATION_CHANNEL", "@ALFA_CON")
+# Modo teste — True = envia tudo para CONFIRMATION_CHANNEL
+# Mude para false no .env quando quiser voltar ao normal
+MODO_TESTE = os.getenv("MODO_TESTE", "false").lower() == "true"
 
-# OpenAI
-OPENAI_API_KEY = "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"
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-OPENAI_HABILITADO = os.getenv("OPENAI_HABILITADO", "true").lower() == "true"
-
-# Modo teste
-MODO_TESTE = os.getenv("MODO_TESTE", "true").lower() == "true"
-
-# Validação básica
 if not API_ID or not API_HASH:
     raise RuntimeError("API_ID ou API_HASH não configurado.")
 
 try:
-    API_ID = int(API_ID)
+    API_ID = int(API_ID.strip())
 except ValueError:
-    raise RuntimeError("API_ID inválido — deve ser um número inteiro.")
-
-client = TelegramClient("coutips_v2_session.session", API_ID, API_HASH)
+    raise RuntimeError("API_ID inválido — deve ser um número inteiro sem espaços ou caracteres especiais.")
+client = TelegramClient("coutips_v2_session", API_ID, API_HASH)
 
 # =========================================================
 # CONFIGURAÇÃO OFICIAL ATUAL
 # =========================================================
-CORTE_GOL = int(os.getenv("CORTE_GOL", "85"))
-CORTE_GOL_HT = int(os.getenv("CORTE_GOL_HT", "87"))
-CORTE_GOL_FT = int(os.getenv("CORTE_GOL_FT", "82"))
+# Fase atual: SOMENTE GOLS. Cantos desativados.
+# Cortes ajustados após auditoria completa do score:
+# Com o score mais honesto (lado correto, IP contínuo, teto 95),
+# 88 HT equivale ao antigo 93-94 / 83 FT equivale ao antigo 88-89.
+CORTE_GOL = int(os.getenv("CORTE_GOL", "88"))
+CORTE_GOL_HT = int(os.getenv("CORTE_GOL_HT", "88"))
+CORTE_GOL_FT = int(os.getenv("CORTE_GOL_FT", "83"))
 
+# Confirmação: corte menor pois já passou por validação extra de continuidade.
 CORTE_CONFIRMACAO_GOL_HT = int(os.getenv("CORTE_CONFIRMACAO_GOL_HT", "85"))
-CORTE_CONFIRMACAO_GOL_FT = int(os.getenv("CORTE_CONFIRMACAO_GOL_FT", "82"))
+CORTE_CONFIRMACAO_GOL_FT = int(os.getenv("CORTE_CONFIRMACAO_GOL_FT", "80"))
 CORTE_CONFIRMACAO_GOL = int(os.getenv("CORTE_CONFIRMACAO_GOL", str(CORTE_CONFIRMACAO_GOL_HT)))
 
-CORTE_OBSERVACAO_JANELA = int(os.getenv("CORTE_OBSERVACAO_JANELA", "80"))
+# Janela de observação alinhada com os novos cortes.
+CORTE_OBSERVACAO_JANELA = int(os.getenv("CORTE_OBSERVACAO_JANELA", "82"))
 CORTE_CANTO = 999  # DESATIVADO — cantos não são enviados na fase atual
 
 # Memória longa apenas para bots de confirmação.
@@ -81,6 +93,10 @@ tarefas_decisao = {}
 mensagens_processadas = {}
 fila_envio = asyncio.Queue(maxsize=100)  # Limite de segurança: evita acúmulo em flood
 tarefa_envio = None
+
+# Lock por jogo — protege pendentes_por_jogo e tarefas_decisao contra
+# duas mensagens do mesmo jogo chegando simultaneamente (nova + edição).
+_locks_por_jogo: dict = {}
 
 
 # =========================================================
@@ -186,6 +202,15 @@ def bloquear_categoria_base(texto):
 CACHE_MAX_ENTRADAS = 500  # Limite de segurança por cache
 
 
+def _lock_jogo(chave_jogo: str) -> asyncio.Lock:
+    """Retorna (criando se necessário) o lock exclusivo para um jogo.
+    Garante que duas mensagens do mesmo jogo não processem simultaneamente.
+    """
+    if chave_jogo not in _locks_por_jogo:
+        _locks_por_jogo[chave_jogo] = asyncio.Lock()
+    return _locks_por_jogo[chave_jogo]
+
+
 def limpar_memoria_interna():
     agora = time.time()
 
@@ -210,12 +235,15 @@ def limpar_memoria_interna():
         alertas = pendentes_por_jogo.get(chave, [])
         if not alertas:
             pendentes_por_jogo.pop(chave, None)
+            tarefas_decisao.pop(chave, None)
+            _locks_por_jogo.pop(chave, None)
             continue
 
         mais_recente = max(a.get("recebido_em", 0) for a in alertas)
         if agora - mais_recente > 120:
             pendentes_por_jogo.pop(chave, None)
             tarefas_decisao.pop(chave, None)
+            _locks_por_jogo.pop(chave, None)
 
 
 # =========================================================
@@ -463,72 +491,137 @@ def extrair_metricas(texto):
 
 # =========================================================
 # LIGAS / CONTEXTO
+# Classificação baseada em taxa de conversão de gol (experiência real),
+# não em prestígio do campeonato.
 # =========================================================
 
-# Constantes de classificação de liga — definidas uma vez, reutilizadas sem recriação
+# PREMIUM — convertem bem, bônus no score
 _LIGAS_PREMIUM = {
-    "england premier league", "france ligue 1", "italy serie a",
-    "spain la liga", "germany bundesliga", "denmark superliga",
+    # Inglaterra
+    "england premier league", "england championship", "england league one",
+    "england league two", "england national league",
+    # Alemanha — todas as divisões convertem
+    "germany bundesliga", "germany 2. bundesliga", "germany 3. liga",
+    "germany regionalliga",
+    # França
+    "france ligue 1", "france ligue 2",
+    # Competições europeias
+    "champions league", "europa league", "conference league",
+    # EUA — MLS e divisões convertem bem
+    "usa major league soccer", "usa mls", "usa usl championship",
+    "usa usl league", "usa nwsl", "nwsl",
+    # Austrália — todas as divisões convertem
+    "australia",
+    # Espanha séries B e abaixo
+    "spain segunda", "spain primera rfef", "spain segunda rfef",
+    "spain tercera",
+    # Outros que convertem
     "netherlands eredivisie", "belgium pro league",
-    "czech republic fortuna liga", "england league two",
-    "switzerland", "portugal liga", "usa nwsl", "nwsl",
+    "portugal liga", "switzerland super league",
 }
 
+# MODERADA — convertem razoavelmente, exigir números sólidos
 _LIGAS_MODERADAS = {
-    "australia", "india", "china", "norway", "sweden",
-    "finland", "japan", "singapore", "hong kong", "macao",
-    "estonia", "poland", "lithuania", "brazil brasileiro women",
-    "denmark first division", "korea republic k-league", "k-league",
+    # Brasil — série A e B, buscar números ótimos
+    "brazil serie a", "brazil brasileiro", "brazil serie b",
+    "brazil copa do brasil",
+    # Espanha série A — depende do jogo, não é consistente
+    "spain la liga",
+    # Itália — série B e C convertem mais que série A
+    "italy serie b", "italy serie c",
+    # Turquia — converte mas com ressalva
+    "turkey super lig", "turkey 1. lig",
+    # Japão e China — alguns times
+    "japan j1 league", "japan j2 league", "china super league",
+    # Ligas árabes — convertem razoavelmente
+    "saudi arabia", "uae", "qatar", "kuwait", "bahrain",
+    # Outros moderados
+    "norway", "sweden", "denmark", "finland",
+    "poland", "czech republic", "scotland",
+    "korea republic", "k-league",
+    # Sul-americanos série B e abaixo — convertem bem nesse nível
+    "argentina primera b", "argentina primera c", "argentina primera d",
+    "colombia segunda", "peru segunda", "chile primera b",
+    "uruguay segunda", "venezuela segunda",
 }
 
-# Ligas estruturalmente mais under/truncadas.
-# Não bloqueiam sozinhas, mas exigem muito mais prova de gol.
+# UNDER — convertem pouco, exigir números extremos para entrar
 _LIGAS_UNDER = {
-    "argentina", "colombia", "peru", "bolivia", "paraguay", "paraguai",
-    "ecuador", "chile", "uruguay", "uruguai", "venezuela",
-    "greece", "turkey", "turquia", "romania", "algeria", "iraq",
+    # Sul-americanos série A — estruturalmente truncados
+    "argentina primera division", "argentina liga profesional",
+    "colombia primera a", "peru liga 1",
+    "chile primera division", "chile primera a",
+    "uruguay primera division",
+    "ecuador liga pro", "bolivia",
+    "paraguay", "venezuela primera",
+    # Itália série A — não converte bem exceto com times grandes
+    "italy serie a",
+    # Ligas africanas — convertem pouco
+    "africa", "nigeria", "ghana", "kenya", "tanzania",
+    "egypt", "morocco", "algeria", "tunisia", "senegal",
+    "south africa", "cameroon", "ivory coast",
+    # Outros under
+    "greece", "romania", "bulgaria", "serbia",
+    "croatia", "slovakia", "hungary",
 }
 
+# PERIGOSA — evitar, dados poucos confiáveis ou conversão muito baixa
 _LIGAS_PERIGOSAS = {
-    "romania 3", "new zealand regional", "mongolia", "jordan",
+    "mongolia", "new zealand regional", "jordan regional",
+    "myanmar", "cambodia", "laos", "bhutan",
+    "san marino", "andorra", "gibraltar", "faroe islands",
+    "kosovo", "moldova", "armenia", "azerbaijan",
 }
 
 
 def classificar_liga(competicao):
     c = remover_acentos(competicao).lower()
 
-    if any(x in c for x in _LIGAS_UNDER):
-        return "UNDER"
+    # Ordem: perigosa → under → moderada → premium → neutra
+    # Perigosa primeiro para não ser engolida por match parcial
     if any(x in c for x in _LIGAS_PERIGOSAS):
         return "PERIGOSA"
-    if any(x in c for x in _LIGAS_PREMIUM):
-        return "PREMIUM"
+    if any(x in c for x in _LIGAS_UNDER):
+        return "UNDER"
     if any(x in c for x in _LIGAS_MODERADAS):
         return "MODERADA"
+    if any(x in c for x in _LIGAS_PREMIUM):
+        return "PREMIUM"
 
     return "NEUTRA"
 
 
 def liga_score(metricas, mercado="gol"):
-    liga = classificar_liga(metricas.get("competicao", ""))
+    liga = metricas.get("_cache_liga") or classificar_liga(metricas.get("competicao", ""))
+    comp = remover_acentos(metricas.get("competicao", "")).lower()
 
     if mercado == "canto":
-        if liga == "PREMIUM":
-            return 3
-        if liga == "MODERADA":
-            return 1
-        if liga == "PERIGOSA":
-            return -3
+        if liga == "PREMIUM":   return 3
+        if liga == "MODERADA":  return 1
+        if liga == "PERIGOSA":  return -3
         return 0
 
+    # ── Score de gol por liga ─────────────────────────────────────────────────
     if liga == "PREMIUM":
-        return 4
+        return 5   # convertem bem — bônus maior
+
     if liga == "MODERADA":
-        return 0
+        # Brasil e Itália série A: moderada mas exige números extremos
+        # O score neutro já reflete isso — o funil faz o trabalho
+        if "brazil" in comp or "brasil" in comp:
+            return 0   # neutro — exige números sólidos pelo funil
+        if "italy serie a" in comp or "spain la liga" in comp:
+            return -2  # leve penalidade — inconsistentes
+        return 1       # outras moderadas: pequeno bônus
+
     if liga == "UNDER":
+        # Sul-americanos série A e África convertem muito pouco
         return -8
+
     if liga == "PERIGOSA":
-        return -10
+        return -12
+
+    # NEUTRA — desconhecida, sem bônus nem penalidade
     return 0
 
 
@@ -1109,7 +1202,19 @@ def trava_pos_gol_institucional(metricas, estrategia, lado):
             return True, 83, "MASSACRE_POS_GOL_AGUARDAR_CONFIRMACAO"
         return True, 76, "PRESSAO_PREMIADA_BLOQUEIO"
 
+    # Gol a favor do lado dominante entre 5-12 minutos:
+    # pressão foi convertida — jogo muda de natureza.
+    # Só mantém se a pressão continuou forte após o gol.
+    if lado_gol == lado and 5 < minutos <= 12:
+        if q["dados"]["u5"] >= 4 and q["dados"]["u10"] >= 8:
+            # Pressão continuou — limita mas não bloqueia
+            return True, 84, "GOL_A_FAVOR_PRESSAO_CONTINUOU"
+        else:
+            # Pressão esfriou após gol — cai forte
+            return True, 72, "GOL_A_FAVOR_PRESSAO_ESFRIOU"
+
     # Zebra/time pressionado marcando contra o fluxo abre o jogo.
+    # Bônus: favorito/dominante perdendo agora tem pressão + necessidade emocional.
     if lado_gol in [pressionado, zebra] and lado == dom and minutos <= 8:
         return False, 0, "GOL_CONTRA_FLUXO_ABRIU_JOGO"
 
@@ -1230,6 +1335,11 @@ def score_classificacao_institucional(metricas, estrategia):
     score += min(q["continuidade"] * 3, 10)
     score += min(q["consequencia"] * 3, 12)
 
+    # Continuidade IP ponderada — filosofia central do sistema ALFA.
+    # IP contínuo com consequência vale mais que pico isolado.
+    cont_ip = score_continuidade_ip(metricas, estrategia)
+    score += int(min(cont_ip, 20))  # cap de 20 dentro do score total
+
     if dados["u5"] >= 6:
         score += 3
     if dados["u10"] >= 10:
@@ -1297,7 +1407,7 @@ def score_classificacao_institucional(metricas, estrategia):
         if not (q["pressao_recente"] >= 2 and q["continuidade"] >= 2 and q["consequencia"] >= 3):
             score = 87
 
-    return int(max(0, min(score, 99)))
+    return int(max(0, min(score, 95)))
 
 
 # =========================================================
@@ -1306,11 +1416,13 @@ def score_classificacao_institucional(metricas, estrategia):
 
 def favorito_score(metricas):
     bonus = 0
+    odds = metricas.get("odds", (0, 0, 0))
+    if not isinstance(odds, (tuple, list)) or len(odds) < 3:
+        return 0
 
-    for odd in [metricas["odds"][0], metricas["odds"][2]]:
+    for odd in [odds[0], odds[2]]:
         if not odd:
             continue
-
         if odd <= 1.35:
             bonus += 10
         elif odd <= 1.50:
@@ -1323,7 +1435,81 @@ def favorito_score(metricas):
     return min(bonus, 12)
 
 
-def score_padrao_alfa(metricas, estrategia):
+def score_continuidade_ip(metricas, estrategia):
+    """Pontuação de IP contínuo com consequência obrigatória.
+
+    Filosofia central do sistema ALFA:
+    IP contínuo por 5+ minutos vale mais do que pico isolado de 25-30.
+    Mas IP contínuo SÓ conta se vier acompanhado de consequência real
+    (remate à baliza, xG, chance de golo).
+
+    Usa dados do lado dominante — não soma os dois times.
+    """
+    p = metricas.get("pressao_alfa", {})
+    dom = metricas.get("lado_dominante", "EQUILIBRADO")
+
+    if dom == "CASA":
+        c10 = p.get("ip_consec_10_casa", 0)
+        c15 = p.get("ip_consec_15_casa", 0)
+        c18 = p.get("ip_consec_18_casa", 0)
+        c22 = p.get("ip_consec_22_casa", 0)
+        rb   = metricas.get("remates_baliza", (0, 0))[0]
+        rda  = metricas.get("remates_dentro_area", (0, 0))[0]
+        xg   = metricas.get("xg", (0.0, 0.0))[0]
+        chance = metricas.get("chance_golo", (0, 0))[0]
+    elif dom == "FORA":
+        c10 = p.get("ip_consec_10_fora", 0)
+        c15 = p.get("ip_consec_15_fora", 0)
+        c18 = p.get("ip_consec_18_fora", 0)
+        c22 = p.get("ip_consec_22_fora", 0)
+        rb   = metricas.get("remates_baliza", (0, 0))[1]
+        rda  = metricas.get("remates_dentro_area", (0, 0))[1]
+        xg   = metricas.get("xg", (0.0, 0.0))[1]
+        chance = metricas.get("chance_golo", (0, 0))[1]
+    else:
+        # Equilibrado: usa max dos dois lados
+        c10 = max(p.get("ip_consec_10_casa", 0), p.get("ip_consec_10_fora", 0))
+        c15 = max(p.get("ip_consec_15_casa", 0), p.get("ip_consec_15_fora", 0))
+        c18 = max(p.get("ip_consec_18_casa", 0), p.get("ip_consec_18_fora", 0))
+        c22 = max(p.get("ip_consec_22_casa", 0), p.get("ip_consec_22_fora", 0))
+        rb     = sum(metricas.get("remates_baliza", (0, 0)))
+        rda    = sum(metricas.get("remates_dentro_area", (0, 0)))
+        xg     = sum(metricas.get("xg", (0.0, 0.0)))
+        chance = max(metricas.get("chance_golo", (0, 0)))
+
+    # Score de continuidade ponderado:
+    # c10 × 1.0 + c15 × 1.5 + c18 × 2.0 + c22 × 3.0
+    # IP moderado contínuo (c15=6min) vale mais que pico isolado de 30
+    score_cont = (
+        c10 * 1.0 +
+        c15 * 1.5 +
+        c18 * 2.0 +
+        c22 * 3.0
+    )
+
+    # Consequência obrigatória — sem ela, IP contínuo é território sem ruptura
+    tem_consequencia = rb >= 1 or rda >= 1 or xg >= 0.25 or chance >= 5
+    if not tem_consequencia:
+        score_cont *= 0.25  # penaliza forte — pressão sem finalização
+        metricas["continuidade_ip_motivo"] = "SEM_CONSEQUENCIA_PENALIZADO"
+    else:
+        metricas["continuidade_ip_motivo"] = "COM_CONSEQUENCIA_VALIDADO"
+
+    # Bônus extra quando continuidade é excepcional
+    bonus = 0
+    if c22 >= 3 and rb >= 2:
+        bonus = 8   # pressão dominante de alto nível com finalização
+    elif c18 >= 4 and rb >= 1:
+        bonus = 5
+    elif c15 >= 6 and tem_consequencia:
+        bonus = 3
+
+    resultado = min(score_cont + bonus, 35)  # cap de 35 para não dominar o score
+    metricas["score_continuidade_ip"] = round(resultado, 1)
+    return resultado
+
+
+
     p = metricas.get("pressao_alfa", {})
     ch_c, ch_f = metricas.get("chance_golo", (0, 0))
 
@@ -1518,31 +1704,35 @@ def dominio_score_gol(metricas):
 
 
 def momentum_score(metricas):
-    u5c, u5f = metricas["ultimos5"]
-    u10c, u10f = metricas["ultimos10"]
+    # Corrigido: usa dados do lado dominante, não soma dos dois times.
+    # Desequilíbrio entre os lados é bônus separado.
+    u5c, u5f = metricas.get("ultimos5", (0, 0))
+    u10c, u10f = metricas.get("ultimos10", (0, 0))
 
-    u5 = u5c + u5f
-    u10 = u10c + u10f
+    dom = metricas.get("lado_dominante", "EQUILIBRADO")
+    if not dom or dom == "EQUILIBRADO":
+        dom, _ = lado_dominante(metricas)
+
+    if dom == "CASA":
+        u5, u10 = u5c, u10c
+    elif dom == "FORA":
+        u5, u10 = u5f, u10f
+    else:
+        u5, u10 = u5c + u5f, u10c + u10f
+
     score = 0
 
-    if u5 >= 3:
-        score += 3
-    if u5 >= 5:
-        score += 4
-    if u5 >= 8:
-        score += 2
+    if u5 >= 3: score += 3
+    if u5 >= 5: score += 4
+    if u5 >= 8: score += 2
 
-    if u10 >= 7:
-        score += 4
-    if u10 >= 10:
-        score += 3
-    if u10 >= 14:
-        score += 2
+    if u10 >= 7:  score += 4
+    if u10 >= 10: score += 3
+    if u10 >= 14: score += 2
 
-    if abs(u10c - u10f) >= 4:
-        score += 3
-    if abs(u5c - u5f) >= 3:
-        score += 2
+    # Bônus de desequilíbrio — lado dominante muito mais ativo que o passivo
+    if abs(u10c - u10f) >= 4: score += 3
+    if abs(u5c - u5f) >= 3:   score += 2
 
     return score
 
@@ -1568,8 +1758,10 @@ def relogio_score(metricas, estrategia):
             return 5
         if 82 <= t <= 83:
             return -4
-        if t >= 84:
-            return -14
+        if 84 <= t <= 86:
+            return -8   # suavizado — antes era -14 direto
+        if t >= 87:
+            return -14  # penalidade máxima só acima de 87
         if t < 63:
             return -6
         return 2
@@ -1578,10 +1770,10 @@ def relogio_score(metricas, estrategia):
 
 
 def ajuste_vermelho_contextual(metricas):
-    liga = classificar_liga(metricas.get("competicao", ""))
+    liga = metricas.get("_cache_liga") or classificar_liga(metricas.get("competicao", ""))
     vermelho = lado_com_vermelho(metricas)
-    dom, _ = lado_dominante(metricas)
-    fav, _ = lado_favorito(metricas)
+    dom = metricas.get("lado_dominante", "EQUILIBRADO")
+    fav = metricas.get("lado_favorito", "DESCONHECIDO")
     zebra = lado_zebra(metricas)
 
     if vermelho in ["NENHUM", "AMBOS"] or dom == "EQUILIBRADO":
@@ -1683,15 +1875,26 @@ def ajuste_gol_recente_contextual(metricas, estrategia):
     return 0, "GOL_ANTIGO_OK"
 
 def fake_pressure_penalty_gol(metricas):
-    ap = sum(metricas["ataques_perigosos"])
-    rb = sum(metricas["remates_baliza"])
-    rl = sum(metricas["remates_lado"])
-    rda = sum(metricas.get("remates_dentro_area", (0, 0)))
-    u5 = sum(metricas["ultimos5"])
-    u10 = sum(metricas["ultimos10"])
-    xg = sum(metricas.get("xg", (0, 0)))
-    xgi = sum(metricas.get("xgi", (0, 0)))
-    cant = sum(metricas["cantos"])
+    # Corrigido: usa dados do lado dominante em vez de soma dos dois times.
+    # Evita penalizar jogo onde só um lado tem volume real.
+    dom = metricas.get("lado_dominante", "EQUILIBRADO")
+    idx = 0 if dom == "CASA" else 1 if dom == "FORA" else None
+
+    def lado_val(campo, fallback=0):
+        v = metricas.get(campo, (fallback, fallback))
+        if idx is not None and isinstance(v, (tuple, list)) and len(v) > idx:
+            return v[idx]
+        return sum(v) if isinstance(v, (tuple, list)) else fallback
+
+    ap  = lado_val("ataques_perigosos")
+    rb  = lado_val("remates_baliza")
+    rl  = lado_val("remates_lado")
+    rda = lado_val("remates_dentro_area")
+    u5  = lado_val("ultimos5")
+    u10 = lado_val("ultimos10")
+    xg  = lado_val("xg")
+    xgi = lado_val("xgi")
+    cant = lado_val("cantos")
     hc, hf = metricas.get("heatmap", (0, 0))
     padrao = metricas.get("padrao_alfa", "")
 
@@ -1741,17 +1944,28 @@ def score_delta_confirmacao(metricas, estrategia, chave_jogo):
     if idade > MEMORIA_CONFIRMACAO_SEGUNDOS:
         return 0, "LEITURA_ANTERIOR_EXPIRADA"
 
-    u5_atual = soma_lados(metricas, "ultimos5")
-    u10_atual = soma_lados(metricas, "ultimos10")
-    u5_ant = soma_lados(ant, "ultimos5")
-    u10_ant = soma_lados(ant, "ultimos10")
+    # Corrigido: compara métricas do lado dominante, não soma dos dois times.
+    # Evita validar confirmação onde só o lado passivo cresceu.
+    dom = metricas.get("lado_dominante", "EQUILIBRADO")
+    idx = 0 if dom == "CASA" else 1 if dom == "FORA" else None
 
-    rb_atual = soma_lados(metricas, "remates_baliza")
-    rb_ant = soma_lados(ant, "remates_baliza")
-    rda_atual = soma_lados(metricas, "remates_dentro_area")
-    rda_ant = soma_lados(ant, "remates_dentro_area")
-    cantos_atual = soma_lados(metricas, "cantos")
-    cantos_ant = soma_lados(ant, "cantos")
+    def lado_val(campo, m, fallback=0):
+        v = m.get(campo, (fallback, fallback))
+        if idx is not None and isinstance(v, (tuple, list)) and len(v) > idx:
+            return v[idx]
+        return sum(v) if isinstance(v, (tuple, list)) else fallback
+
+    u5_atual  = lado_val("ultimos5",  metricas)
+    u10_atual = lado_val("ultimos10", metricas)
+    u5_ant    = lado_val("ultimos5",  ant)
+    u10_ant   = lado_val("ultimos10", ant)
+
+    rb_atual    = lado_val("remates_baliza",      metricas)
+    rb_ant      = lado_val("remates_baliza",      ant)
+    rda_atual   = lado_val("remates_dentro_area", metricas)
+    rda_ant     = lado_val("remates_dentro_area", ant)
+    cantos_atual = lado_val("cantos", metricas)
+    cantos_ant   = lado_val("cantos", ant)
 
     p = metricas.get("pressao_alfa", {})
     pa = ant.get("pressao_alfa", {})
@@ -2425,7 +2639,8 @@ def score_gol(metricas, estrategia, chave_jogo):
     if not tempo_operacional_valido(metricas, estrategia):
         score = min(score, 72)
 
-    return int(max(0, min(score, 99))), metricas
+    # Teto máximo: 95 — nenhum jogo é certeza absoluta
+    return int(max(0, min(score, 95))), metricas
 
 # =========================================================
 # CANTO — DESATIVADO NA FASE ATUAL (somente gols)
@@ -2640,7 +2855,7 @@ def texto_contexto_gol(metricas):
     return "\n" + "\n".join(textos) if textos else ""
 
 
-def montar_mensagem_gol(jogo, estrategia, score, metricas, analise_openai=None):
+def montar_mensagem_gol(jogo, estrategia, score, metricas):
     ctx = texto_contexto_gol(metricas)
     link = f"\n🔗 Bet365: {html.escape(metricas['bet365'])}" if metricas.get("bet365") else ""
 
@@ -2656,14 +2871,6 @@ def montar_mensagem_gol(jogo, estrategia, score, metricas, analise_openai=None):
     elif metricas.get("motivo_funil") == "FUNIL_APROVADO":
         leitura_base = "Jogo passou pelo funil ALFA: pressão, validação, travas e classificação."
 
-    # Bloco de análise contextual da OpenAI (aparece só se habilitada)
-    bloco_openai = ""
-    if analise_openai and analise_openai.get("leitura"):
-        leitura_ai = html.escape(str(analise_openai["leitura"]))
-        confianca_ai = analise_openai.get("confianca", "")
-        conf_texto = f" · confiança {confianca_ai}%" if confianca_ai else ""
-        bloco_openai = f"\n\n🤖 <b>Análise IA{conf_texto}:</b>\n{leitura_ai}"
-
     return f"""{titulo}
 
 ⚽ <b>COUTIPS {nome_bot}</b>
@@ -2677,7 +2884,7 @@ def montar_mensagem_gol(jogo, estrategia, score, metricas, analise_openai=None):
 💰 <b>Odd mínima:</b> 1.60
 
 🧠 <b>Leitura:</b>
-{html.escape(leitura_base)}{ctx}{bloco_openai}
+{html.escape(leitura_base)}{ctx}
 
 📌 <b>Gestão:</b>
 Entrada padrão — 1% da banca.
@@ -2690,115 +2897,40 @@ def montar_mensagem_canto(jogo, estrategia, score, metricas):
     return ""
 
 
-# =========================================================
-# INTEGRAÇÃO OPENAI — ANÁLISE CONTEXTUAL
-# =========================================================
-
-SYSTEM_PROMPT_OPENAI = """Você é um analista especializado em trading esportivo ao vivo, focado em mercados de gols.
-
-Você recebe alertas de jogos de futebol que já passaram por um funil automático rigoroso (ALFA).
-Sua função é fazer uma análise contextual final — olhar para o que os números realmente significam naquele momento do jogo.
-
-Responda SEMPRE em JSON puro, sem texto fora do JSON, sem markdown, sem explicações adicionais.
-
-Formato obrigatório:
-{
-  "decisao": "APROVADO" ou "BLOQUEADO",
-  "confianca": número de 0 a 100,
-  "motivo": "explicação curta em uma linha",
-  "leitura": "análise para o apostador em 2-3 linhas, em português direto e objetivo"
-}
-
-Critérios para BLOQUEAR:
-- Pressão claramente fake: muitos ataques mas sem remates à baliza nem xG real
-- Jogo emocionalmente morto: placar fechado, pouca chance de reversão
-- Tempo insuficiente: menos de 10 minutos para o fim sem pressão explosiva
-- Liga de alto risco sem evidência concreta de gol
-- Gol acabou de sair e o jogo ainda não se reorganizou
-
-Critérios para APROVAR:
-- Pressão real e sustentada do lado correto (favorito perdendo ou empatando)
-- Métricas ofensivas concretas: remates à baliza, xG, chance de golo
-- Contexto emocional vivo: favorito pressionando para virar ou ampliar
-- Liga confiável com histórico de gols
-
-Seja direto. Não aprove por dúvida — bloqueie."""
+LOG_CSV_PATH = os.getenv("LOG_CSV_PATH", "alertas_enviados.csv")
+_CSV_CABECALHO = ["data_hora", "jogo", "estrategia", "minuto", "placar",
+                  "score", "mercado", "liga", "lado_dominante", "resultado"]
 
 
-async def consultar_openai(texto_alerta: str, score_bot: int, jogo: str, estrategia: str) -> dict:
-    """Envia o alerta para a OpenAI e retorna a decisão contextual.
+def registrar_alerta_csv(alerta: dict):
+    """Registra alerta enviado em CSV para análise futura de resultados.
 
-    Retorna dict com: decisao, confianca, motivo, leitura.
-    Em caso de erro, retorna APROVADO para não perder o alerta (o bot já filtrou).
+    A coluna 'resultado' fica em branco — você preenche manualmente
+    após o jogo com: GOL, NAO_GOL ou INCONCLUSIVO.
     """
-    if not OPENAI_API_KEY:
-        log("⚠️ OPENAI_API_KEY não configurada — pulando análise OpenAI.")
-        return {"decisao": "APROVADO", "confianca": score_bot, "motivo": "OpenAI não configurada", "leitura": ""}
-
-    prompt = f"""Analise este alerta de trading esportivo ao vivo:
-
-Jogo: {jogo}
-Estratégia: {estrategia}
-Score do sistema ALFA: {score_bot}%
-
---- DADOS COMPLETOS DO ALERTA ---
-{texto_alerta}
----
-
-Retorne sua análise no formato JSON especificado."""
-
-    payload = {
-        "model": OPENAI_MODEL,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT_OPENAI},
-            {"role": "user",   "content": prompt},
-        ],
-        "max_tokens": 300,
-        "temperature": 0.2,  # baixo para respostas consistentes
+    m = alerta.get("metricas", {})
+    linha = {
+        "data_hora":     datetime.now().strftime("%d/%m/%Y %H:%M"),
+        "jogo":          alerta.get("jogo", ""),
+        "estrategia":    alerta.get("estrategia", ""),
+        "minuto":        m.get("tempo", ""),
+        "placar":        m.get("placar", ""),
+        "score":         alerta.get("score_gol", ""),
+        "mercado":       m.get("mercado", ""),
+        "liga":          m.get("competicao", ""),
+        "lado_dominante": m.get("lado_dominante", ""),
+        "resultado":     "",  # preencher manualmente após o jogo
     }
-
     try:
-        async with httpx.AsyncClient(timeout=15.0) as cliente:
-            resposta = await cliente.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {OPENAI_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json=payload,
-            )
-            resposta.raise_for_status()
-            dados = resposta.json()
-            texto = dados["choices"][0]["message"]["content"].strip()
-
-            # limpar possível markdown do modelo
-            texto = texto.replace("```json", "").replace("```", "").strip()
-
-            import json as _json
-            resultado = _json.loads(texto)
-
-            # garantir campos obrigatórios
-            decisao = str(resultado.get("decisao", "APROVADO")).upper()
-            if decisao not in ("APROVADO", "BLOQUEADO"):
-                decisao = "APROVADO"
-
-            log(
-                f"🤖 OpenAI | {jogo} | decisão={decisao} "
-                f"confiança={resultado.get('confianca','?')}% | {resultado.get('motivo','')}"
-            )
-            return {
-                "decisao": decisao,
-                "confianca": resultado.get("confianca", score_bot),
-                "motivo": resultado.get("motivo", ""),
-                "leitura": resultado.get("leitura", ""),
-            }
-
-    except httpx.TimeoutException:
-        log(f"⚠️ OpenAI timeout para {jogo} — aprovando por fallback.")
-        return {"decisao": "APROVADO", "confianca": score_bot, "motivo": "Timeout OpenAI", "leitura": ""}
+        arquivo_existe = os.path.isfile(LOG_CSV_PATH)
+        with open(LOG_CSV_PATH, "a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=_CSV_CABECALHO)
+            if not arquivo_existe:
+                writer.writeheader()
+            writer.writerow(linha)
+        log(f"📋 Alerta registrado no CSV: {alerta.get('jogo')} | {alerta.get('score_gol')}%")
     except Exception as e:
-        log(f"⚠️ Erro OpenAI para {jogo}: {e} — aprovando por fallback.")
-        return {"decisao": "APROVADO", "confianca": score_bot, "motivo": f"Erro: {e}", "leitura": ""}
+        log(f"⚠️ Erro ao salvar CSV: {e}")
 
 
 # =========================================================
@@ -2807,10 +2939,7 @@ Retorne sua análise no formato JSON especificado."""
 
 async def trabalhador_envio():
     log("📤 Fila de envio iniciada.")
-    if MODO_TESTE:
-        log(f"🧪 MODO TESTE ATIVO — envios apenas para {CONFIRMATION_CHANNEL}")
-    if OPENAI_HABILITADO:
-        log(f"🤖 Análise OpenAI ATIVA ({OPENAI_MODEL})")
+    log(f"📡 Canais ativos: principal={TARGET_CHANNEL} | confirmação={CONFIRMATION_CHANNEL}")
 
     while True:
         item = await fila_envio.get()
@@ -2825,29 +2954,12 @@ async def trabalhador_envio():
                 )
                 continue
 
-            alerta     = item["alerta"]
-            mercado    = item["mercado"]
-            texto_raw  = item.get("texto_original", "")  # texto bruto do alerta
+            alerta  = item["alerta"]
+            mercado = item["mercado"]
 
             if mercado != "GOL":
                 log(f"⚠️ Mercado ignorado na fase atual: {mercado}")
                 continue
-
-            # ── Análise OpenAI (se habilitada) ───────────────────────────────
-            analise_openai = None
-            if OPENAI_HABILITADO and texto_raw:
-                analise_openai = await consultar_openai(
-                    texto_alerta=texto_raw,
-                    score_bot=alerta["score_gol"],
-                    jogo=alerta["jogo"],
-                    estrategia=alerta["estrategia"],
-                )
-                if analise_openai["decisao"] == "BLOQUEADO":
-                    log(
-                        f"🤖 OpenAI BLOQUEOU | {alerta['jogo']} | "
-                        f"motivo: {analise_openai['motivo']}"
-                    )
-                    continue  # descarta — não envia
 
             # ── Montar mensagem ───────────────────────────────────────────────
             mensagem = montar_mensagem_gol(
@@ -2855,19 +2967,17 @@ async def trabalhador_envio():
                 alerta["estrategia"],
                 alerta["score_gol"],
                 alerta["metricas"],
-                analise_openai=analise_openai,
             )
 
-            # ── Definir destino ───────────────────────────────────────────────
+            # Definir destino — modo teste envia tudo para canal de confirmação
             if MODO_TESTE:
-                # Modo teste: tudo vai só para o canal de confirmação
                 destino = CONFIRMATION_CHANNEL
             else:
-                # Modo normal: confirmações vão para CONFIRMATION_CHANNEL, resto para TARGET_CHANNEL
                 destino = item.get("destino") or TARGET_CHANNEL
 
             await client.send_message(destino, mensagem, parse_mode="html")
             marcar_enviado(item["chave_envio"])
+            registrar_alerta_csv(alerta)
 
             log(
                 f"✅ ENVIADO GOL | {alerta['estrategia']} | "
@@ -2892,9 +3002,13 @@ async def decidir_e_enviar(chave_jogo):
     try:
         await asyncio.sleep(JANELA_DECISAO_SEGUNDOS)
 
-        alertas = pendentes_por_jogo.pop(chave_jogo, [])
-        tarefas_decisao.pop(chave_jogo, None)
+        # Lock ao fazer pop — garante que nenhuma mensagem nova
+        # adicione alertas enquanto a decisão está sendo tomada.
+        async with _lock_jogo(chave_jogo):
+            alertas = pendentes_por_jogo.pop(chave_jogo, [])
+            tarefas_decisao.pop(chave_jogo, None)
 
+        # Lock liberado — o resto do processamento é local e seguro.
         if not alertas:
             log(f"ℹ️ Nenhum alerta pendente para {chave_jogo}")
             return
@@ -3097,29 +3211,60 @@ async def processar_evento(event, origem="nova"):
                 f"Gol={sg}% abaixo do corte real {corte_evento}% | {jogo}"
             )
 
-        pendentes_por_jogo.setdefault(chave_jogo, []).append(alerta)
+        # Lock por jogo: garante que nova mensagem e edição simultânea
+        # do mesmo jogo não sobrescrevam pendentes_por_jogo uma da outra.
+        async with _lock_jogo(chave_jogo):
+            pendentes_por_jogo.setdefault(chave_jogo, []).append(alerta)
 
-        log(
-            f"⏳ ALERTA EM JANELA DE DECISÃO | {estrategia} | "
-            f"Gol={sg}% | aguardando {JANELA_DECISAO_SEGUNDOS}s | {jogo}"
-        )
+            log(
+                f"⏳ ALERTA EM JANELA DE DECISÃO | {estrategia} | "
+                f"Gol={sg}% | aguardando {JANELA_DECISAO_SEGUNDOS}s | {jogo}"
+            )
 
-        if chave_jogo not in tarefas_decisao:
-            tarefas_decisao[chave_jogo] = asyncio.create_task(decidir_e_enviar(chave_jogo))
+            if chave_jogo not in tarefas_decisao:
+                tarefas_decisao[chave_jogo] = asyncio.create_task(decidir_e_enviar(chave_jogo))
 
     except Exception as e:
         log(f"❌ ERRO NO PROCESSAMENTO DO ALERTA: {e}")
         log(traceback.format_exc())
 
 
-@client.on(events.NewMessage)
+@client.on(events.NewMessage(incoming=True))
 async def handler_nova_mensagem(event):
     await processar_evento(event, origem="nova")
 
 
-@client.on(events.MessageEdited)
+@client.on(events.MessageEdited(incoming=True))
 async def handler_mensagem_editada(event):
     await processar_evento(event, origem="editada")
+
+
+# =========================================================
+# PROTEÇÃO CONTRA INSTÂNCIA DUPLICADA
+# =========================================================
+
+import fcntl
+import socket
+
+def verificar_instancia_unica():
+    """Garante que apenas uma instância do bot está rodando.
+
+    Usa dois mecanismos combinados:
+    1. Arquivo de lock — bloqueia segunda instância no mesmo servidor
+    2. Socket exclusivo — detecta processo duplicado no mesmo host
+    """
+    lock_path = "/tmp/alfa_bot.lock"
+    try:
+        lock_file = open(lock_path, "w")
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        lock_file.write(str(os.getpid()))
+        lock_file.flush()
+        log(f"✅ Instância única confirmada (PID {os.getpid()})")
+        return lock_file  # mantém o arquivo aberto para manter o lock
+    except IOError:
+        log("❌ OUTRA INSTÂNCIA JÁ ESTÁ RODANDO — encerrando este processo.")
+        log("   Verifique no Railway se há mais de 1 réplica ativa em Settings.")
+        raise SystemExit(1)
 
 
 # =========================================================
@@ -3133,11 +3278,11 @@ async def main():
     log("📊 Estratégias ativas: ALFA_HT | ALFA_HT CONFIRMAÇÃO | ALFA_FT | ALFA_FT CONFIRMAÇÃO | ARCE_HT | CHAMA_FT")
     log(f"⚽ Canal gols: {TARGET_CHANNEL}")
     log(f"🧪 Canal técnico de confirmação: {CONFIRMATION_CHANNEL}")
+    if MODO_TESTE:
+        log(f"🧪 MODO TESTE ATIVO — todos os alertas vão para {CONFIRMATION_CHANNEL}")
     log(f"🎯 Cortes gol: HT={CORTE_GOL_HT}% | FT={CORTE_GOL_FT}% | Conf HT={CORTE_CONFIRMACAO_GOL_HT}% | Conf FT={CORTE_CONFIRMACAO_GOL_FT}% | Cantos desativados")
     log(f"⏳ Janela de decisão por jogo: {JANELA_DECISAO_SEGUNDOS}s")
     log(f"📤 Intervalo entre envios: {INTERVALO_ENVIO_SEGUNDOS}s")
-    log("⚠️ Confirme no Railway que existe apenas 1 instância/replica ativa.")
-    log("🧠 Score ALFA: funil anti-fake pressure, HT 87+, FT 82+, ARCE/CHAMA +3, liga under pesada, consequência ofensiva do lado certo e confirmação forte pode voltar ao canal principal.")
 
     await client.start()
 
@@ -3150,6 +3295,7 @@ async def main():
 
 
 if __name__ == "__main__":
+    _lock = verificar_instancia_unica()  # bloqueia se já houver outra instância
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
