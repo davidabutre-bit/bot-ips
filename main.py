@@ -53,7 +53,14 @@ try:
     API_ID = int(API_ID.strip())
 except ValueError:
     raise RuntimeError("API_ID inválido — deve ser um número inteiro sem espaços ou caracteres especiais.")
-client = TelegramClient("coutips_v2_session", API_ID, API_HASH)
+
+# receive_updates=True garante recebimento de todas as atualizações incluindo mensagens de bots
+client = TelegramClient(
+    "coutips_v2_session",
+    API_ID,
+    API_HASH,
+    receive_updates=True,
+)
 
 # =========================================================
 # CONFIGURAÇÃO OFICIAL ATUAL
@@ -3467,11 +3474,16 @@ async def watchdog_envio():
 # =========================================================
 
 async def processar_evento(event, origem="nova"):
+    # Ignora apenas mensagens enviadas pelo próprio número (outgoing)
+    # Mensagens de bots como CornerProBot não são outgoing — são incoming
     if event.out:
         return
 
     texto = event.raw_text or ""
-    log(f"📥 EVENTO RECEBIDO DO TELEGRAM | origem={origem}")
+
+    # Log detalhado para diagnóstico
+    sender = getattr(event, 'sender_id', 'desconhecido')
+    log(f"📥 EVENTO RECEBIDO DO TELEGRAM | origem={origem} | sender={sender}")
 
     if not texto.strip():
         log("ℹ️ Evento ignorado: texto vazio.")
@@ -3564,12 +3576,12 @@ async def processar_evento(event, origem="nova"):
         log(traceback.format_exc())
 
 
-@client.on(events.NewMessage(incoming=True))
+@client.on(events.NewMessage(incoming=True, from_users=None))
 async def handler_nova_mensagem(event):
     await processar_evento(event, origem="nova")
 
 
-@client.on(events.MessageEdited(incoming=True))
+@client.on(events.MessageEdited(incoming=True, from_users=None))
 async def handler_mensagem_editada(event):
     await processar_evento(event, origem="editada")
 
@@ -3620,6 +3632,9 @@ async def main():
     log(f"📤 Intervalo entre envios: {INTERVALO_ENVIO_SEGUNDOS}s")
 
     await client.start()
+
+    # Força o cliente a buscar mensagens que chegaram enquanto estava offline
+    await client.catch_up()
 
     log("✅ TELEGRAM CONECTADO COM SUCESSO")
 
