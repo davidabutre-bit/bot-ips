@@ -10,6 +10,7 @@ import html
 import unicodedata
 import logging
 import csv
+import httpx
 from datetime import datetime
 
 load_dotenv()
@@ -85,6 +86,29 @@ INTERVALO_ENVIO_SEGUNDOS = float(os.getenv("INTERVALO_ENVIO_SEGUNDOS", "5"))
 CONFIRMACAO_DELTA_FORTE = int(os.getenv("CONFIRMACAO_DELTA_FORTE", "8"))
 CONFIRMACAO_SCORE_MINIMO = int(os.getenv("CONFIRMACAO_SCORE_MINIMO", str(CORTE_CONFIRMACAO_GOL_HT)))
 WATCHDOG_SEGUNDOS = int(os.getenv("WATCHDOG_SEGUNDOS", "60"))
+
+# ── Canais ────────────────────────────────────────────────────────────────────
+TARGET_CHANNEL = (
+    os.getenv("TARGET_CHANNEL")
+    or os.getenv("TARGET_CHANNEL_GOLS")
+    or "@CoutipsIPS"
+)
+CORNERS_CHANNEL = (
+    os.getenv("CORNERS_CHANNEL")
+    or os.getenv("TARGET_CHANNEL_CANTOS")
+    or "@Goat_Bot01"
+)
+CONFIRMATION_CHANNEL = (
+    os.getenv("CONFIRMATION_CHANNEL")
+    or os.getenv("TARGET_CHANNEL_CONFIRMACAO")
+    or "@ALFA_CON"
+)
+MODO_TESTE = os.getenv("MODO_TESTE", "false").lower() == "true"
+
+# ── OpenAI ────────────────────────────────────────────────────────────────────
+OPENAI_API_KEY   = os.getenv("OPENAI_API_KEY", "")
+OPENAI_MODEL     = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_HABILITADO = os.getenv("OPENAI_HABILITADO", "true").lower() == "true"
 
 ultimas_leituras_por_jogo = {}
 ultimos_enviados = {}
@@ -3019,10 +3043,118 @@ Entrada padrão — 1% da banca.
 Evitar entrada se sair gol antes de apostar.{link}
 
 COUTIPS — leitura ao vivo com pressão, contexto e disciplina."""
+
+
+def montar_mensagem_gol_nova(jogo, estrategia, score_alfa, score_media, metricas, link_bet365=""):
+    """Mensagem enxuta com cabeçalho dinâmico baseado no score médio."""
+    eh_conf = eh_confirmacao(estrategia)
+    eh_ht   = "HT" in estrategia or "ht" in estrategia.lower()
+
+    # Cabeçalho por score e tipo
+    if score_media >= 90:
+        emoji = "💎"
+    else:
+        emoji = "🎯"
+
+    periodo = "PRIMEIRO TEMPO" if eh_ht else "SEGUNDO TEMPO"
+    if eh_conf:
+        cabecalho = f"{emoji} ALFA - CONFIRMADO | {periodo}"
+    else:
+        cabecalho = f"{emoji} ALFA - AO VIVO | {periodo}"
+
+    link = f"\n🔗 {html.escape(link_bet365)}" if link_bet365 else ""
+
+    return f"""{cabecalho}
+
+🏟 {html.escape(str(jogo))}
+⏱ {metricas.get('tempo', '?')}' | {html.escape(str(metricas.get('placar', '?')))}
+🎯 {html.escape(str(metricas.get('mercado', '?')))}
+📊 COUTIPS: {score_media}%{link}"""
+
+
 def montar_mensagem_canto(jogo, estrategia, score, metricas):
     # DESATIVADO — cantos não são enviados na fase atual
     # TODO: reimplementar quando cantos forem reabertos
     return ""
+
+
+# =========================================================
+# OPENAI — ANÁLISE CONTEXTUAL
+# =========================================================
+
+_PROMPT_NORMAL = """Você é um analista especializado em trading esportivo ao vivo, focado em mercados de gols.
+
+O alerta abaixo já passou por um funil matemático rigoroso que exige:
+- IP contínuo com consequência real (remates, xG, chance de golo)
+- Lado dominante identificado corretamente
+- Contexto emocional vivo (favorito perdendo ou empatando)
+
+Sua função é fazer a leitura contextual final — o que os números não capturam:
+- Conhecimento sobre os times (times de transição de elite como Atlético Madrid, PSG, Bayern convertem mesmo sem dominar)
+- Histórico da liga
+- Contexto emocional do placar além dos números
+- Dados históricos da CornerPro no alerta (percentual Over, média de gols)
+
+Responda APENAS com JSON puro, sem markdown:
+{"decisao": "APROVADO" ou "BLOQUEADO", "confianca": numero 0-100}
+
+Bloqueie se: pressão sem consequência real, jogo emocionalmente morto, liga muito truncada sem sinais extremos.
+Aprove se: contexto emocional vivo, time de qualidade pressionando, dados históricos favoráveis."""
+
+_PROMPT_CONFIRMACAO = """Você é um analista especializado em trading esportivo ao vivo.
+
+Este é um alerta de CONFIRMAÇÃO. O time que pressionava marcou um gol recentemente.
+A pergunta NÃO é "vai ter gol?" — é "a pressão continuou real após o gol ou o time esfriou?"
+
+Analise se os dados mostram:
+- IP ainda alto após o gol (time continua atacando)
+- u5 e u10 ainda favoráveis ao lado dominante
+- Remates e chances continuando
+
+Se o time esfriou e está administrando → BLOQUEIE.
+Se a pressão continuou forte → APROVE.
+
+Responda APENAS com JSON puro, sem markdown:
+{"decisao": "APROVADO" ou "BLOQUEADO", "confianca": numero 0-100}"""
+
+
+async def consultar_openai(texto_alerta: str, score_alfa: int, jogo: str,
+                           estrategia: str, eh_conf: bool = False) -> dict:
+    """Consulta OpenAI e retorna decisão + confiança."""
+    if not OPENAI_API_KEY:
+        return {"decisao": "APROVADO", "confianca": score_alfa}
+
+    prompt_sistema = _PROMPT_CONFIRMACAO if eh_conf else _PROMPT_NORMAL
+    prompt_usuario = f"Jogo: {jogo}\nEstratégia: {estrategia}\nScore ALFA: {score_alfa}%\n\n{texto_alerta}"
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as cli:
+            resp = await cli.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={"Authorization": f"Bearer {OPENAI_API_KEY}",
+                         "Content-Type": "application/json"},
+                json={"model": OPENAI_MODEL, "max_tokens": 80, "temperature": 0.1,
+                      "messages": [{"role": "system", "content": prompt_sistema},
+                                   {"role": "user",   "content": prompt_usuario}]},
+            )
+            resp.raise_for_status()
+            texto = resp.json()["choices"][0]["message"]["content"].strip()
+            texto = texto.replace("```json", "").replace("```", "").strip()
+            import json as _json
+            resultado = _json.loads(texto)
+            decisao = str(resultado.get("decisao", "APROVADO")).upper()
+            if decisao not in ("APROVADO", "BLOQUEADO"):
+                decisao = "APROVADO"
+            confianca = int(resultado.get("confianca", score_alfa))
+            log(f"🤖 OpenAI | {jogo} | {decisao} | confiança={confianca}%")
+            return {"decisao": decisao, "confianca": confianca}
+
+    except httpx.TimeoutException:
+        log(f"⚠️ OpenAI timeout — aprovando por fallback: {jogo}")
+        return {"decisao": "APROVADO", "confianca": score_alfa}
+    except Exception as e:
+        log(f"⚠️ OpenAI erro — aprovando por fallback: {e}")
+        return {"decisao": "APROVADO", "confianca": score_alfa}
 
 
 LOG_CSV_PATH = os.getenv("LOG_CSV_PATH", "alertas_enviados.csv")
@@ -3068,6 +3200,81 @@ def registrar_alerta_csv(alerta: dict):
 async def trabalhador_envio():
     log("📤 Fila de envio iniciada.")
     log(f"📡 Canais ativos: principal={TARGET_CHANNEL} | confirmação={CONFIRMATION_CHANNEL}")
+    if MODO_TESTE:
+        log(f"🧪 MODO TESTE ATIVO — envios apenas para {CONFIRMATION_CHANNEL}")
+    if OPENAI_HABILITADO and OPENAI_API_KEY:
+        log(f"🤖 OpenAI ATIVA ({OPENAI_MODEL})")
+
+    while True:
+        item = await fila_envio.get()
+        try:
+            idade = time.time() - item.get("gerado_em", time.time())
+            if idade > 120:
+                log(f"🗑️ ALERTA EXPIRADO | {item.get('alerta',{}).get('jogo','?')}")
+                continue
+
+            alerta   = item["alerta"]
+            mercado  = item["mercado"]
+            texto_raw = item.get("texto_original", "")
+
+            if mercado != "GOL":
+                log(f"⚠️ Mercado ignorado: {mercado}")
+                continue
+
+            score_alfa  = alerta["score_gol"]
+            jogo        = alerta["jogo"]
+            estrategia  = alerta["estrategia"]
+            eh_conf     = eh_confirmacao(estrategia)
+
+            # ── OpenAI decide ────────────────────────────────────────────────
+            score_ia = score_alfa  # fallback se OpenAI desligada
+            if OPENAI_HABILITADO and OPENAI_API_KEY and texto_raw:
+                resultado_ia = await consultar_openai(
+                    texto_alerta=texto_raw,
+                    score_alfa=score_alfa,
+                    jogo=jogo,
+                    estrategia=estrategia,
+                    eh_conf=eh_conf,
+                )
+                if resultado_ia["decisao"] == "BLOQUEADO":
+                    log(f"🤖 OpenAI BLOQUEOU | {jogo}")
+                    continue
+                score_ia = resultado_ia["confianca"]
+
+            # ── Média ALFA + IA ───────────────────────────────────────────────
+            score_medio = round((score_alfa + score_ia) / 2)
+
+            # ── Monta mensagem nova ───────────────────────────────────────────
+            mensagem = montar_mensagem_gol_nova(
+                jogo=jogo,
+                estrategia=estrategia,
+                score_alfa=score_alfa,
+                score_media=score_medio,
+                metricas=alerta["metricas"],
+                link_bet365=alerta["metricas"].get("bet365", ""),
+            )
+
+            # ── Destino ───────────────────────────────────────────────────────
+            if MODO_TESTE:
+                destino = CONFIRMATION_CHANNEL
+            else:
+                destino = item.get("destino") or TARGET_CHANNEL
+
+            await client.send_message(destino, mensagem, parse_mode="html")
+            marcar_enviado(item["chave_envio"])
+            registrar_alerta_csv(alerta)
+
+            log(f"✅ ENVIADO | {estrategia} | ALFA={score_alfa}% IA={score_ia}% MÉDIA={score_medio}% | {jogo} | {destino}")
+            await asyncio.sleep(INTERVALO_ENVIO_SEGUNDOS)
+
+        except FloodWaitError as e:
+            log(f"⛔ FLOOD WAIT: {e.seconds}s")
+            await asyncio.sleep(e.seconds + 1)
+        except Exception as e:
+            log(f"❌ ERRO AO ENVIAR: {e}")
+            log(traceback.format_exc())
+        finally:
+            fila_envio.task_done()
 
     while True:
         item = await fila_envio.get()
