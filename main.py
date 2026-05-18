@@ -2573,8 +2573,32 @@ def score_gol(metricas, estrategia, chave_jogo):
     metricas["lado_vermelho"] = lado_com_vermelho(metricas)
     metricas["nivel_pressao_sustentada"] = pressao_sustentada_nivel(metricas, estrategia)
 
-    # Mantém compatibilidade de logs/mensagens antigas.
-    _, padrao = score_padrao_alfa(metricas, estrategia)
+    # Determina padrão ALFA para log — baseado nos dados do lado dominante já calculados
+    p = metricas.get("pressao_alfa", {})
+    dom = metricas.get("lado_dominante", "EQUILIBRADO")
+    if dom == "CASA":
+        _c15 = p.get("ip_consec_15_casa", 0)
+        _c18 = p.get("ip_consec_18_casa", 0)
+        _c22 = p.get("ip_consec_22_casa", 0)
+        _chance = metricas.get("chance_golo", (0, 0))[0]
+    elif dom == "FORA":
+        _c15 = p.get("ip_consec_15_fora", 0)
+        _c18 = p.get("ip_consec_18_fora", 0)
+        _c22 = p.get("ip_consec_22_fora", 0)
+        _chance = metricas.get("chance_golo", (0, 0))[1]
+    else:
+        _c15 = max(p.get("ip_consec_15_casa", 0), p.get("ip_consec_15_fora", 0))
+        _c18 = max(p.get("ip_consec_18_casa", 0), p.get("ip_consec_18_fora", 0))
+        _c22 = max(p.get("ip_consec_22_casa", 0), p.get("ip_consec_22_fora", 0))
+        _chance = max(metricas.get("chance_golo", (0, 0)))
+    if _c22 >= 3 and _chance >= 10:
+        padrao = "ALFA_FT_DIAMANTE" if eh_ft(estrategia) else "ALFA_HT_DIAMANTE"
+    elif _c18 >= 3 and _chance >= 6:
+        padrao = "ALFA_FT_FORTE" if eh_ft(estrategia) else "ALFA_HT_FORTE"
+    elif _c15 >= 5:
+        padrao = "ALFA_FT_BASE" if eh_ft(estrategia) else "ALFA_HT_BASE"
+    else:
+        padrao = "SEM_PADRAO_ALFA"
     metricas["padrao_alfa"] = padrao
 
     aprovado_funil, teto_funil, motivo_funil = funil_institucional_gol(metricas, estrategia, chave_jogo)
@@ -3295,7 +3319,7 @@ async def main():
 
 
 if __name__ == "__main__":
-    _lock = verificar_instancia_unica()  # bloqueia se já houver outra instância
+    _lock = verificar_instancia_unica()
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
