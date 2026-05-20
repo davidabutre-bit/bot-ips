@@ -3031,9 +3031,7 @@ def texto_contexto_gol(metricas):
 
 def montar_mensagem_gol(jogo, estrategia, score, metricas):
     ctx = texto_contexto_gol(metricas)
-    link_b365 = f"\n🔗 Bet365: {html.escape(metricas['bet365'])}" if metricas.get("bet365") else ""
-    link_bf = f"\n🔗 Betfair: https://www.betfair.com/sport/football" if metricas.get("bet365") else ""
-    link = link_b365 + link_bf
+    link = f"\n🔗 Bet365: {html.escape(metricas['bet365'])}" if metricas.get("bet365") else ""
 
     nome_bot = html.escape(nome_publico_bot(estrategia))
     titulo = "🔁 ENTRADA CONFIRMADA" if eh_confirmacao(estrategia) else "🔥 ENTRADA VALIDADA"
@@ -3097,8 +3095,7 @@ def montar_mensagem_gol_nova(jogo, estrategia, score_alfa, score_media, metricas
     }
     linha_liga = emojis_liga.get(liga, f"⚪ Liga: {liga}")
 
-    link_b365 = f"\n🔗 Bet365: {html.escape(link_bet365)}" if link_bet365 else ""
-    link_bf = f"\n🔗 Betfair: https://www.betfair.com/sport/football" if link_bet365 else ""
+    link = f"\n🔗 {html.escape(link_bet365)}" if link_bet365 else ""
 
     return f"""{cabecalho}
 
@@ -3106,7 +3103,7 @@ def montar_mensagem_gol_nova(jogo, estrategia, score_alfa, score_media, metricas
 ⏱ {metricas.get('tempo', '?')}' | {html.escape(str(metricas.get('placar', '?')))}
 🎯 {html.escape(str(metricas.get('mercado', '?')))}
 📊 COUTIPS: {score_media}%
-{linha_liga}{link_b365}{link_bf}"""
+{linha_liga}{link}"""
 
 
 def montar_mensagem_canto(jogo, estrategia, score, metricas):
