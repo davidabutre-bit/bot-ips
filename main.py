@@ -601,7 +601,8 @@ _LIGAS_UNDER = {
     "chile primera division", "chile primera a",
     "uruguay primera division",
     "ecuador liga pro", "bolivia",
-    "paraguay", "venezuela primera",
+    "paraguay", "paraguay division intermedia", "paraguay primera division",
+    "venezuela primera",
     # Itália série A — não converte bem exceto com times grandes
     "italy serie a",
     # Ligas africanas — convertem pouco
@@ -1543,6 +1544,8 @@ def score_classificacao_institucional(metricas, estrategia):
 # =========================================================
 
 def favorito_score(metricas):
+    # Bônus reduzido — odds favorita não pode dominar o score sozinha.
+    # Pressão real deve ser o motor principal, não a disparidade de odds.
     bonus = 0
     odds = metricas.get("odds", (0, 0, 0))
     if not isinstance(odds, (tuple, list)) or len(odds) < 3:
@@ -1552,15 +1555,15 @@ def favorito_score(metricas):
         if not odd:
             continue
         if odd <= 1.35:
-            bonus += 10
-        elif odd <= 1.50:
             bonus += 7
+        elif odd <= 1.50:
+            bonus += 5
         elif odd <= 1.70:
-            bonus += 4
+            bonus += 3
         elif odd <= 2.00:
             bonus += 1
 
-    return min(bonus, 12)
+    return min(bonus, 8)
 
 
 def score_continuidade_ip(metricas, estrategia):
@@ -3054,7 +3057,7 @@ COUTIPS — leitura ao vivo com pressão, contexto e disciplina."""
 def montar_mensagem_gol_nova(jogo, estrategia, score_alfa, score_media, metricas, link_bet365=""):
     """Mensagem enxuta com cabeçalho dinâmico baseado no score médio."""
     eh_conf = eh_confirmacao(estrategia)
-    eh_ht   = "HT" in estrategia or "ht" in estrategia.lower()
+    eh_ht_flag = "HT" in estrategia or "ht" in estrategia.lower()
 
     # Cabeçalho por score e tipo
     if score_media >= 90:
@@ -3062,11 +3065,22 @@ def montar_mensagem_gol_nova(jogo, estrategia, score_alfa, score_media, metricas
     else:
         emoji = "🎯"
 
-    periodo = "PRIMEIRO TEMPO" if eh_ht else "SEGUNDO TEMPO"
+    periodo = "PRIMEIRO TEMPO" if eh_ht_flag else "SEGUNDO TEMPO"
     if eh_conf:
         cabecalho = f"{emoji} ALFA - CONFIRMADO | {periodo}"
     else:
         cabecalho = f"{emoji} ALFA - AO VIVO | {periodo}"
+
+    # Classificação da liga
+    liga = classificar_liga(metricas.get("competicao", ""))
+    emojis_liga = {
+        "PREMIUM":  "🏆 Liga: PREMIUM",
+        "MODERADA": "📊 Liga: MODERADA",
+        "NEUTRA":   "⚪ Liga: NEUTRA",
+        "UNDER":    "⚠️ Liga: UNDER",
+        "PERIGOSA": "🚨 Liga: PERIGOSA",
+    }
+    linha_liga = emojis_liga.get(liga, f"⚪ Liga: {liga}")
 
     link = f"\n🔗 {html.escape(link_bet365)}" if link_bet365 else ""
 
@@ -3075,7 +3089,8 @@ def montar_mensagem_gol_nova(jogo, estrategia, score_alfa, score_media, metricas
 🏟 {html.escape(str(jogo))}
 ⏱ {metricas.get('tempo', '?')}' | {html.escape(str(metricas.get('placar', '?')))}
 🎯 {html.escape(str(metricas.get('mercado', '?')))}
-📊 COUTIPS: {score_media}%{link}"""
+📊 COUTIPS: {score_media}%
+{linha_liga}{link}"""
 
 
 def montar_mensagem_canto(jogo, estrategia, score, metricas):
@@ -3090,35 +3105,66 @@ def montar_mensagem_canto(jogo, estrategia, score, metricas):
 
 _PROMPT_NORMAL = """Você é um analista especializado em trading esportivo ao vivo, focado em mercados de gols.
 
-O alerta abaixo já passou por um funil matemático rigoroso que exige:
-- IP contínuo com consequência real (remates, xG, chance de golo)
-- Lado dominante identificado corretamente
-- Contexto emocional vivo (favorito perdendo ou empatando)
+O alerta abaixo já passou por um funil matemático rigoroso. Sua função é avaliar a QUALIDADE DA PRESSÃO — não o tipo de competição.
 
-Sua função é fazer a leitura contextual final — o que os números não capturam:
-- Conhecimento sobre os times (times de transição de elite como Atlético Madrid, PSG, Bayern convertem mesmo sem dominar)
-- Histórico da liga
-- Contexto emocional do placar além dos números
-- Dados históricos da CornerPro no alerta (percentual Over, média de gols)
+ESCALA DE PRESSÃO CONTÍNUA (IP = Índice de Pressão por minuto):
+- IP 15+ contínuo por 5+ minutos = pressão relevante, começa a contar
+- IP 15-18 contínuo por 5+ minutos = pressão boa, favorável
+- IP 18+ contínuo por 5+ minutos = pressão forte, alto potencial
+- IP 10+ contínuo por 10+ minutos = dominância clara de um lado
+- IP 10+ contínuo por 20+ minutos = amasso total, cenário ideal
+
+O que transforma pressão em entrada válida é a CONSEQUÊNCIA:
+- Remates à baliza = finalização real
+- Chances de golo = criação real
+- xG acumulado = perigo real
+Pressão sem nenhuma dessas = território sem ruptura, bloquear.
+
+IGNORE completamente:
+- Se é copa, final, eliminatória ou liga regular — IRRELEVANTE
+- Nome da competição — IRRELEVANTE
+- Fase do campeonato — IRRELEVANTE
+
+BLOQUEIE apenas se:
+- IP alto por 1-2 minutos apenas (pico isolado sem continuidade)
+- Nenhum remate à baliza e nenhuma chance de golo apesar do IP
+- Ambos os lados com IP equilibrado (sem dominância clara de um lado)
+- Dados históricos Over muito baixos (abaixo de 40%)
+
+APROVE se:
+- IP contínuo de qualquer intensidade por 5+ minutos com remates ou chances reais
+- Dominância clara de um lado sustentada por múltiplos minutos
+- Dados históricos favoráveis
 
 Responda APENAS com JSON puro, sem markdown:
-{"decisao": "APROVADO" ou "BLOQUEADO", "confianca": numero 0-100}
-
-Bloqueie se: pressão sem consequência real, jogo emocionalmente morto, liga muito truncada sem sinais extremos.
-Aprove se: contexto emocional vivo, time de qualidade pressionando, dados históricos favoráveis."""
+{"decisao": "APROVADO" ou "BLOQUEADO", "confianca": numero 0-100}"""
 
 _PROMPT_CONFIRMACAO = """Você é um analista especializado em trading esportivo ao vivo.
 
-Este é um alerta de CONFIRMAÇÃO. O time que pressionava marcou um gol recentemente.
-A pergunta NÃO é "vai ter gol?" — é "a pressão continuou real após o gol ou o time esfriou?"
+Este é um alerta de CONFIRMAÇÃO. O time dominante marcou um gol e a pergunta é:
+"A pressão continuou REAL após o gol, com consequência, ou o time esfriou?"
 
-Analise se os dados mostram:
-- IP ainda alto após o gol (time continua atacando)
+REGRA CENTRAL — IP SEM CONSEQUÊNCIA NÃO VALE NADA:
+IP contínuo alto após o gol só é relevante SE vier acompanhado de:
+- Remates à baliza continuando
+- Chances de golo reais
 - u5 e u10 ainda favoráveis ao lado dominante
-- Remates e chances continuando
+IP alto sem remates e sem chances = time com bola mas sem criar perigo = BLOQUEIE.
 
-Se o time esfriou e está administrando → BLOQUEIE.
-Se a pressão continuou forte → APROVE.
+BLOQUEIE se:
+- IP caiu após o gol (time administrando a vantagem)
+- u5 e u10 do lado dominante caíram ou equilibraram
+- Nenhum remate à baliza após o gol
+- Time claramente administrando resultado
+
+APROVE se:
+- IP contínuo por 5+ minutos após o gol COM remates e chances reais
+- u5 e u10 ainda claramente favoráveis ao lado dominante
+- Evidência clara que o time continua atacando, não administrando
+
+IGNORE completamente:
+- Se é copa, final, eliminatória — IRRELEVANTE
+- Nome da competição — IRRELEVANTE
 
 Responda APENAS com JSON puro, sem markdown:
 {"decisao": "APROVADO" ou "BLOQUEADO", "confianca": numero 0-100}"""
@@ -3260,17 +3306,48 @@ async def trabalhador_envio():
                 link_bet365=alerta["metricas"].get("bet365", ""),
             )
 
-            # ── Destino ───────────────────────────────────────────────────────
+            # ── Destino por liga e tipo ───────────────────────────────────────
+            liga = classificar_liga(alerta["metricas"].get("competicao", ""))
+
             if MODO_TESTE:
                 destino = CONFIRMATION_CHANNEL
+                await client.send_message(destino, mensagem, parse_mode="html")
+                marcar_enviado(item["chave_envio"])
+                registrar_alerta_csv(alerta)
+                log(f"✅ ENVIADO | {estrategia} | ALFA={score_alfa}% IA={score_ia}% MÉDIA={score_medio}% | {jogo} | {destino}")
+            elif eh_conf:
+                if score_medio >= 92:
+                    await client.send_message(TARGET_CHANNEL, mensagem, parse_mode="html")
+                    await client.send_message(CONFIRMATION_CHANNEL, mensagem, parse_mode="html")
+                    marcar_enviado(item["chave_envio"])
+                    registrar_alerta_csv(alerta)
+                    log(f"✅ ENVIADO | {estrategia} | ALFA={score_alfa}% IA={score_ia}% MÉDIA={score_medio}% | Liga={liga} | {jogo} | AMBOS CANAIS")
+                elif score_medio >= 87:
+                    await client.send_message(CONFIRMATION_CHANNEL, mensagem, parse_mode="html")
+                    marcar_enviado(item["chave_envio"])
+                    registrar_alerta_csv(alerta)
+                    log(f"✅ ENVIADO | {estrategia} | ALFA={score_alfa}% IA={score_ia}% MÉDIA={score_medio}% | Liga={liga} | {jogo} | {CONFIRMATION_CHANNEL}")
+                else:
+                    log(f"⛔ CONFIRMAÇÃO ABAIXO DO MÍNIMO | Média={score_medio}% < 87% | Liga={liga} | {jogo}")
             else:
-                destino = item.get("destino") or TARGET_CHANNEL
+                if liga == "PREMIUM":
+                    corte_liga = 85
+                elif liga in ["NEUTRA", "MODERADA"]:
+                    corte_liga = 87
+                elif liga == "UNDER":
+                    corte_liga = 91
+                elif liga == "PERIGOSA":
+                    corte_liga = 95
+                else:
+                    corte_liga = 87
 
-            await client.send_message(destino, mensagem, parse_mode="html")
-            marcar_enviado(item["chave_envio"])
-            registrar_alerta_csv(alerta)
-
-            log(f"✅ ENVIADO | {estrategia} | ALFA={score_alfa}% IA={score_ia}% MÉDIA={score_medio}% | {jogo} | {destino}")
+                if score_medio < corte_liga:
+                    log(f"⛔ BLOQUEADO MÉDIA FINAL | Liga={liga} | Média={score_medio}% < {corte_liga}% | {jogo}")
+                else:
+                    await client.send_message(TARGET_CHANNEL, mensagem, parse_mode="html")
+                    marcar_enviado(item["chave_envio"])
+                    registrar_alerta_csv(alerta)
+                    log(f"✅ ENVIADO | {estrategia} | ALFA={score_alfa}% IA={score_ia}% MÉDIA={score_medio}% | Liga={liga} | {jogo} | {TARGET_CHANNEL}")
             await asyncio.sleep(INTERVALO_ENVIO_SEGUNDOS)
 
         except FloodWaitError as e:
@@ -3550,6 +3627,11 @@ async def processar_evento(event, origem="nova"):
                 f"Gol={sg}% < observação {CORTE_OBSERVACAO_JANELA}% | {jogo}"
             )
             return
+
+        if eh_confirmacao(estrategia):
+            liga = classificar_liga(metricas.get("competicao", ""))
+            # UNDER e PERIGOSA não são bloqueadas aqui — têm corte mais alto na média final
+            # UNDER → ≥91%, PERIGOSA → ≥95% (aplicado no trabalhador_envio)
 
         if sg < corte_evento:
             log(
