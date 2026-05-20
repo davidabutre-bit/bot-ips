@@ -3331,15 +3331,15 @@ async def trabalhador_envio():
                     log(f"⛔ CONFIRMAÇÃO ABAIXO DO MÍNIMO | Média={score_medio}% < 87% | Liga={liga} | {jogo}")
             else:
                 if liga == "PREMIUM":
-                    corte_liga = 85
+                    corte_liga = int(os.getenv("CORTE_MEDIA_PREMIUM", "85"))
                 elif liga in ["NEUTRA", "MODERADA"]:
-                    corte_liga = 87
+                    corte_liga = int(os.getenv("CORTE_MEDIA_NEUTRA", "83"))
                 elif liga == "UNDER":
-                    corte_liga = 91
+                    corte_liga = int(os.getenv("CORTE_MEDIA_UNDER", "91"))
                 elif liga == "PERIGOSA":
-                    corte_liga = 95
+                    corte_liga = int(os.getenv("CORTE_MEDIA_PERIGOSA", "95"))
                 else:
-                    corte_liga = 87
+                    corte_liga = int(os.getenv("CORTE_MEDIA_NEUTRA", "83"))
 
                 if score_medio < corte_liga:
                     log(f"⛔ BLOQUEADO MÉDIA FINAL | Liga={liga} | Média={score_medio}% < {corte_liga}% | {jogo}")
