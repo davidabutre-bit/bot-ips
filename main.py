@@ -217,6 +217,19 @@ def extrair_link_bet365(texto):
     return m.group(0).strip() if m else ""
 
 
+def extrair_link_betfair(texto):
+    # Gera link Betfair a partir do link Bet365 — substitui domínio
+    m = re.search(r"https?://(?:www\.)?bet365[^\s*]+", texto, re.IGNORECASE)
+    if not m:
+        return ""
+    link365 = m.group(0).strip()
+    # Extrai o nome do time do link Bet365 (ex: K^Antwerp)
+    nome = re.search(r"K\^([^\s/]+)", link365)
+    if nome:
+        return f"https://www.betfair.com/sport/football"
+    return ""
+
+
 def bloquear_categoria_base(texto):
     t = remover_acentos(texto).upper()
     for padrao in [
@@ -3018,7 +3031,9 @@ def texto_contexto_gol(metricas):
 
 def montar_mensagem_gol(jogo, estrategia, score, metricas):
     ctx = texto_contexto_gol(metricas)
-    link = f"\n🔗 Bet365: {html.escape(metricas['bet365'])}" if metricas.get("bet365") else ""
+    link_b365 = f"\n🔗 Bet365: {html.escape(metricas['bet365'])}" if metricas.get("bet365") else ""
+    link_bf = f"\n🔗 Betfair: https://www.betfair.com/sport/football" if metricas.get("bet365") else ""
+    link = link_b365 + link_bf
 
     nome_bot = html.escape(nome_publico_bot(estrategia))
     titulo = "🔁 ENTRADA CONFIRMADA" if eh_confirmacao(estrategia) else "🔥 ENTRADA VALIDADA"
@@ -3082,7 +3097,8 @@ def montar_mensagem_gol_nova(jogo, estrategia, score_alfa, score_media, metricas
     }
     linha_liga = emojis_liga.get(liga, f"⚪ Liga: {liga}")
 
-    link = f"\n🔗 {html.escape(link_bet365)}" if link_bet365 else ""
+    link_b365 = f"\n🔗 Bet365: {html.escape(link_bet365)}" if link_bet365 else ""
+    link_bf = f"\n🔗 Betfair: https://www.betfair.com/sport/football" if link_bet365 else ""
 
     return f"""{cabecalho}
 
@@ -3090,7 +3106,7 @@ def montar_mensagem_gol_nova(jogo, estrategia, score_alfa, score_media, metricas
 ⏱ {metricas.get('tempo', '?')}' | {html.escape(str(metricas.get('placar', '?')))}
 🎯 {html.escape(str(metricas.get('mercado', '?')))}
 📊 COUTIPS: {score_media}%
-{linha_liga}{link}"""
+{linha_liga}{link_b365}{link_bf}"""
 
 
 def montar_mensagem_canto(jogo, estrategia, score, metricas):
@@ -3380,11 +3396,13 @@ async def trabalhador_envio():
                 continue
 
             # ── Montar mensagem ───────────────────────────────────────────────
-            mensagem = montar_mensagem_gol(
-                alerta["jogo"],
-                alerta["estrategia"],
-                alerta["score_gol"],
-                alerta["metricas"],
+            mensagem = montar_mensagem_gol_nova(
+                jogo=alerta["jogo"],
+                estrategia=alerta["estrategia"],
+                score_alfa=alerta["score_gol"],
+                score_media=alerta["score_gol"],
+                metricas=alerta["metricas"],
+                link_bet365=alerta["metricas"].get("bet365", ""),
             )
 
             # Definir destino — modo teste envia tudo para canal de confirmação
