@@ -3723,12 +3723,27 @@ async def processar_evento(event, origem="nova"):
 
 @client.on(events.NewMessage(incoming=True, from_users=None))
 async def handler_nova_mensagem(event):
-    await processar_evento(event, origem="nova")
+    try:
+        # Filtra antes de processar — aceita só mensagens do CornerProBot
+        texto = event.raw_text or ""
+        if not mensagem_valida(texto):
+            return
+        await processar_evento(event, origem="nova")
+    except Exception as e:
+        # Ignora silenciosamente objetos de sistema que o Telethon não reconhece
+        # (ex: notificações de export de dados, mensagens de serviço do Telegram)
+        log(f"⚠️ Mensagem de sistema ignorada: {type(e).__name__}")
 
 
 @client.on(events.MessageEdited(incoming=True, from_users=None))
 async def handler_mensagem_editada(event):
-    await processar_evento(event, origem="editada")
+    try:
+        texto = event.raw_text or ""
+        if not mensagem_valida(texto):
+            return
+        await processar_evento(event, origem="editada")
+    except Exception as e:
+        log(f"⚠️ Mensagem de sistema ignorada: {type(e).__name__}")
 
 
 # =========================================================
