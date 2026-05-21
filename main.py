@@ -111,6 +111,12 @@ CONFIRMATION_CHANNEL = (
 )
 MODO_TESTE = os.getenv("MODO_TESTE", "false").lower() == "true"
 
+# ── Canais de Auditoria (opcionais — só ativa se variável existir no Railway) ─
+AUDIT_HT_OK  = os.getenv("AUDIT_HT_OK", "")   # ex: @HT_APROVADO
+AUDIT_HT_NO  = os.getenv("AUDIT_HT_NO", "")   # ex: @HT_REPROVADO
+AUDIT_FT_OK  = os.getenv("AUDIT_FT_OK", "")   # ex: @FT_APROVADO
+AUDIT_FT_NO  = os.getenv("AUDIT_FT_NO", "")   # ex: @FT_REPROVADO
+
 # ── OpenAI ────────────────────────────────────────────────────────────────────
 OPENAI_API_KEY   = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL     = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
@@ -132,6 +138,41 @@ _locks_por_jogo: dict = {}
 # =========================================================
 # FUNÇÕES BASE
 # =========================================================
+
+async def enviar_auditoria(client, estrategia, jogo, score_alfa, score_ia, score_medio, liga, aprovado, motivo=""):
+    """Envia mensagem de auditoria para o canal correspondente.
+    Só executa se a variável de canal estiver configurada no Railway.
+    Usa texto puro sem links para evitar preview cards do Telegram.
+    """
+    try:
+        eh_ht = "HT" in estrategia
+        if aprovado:
+            canal = AUDIT_HT_OK if eh_ht else AUDIT_FT_OK
+            emoji = "✅"
+            status = "APROVADO"
+        else:
+            canal = AUDIT_HT_NO if eh_ht else AUDIT_FT_NO
+            emoji = "❌"
+            status = "REPROVADO"
+
+        if not canal:
+            return  # Canal não configurado — auditoria desativada
+
+        tipo = "HT" if eh_ht else "FT"
+        ia_str = f" | IA={score_ia}%" if score_ia else ""
+        motivo_str = (f"\n📝 {motivo}" if motivo else "")
+
+        mensagem = (
+            f"{emoji} {status} | {tipo} | {estrategia}\n"
+            f"🏟 {jogo}\n"
+            f"📊 ALFA={score_alfa}%{ia_str} | MÉDIA={score_medio}%\n"
+            f"🏆 Liga: {liga}{motivo_str}"
+        )
+
+        await client.send_message(canal, mensagem)
+    except Exception as e:
+        log(f"⚠️ AUDITORIA ERRO: {e}")
+
 
 def log(msg):
     """Log compatível com o padrão anterior e integrado ao módulo logging.
@@ -615,6 +656,9 @@ _LIGAS_UNDER = {
     "uruguay primera division",
     "ecuador liga pro", "bolivia",
     "paraguay", "paraguay division intermedia", "paraguay primera division",
+    "netherlands eerste divisie", "brazil serie d", "usa mls next pro",
+    "australia victoria npl women", "asia afc u20 women",
+    "asia afc u20 women's asian cup",
     "venezuela primera",
     # Itália série A — não converte bem exceto com times grandes
     "italy serie a",
@@ -1987,6 +2031,16 @@ def ajuste_gol_recente_contextual(metricas, estrategia):
             if lado == zebra and dom == fav and vivo:
                 return 12, "GOL_ZEBRA_CONTRA_FLUXO"
             if lado == dom:
+                # Só penaliza se o gol colocou o time na frente ou aumentou vantagem.
+                # Se empatou ou ainda está perdendo, o time continua com necessidade de atacar.
+                gc, gf = extrair_gols_placar(metricas.get("placar", ""))
+                if gc is not None:
+                    gols_dom = gc if lado == "CASA" else gf
+                    gols_adv = gf if lado == "CASA" else gc
+                    if gols_dom > gols_adv:
+                        return -16, "PRESSAO_PREMIADA_RECENTE"
+                    else:
+                        return 0, "GOL_EMPATE_OU_AINDA_PERDENDO"
                 return -16, "PRESSAO_PREMIADA_RECENTE"
         return -8, "GOL_RECENTE_SEM_CONFIRMACAO"
 
@@ -1996,9 +2050,20 @@ def ajuste_gol_recente_contextual(metricas, estrategia):
                 return 8, "GOL_TIME_PRESSIONADO_ABRIU_JOGO"
             if lado == zebra and dom == fav and vivo:
                 return 10, "GOL_ZEBRA_CONTRA_FLUXO"
-            if lado == dom and not vivo:
-                return -12, "PRESSAO_PREMIADA_MORREU"
-            if lado == dom and vivo:
+            if lado == dom:
+                # Mesma lógica: só penaliza se ficou na frente
+                gc, gf = extrair_gols_placar(metricas.get("placar", ""))
+                if gc is not None:
+                    gols_dom = gc if lado == "CASA" else gf
+                    gols_adv = gf if lado == "CASA" else gc
+                    if gols_dom > gols_adv:
+                        if not vivo:
+                            return -12, "PRESSAO_PREMIADA_MORREU"
+                        return -5, "PRESSAO_PREMIADA_MAS_VIVA"
+                    else:
+                        return 0, "GOL_EMPATE_OU_AINDA_PERDENDO"
+                if not vivo:
+                    return -12, "PRESSAO_PREMIADA_MORREU"
                 return -5, "PRESSAO_PREMIADA_MAS_VIVA"
         return -4, "GOL_RECENTE_CAUTELA"
 
@@ -3116,68 +3181,48 @@ def montar_mensagem_canto(jogo, estrategia, score, metricas):
 # OPENAI — ANÁLISE CONTEXTUAL
 # =========================================================
 
-_PROMPT_NORMAL = """Você é um analista especializado em trading esportivo ao vivo, focado em mercados de gols.
+_PROMPT_NORMAL = """Você é um analista de futebol ao vivo especializado em identificar se um gol vai sair.
 
-O alerta abaixo já passou por um funil matemático rigoroso. Sua função é avaliar a QUALIDADE DA PRESSÃO — não o tipo de competição.
+O sistema matemático já calculou um score para este jogo. Sua função é olhar os dados ao vivo e responder: esse score faz sentido com o que está acontecendo em campo agora?
 
-ESCALA DE PRESSÃO CONTÍNUA (IP = Índice de Pressão por minuto):
-- IP 15+ contínuo por 5+ minutos = pressão relevante, começa a contar
-- IP 15-18 contínuo por 5+ minutos = pressão boa, favorável
-- IP 18+ contínuo por 5+ minutos = pressão forte, alto potencial
-- IP 10+ contínuo por 10+ minutos = dominância clara de um lado
-- IP 10+ contínuo por 20+ minutos = amasso total, cenário ideal
+PASSO 1 — RELEITURA DOS DADOS AO VIVO:
+Analise com seus próprios olhos — o Python pode errar:
+- Quem está dominando de verdade? Olhe AP, u5, u10, remates, IP do lado dominante — não a soma dos dois times.
+- Esse domínio tem consequência real? Chute no gol, chance de golo, xG. Domínio sem consequência não vale.
+- A pressão está ativa agora ou já esfriou? Olhe u5, u10 e IP recente.
+- O time tem motivo emocional para continuar atacando? Está perdendo, empatando, ou ganhando por pouco?
+- Se o adversário marcou em contra-ataque: o time dominante vai apertar mais, não menos. Não é motivo para bloquear.
+- Dados históricos zerados ou ausentes: ignore completamente. O ao vivo prevalece sempre.
+- Dados corrompidos no início (-1, 0): ignore esses valores e analise o restante.
 
-O que transforma pressão em entrada válida é a CONSEQUÊNCIA:
-- Remates à baliza = finalização real
-- Chances de golo = criação real
-- xG acumulado = perigo real
-Pressão sem nenhuma dessas = território sem ruptura, bloquear.
+PASSO 2 — CONFIRMAÇÃO:
+Esse jogo tem cara de gol agora?
+- APROVADO se os dados ao vivo confirmam o score do Python
+- BLOQUEADO se os dados contradizem claramente — pressão inexistente ou já encerrada
 
-IGNORE completamente:
-- Se é copa, final, eliminatória ou liga regular — IRRELEVANTE
-- Nome da competição — IRRELEVANTE
-- Fase do campeonato — IRRELEVANTE
-
-BLOQUEIE apenas se:
-- IP alto por 1-2 minutos apenas (pico isolado sem continuidade)
-- Nenhum remate à baliza e nenhuma chance de golo apesar do IP
-- Ambos os lados com IP equilibrado (sem dominância clara de um lado)
-- Dados históricos Over muito baixos (abaixo de 40%)
-
-APROVE se:
-- IP contínuo de qualquer intensidade por 5+ minutos com remates ou chances reais
-- Dominância clara de um lado sustentada por múltiplos minutos
-- Dados históricos favoráveis
+Copa, liga, fase do campeonato: irrelevante para a decisão.
 
 Responda APENAS com JSON puro, sem markdown:
 {"decisao": "APROVADO" ou "BLOQUEADO", "confianca": numero 0-100}"""
 
-_PROMPT_CONFIRMACAO = """Você é um analista especializado em trading esportivo ao vivo.
+_PROMPT_CONFIRMACAO = """Você é um analista de futebol ao vivo. O time dominante marcou um gol.
 
-Este é um alerta de CONFIRMAÇÃO. O time dominante marcou um gol e a pergunta é:
-"A pressão continuou REAL após o gol, com consequência, ou o time esfriou?"
+Sua função é responder: a pressão continuou real após o gol, ou o time esfriou?
 
-REGRA CENTRAL — IP SEM CONSEQUÊNCIA NÃO VALE NADA:
-IP contínuo alto após o gol só é relevante SE vier acompanhado de:
-- Remates à baliza continuando
-- Chances de golo reais
-- u5 e u10 ainda favoráveis ao lado dominante
-IP alto sem remates e sem chances = time com bola mas sem criar perigo = BLOQUEIE.
+PASSO 1 — RELEITURA DOS DADOS AO VIVO:
+Analise o que aconteceu após o gol:
+- O lado dominante continua atacando? Olhe u5, u10, remates e IP após o gol.
+- Ou parou e está administrando o resultado?
+- Gol sofrido em transição pelo dominante: vai apertar ainda mais — não é motivo para bloquear.
+- Gol de empate ou time ainda perdendo: contexto emocional vivo, tende a continuar atacando.
+- Pressão ativa mas sem remate e sem chance: domínio sem consequência — bloqueia.
 
-BLOQUEIE se:
-- IP caiu após o gol (time administrando a vantagem)
-- u5 e u10 do lado dominante caíram ou equilibraram
-- Nenhum remate à baliza após o gol
-- Time claramente administrando resultado
+PASSO 2 — CONFIRMAÇÃO:
+A pressão continuou real após o gol?
+- APROVADO se o time dominante continua atacando com consequência real
+- BLOQUEADO se claramente esfriou e está administrando
 
-APROVE se:
-- IP contínuo por 5+ minutos após o gol COM remates e chances reais
-- u5 e u10 ainda claramente favoráveis ao lado dominante
-- Evidência clara que o time continua atacando, não administrando
-
-IGNORE completamente:
-- Se é copa, final, eliminatória — IRRELEVANTE
-- Nome da competição — IRRELEVANTE
+Copa, liga, fase do campeonato: irrelevante.
 
 Responda APENAS com JSON puro, sem markdown:
 {"decisao": "APROVADO" ou "BLOQUEADO", "confianca": numero 0-100}"""
@@ -3340,8 +3385,10 @@ async def trabalhador_envio():
                     marcar_enviado(item["chave_envio"])
                     registrar_alerta_csv(alerta)
                     log(f"✅ ENVIADO | {estrategia} | ALFA={score_alfa}% IA={score_ia}% MÉDIA={score_medio}% | Liga={liga} | {jogo} | {CONFIRMATION_CHANNEL}")
+                    await enviar_auditoria(client, estrategia, jogo, score_alfa, score_ia, score_medio, liga, aprovado=True, motivo="Confirmação")
                 else:
                     log(f"⛔ CONFIRMAÇÃO ABAIXO DO MÍNIMO | Média={score_medio}% < 87% | Liga={liga} | {jogo}")
+                    await enviar_auditoria(client, estrategia, jogo, score_alfa, score_ia, score_medio, liga, aprovado=False, motivo=f"Confirmação abaixo de 87%")
             else:
                 if liga == "PREMIUM":
                     corte_liga = int(os.getenv("CORTE_MEDIA_PREMIUM", "85"))
@@ -3356,11 +3403,13 @@ async def trabalhador_envio():
 
                 if score_medio < corte_liga:
                     log(f"⛔ BLOQUEADO MÉDIA FINAL | Liga={liga} | Média={score_medio}% < {corte_liga}% | {jogo}")
+                    await enviar_auditoria(client, estrategia, jogo, score_alfa, score_ia, score_medio, liga, aprovado=False, motivo=f"Média {score_medio}% < corte {corte_liga}%")
                 else:
                     await client.send_message(TARGET_CHANNEL, mensagem, parse_mode="html")
                     marcar_enviado(item["chave_envio"])
                     registrar_alerta_csv(alerta)
                     log(f"✅ ENVIADO | {estrategia} | ALFA={score_alfa}% IA={score_ia}% MÉDIA={score_medio}% | Liga={liga} | {jogo} | {TARGET_CHANNEL}")
+                    await enviar_auditoria(client, estrategia, jogo, score_alfa, score_ia, score_medio, liga, aprovado=True)
             await asyncio.sleep(INTERVALO_ENVIO_SEGUNDOS)
 
         except FloodWaitError as e:
