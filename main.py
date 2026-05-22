@@ -156,6 +156,7 @@ async def enviar_auditoria(client, estrategia, jogo, score_alfa, score_ia, score
             status = "REPROVADO"
 
         if not canal:
+            log(f"⚠️ AUDITORIA SEM CANAL | {status} | {estrategia} | variável de ambiente vazia")
             return  # Canal não configurado — auditoria desativada
 
         tipo = "HT" if eh_ht else "FT"
@@ -169,9 +170,12 @@ async def enviar_auditoria(client, estrategia, jogo, score_alfa, score_ia, score
             f"🏆 Liga: {liga}{motivo_str}"
         )
 
+        log(f"📤 AUDITORIA TENTANDO ENVIAR | {status} | canal={canal} | {jogo}")
         await client.send_message(canal, mensagem)
+        log(f"📋 AUDITORIA ENVIADA | {status} | canal={canal} | {jogo}")
     except Exception as e:
-        log(f"⚠️ AUDITORIA ERRO: {e}")
+        log(f"❌ AUDITORIA ERRO | canal={canal} | tipo={type(e).__name__} | {e}")
+        log(traceback.format_exc())
 
 
 def log(msg):
