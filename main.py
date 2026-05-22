@@ -639,6 +639,7 @@ _LIGAS_MODERADAS = {
     # Outros moderados
     "norway", "sweden", "denmark", "finland",
     "poland", "czech republic", "scotland",
+    "greece",  # movido de UNDER após auditoria 21/05/2026 — 2 greens perdidos
     "korea republic", "k-league",
     "faroe islands", "iceland", "northern ireland",
     # Sul-americanos série B e abaixo — convertem bem nesse nível
@@ -667,7 +668,7 @@ _LIGAS_UNDER = {
     "egypt", "morocco", "algeria", "tunisia", "senegal",
     "south africa", "cameroon", "ivory coast",
     # Outros under
-    "greece", "romania", "bulgaria", "serbia",
+    "romania", "bulgaria", "serbia",
     "croatia", "slovakia", "hungary",
 }
 
@@ -3183,24 +3184,64 @@ def montar_mensagem_canto(jogo, estrategia, score, metricas):
 
 _PROMPT_NORMAL = """Você é um analista de futebol ao vivo especializado em identificar se um gol vai sair.
 
-O sistema matemático já calculou um score para este jogo. Sua função é olhar os dados ao vivo e responder: esse score faz sentido com o que está acontecendo em campo agora?
+O sistema matemático ALFA já calculou um score. Sua função é confirmar ou bloquear com base nos DADOS AO VIVO.
 
-PASSO 1 — RELEITURA DOS DADOS AO VIVO:
+═══════════════════════════════════════════════════
+HIERARQUIA FUNDAMENTAL — LEIA COM ATENÇÃO
+═══════════════════════════════════════════════════
+
+Os dados AO VIVO sempre prevalecem sobre o histórico pré-live.
+O histórico pré-live (liga, médias, previsões) serve APENAS para causar:
+- CAUTELA se a liga for ruim
+- CERTEZA se a liga for boa
+Nunca para bloquear sozinho um jogo que está gritando nos números ao vivo.
+
+═══════════════════════════════════════════════════
+REGRA DE PONDERAÇÃO POR SCORE E LIGA
+═══════════════════════════════════════════════════
+
+LIGA BOA (Premium/Moderada):
+- Score 80%+ → confirme com tranquilidade. Os dados live mandam.
+- Score abaixo → cautela normal.
+
+LIGA RUIM (Under/Perigosa/Desconhecida):
+- Score 90%+ → APROVE se os dados live justificam. A liga é apenas contexto,
+  não pode bloquear um jogo onde o domínio ao vivo é claro.
+- Score 78-89% → exija mais evidência nos dados live. A liga pesa mais aqui.
+- Score abaixo de 78% → bloqueie.
+
+HISTÓRICO ZERADO OU AUSENTE (liga nova, dados pré-live vazios):
+- Os dados live são a ÚNICA referência. Não bloqueie por falta de histórico.
+- Analise apenas o que está acontecendo em campo agora.
+
+═══════════════════════════════════════════════════
+PASSO 1 — RELEITURA DOS DADOS AO VIVO
+═══════════════════════════════════════════════════
+
 Analise com seus próprios olhos — o Python pode errar:
 - Quem está dominando de verdade? Olhe AP, u5, u10, remates, IP do lado dominante — não a soma dos dois times.
-- Esse domínio tem consequência real? Chute no gol, chance de golo, xG. Domínio sem consequência não vale.
-- A pressão está ativa agora ou já esfriou? Olhe u5, u10 e IP recente.
+- Esse domínio tem CONSEQUÊNCIA REAL no último terço? Chute no gol, chance de golo, xG, remates dentro da área.
+- Volume de ataque alto SEM xG e SEM remates dentro da área = pressão fake. Não aprove.
+- A pressão está ativa AGORA ou já esfriou? Olhe u5, u10 e IP recente.
 - O time tem motivo emocional para continuar atacando? Está perdendo, empatando, ou ganhando por pouco?
-- Se o adversário marcou em contra-ataque: o time dominante vai apertar mais, não menos. Não é motivo para bloquear.
-- Dados históricos zerados ou ausentes: ignore completamente. O ao vivo prevalece sempre.
+- Se o adversário marcou em contra-ataque: o time dominante vai apertar mais. Não é motivo para bloquear.
 - Dados corrompidos no início (-1, 0): ignore esses valores e analise o restante.
 
-PASSO 2 — CONFIRMAÇÃO:
-Esse jogo tem cara de gol agora?
-- APROVADO se os dados ao vivo confirmam o score do Python
-- BLOQUEADO se os dados contradizem claramente — pressão inexistente ou já encerrada
+═══════════════════════════════════════════════════
+PASSO 2 — DECISÃO
+═══════════════════════════════════════════════════
 
-Copa, liga, fase do campeonato: irrelevante para a decisão.
+APROVADO se:
+- Os dados live confirmam o score ALFA
+- Há domínio real com consequência no último terço
+- A pressão está viva agora
+
+BLOQUEADO se:
+- Pressão é volume sem chegada (AP alto, xG baixo, zero dentro da área)
+- A pressão já esfriou (u5 e u10 zerados ou caindo)
+- Time perdendo com pressão morrendo no 2P
+
+Copa, fase do campeonato, prestígio do time: irrelevante para a decisão.
 
 Responda APENAS com JSON puro, sem markdown:
 {"decisao": "APROVADO" ou "BLOQUEADO", "confianca": numero 0-100}"""
@@ -3209,20 +3250,44 @@ _PROMPT_CONFIRMACAO = """Você é um analista de futebol ao vivo. O time dominan
 
 Sua função é responder: a pressão continuou real após o gol, ou o time esfriou?
 
-PASSO 1 — RELEITURA DOS DADOS AO VIVO:
-Analise o que aconteceu após o gol:
+═══════════════════════════════════════════════════
+HIERARQUIA FUNDAMENTAL
+═══════════════════════════════════════════════════
+
+Os dados AO VIVO prevalecem sempre sobre o histórico pré-live.
+A liga serve apenas para causar cautela (se ruim) ou certeza (se boa),
+nunca para bloquear um jogo onde o domínio segue claro.
+
+LIGA BOA + score 80%+ → confirme com tranquilidade
+LIGA RUIM + score 90%+ → dados live mandam, liga é só contexto
+LIGA RUIM + score 78-89% → exija mais evidência live
+Histórico zerado/ausente → analise apenas o ao vivo
+
+═══════════════════════════════════════════════════
+PASSO 1 — RELEITURA APÓS O GOL
+═══════════════════════════════════════════════════
+
 - O lado dominante continua atacando? Olhe u5, u10, remates e IP após o gol.
 - Ou parou e está administrando o resultado?
 - Gol sofrido em transição pelo dominante: vai apertar ainda mais — não é motivo para bloquear.
 - Gol de empate ou time ainda perdendo: contexto emocional vivo, tende a continuar atacando.
-- Pressão ativa mas sem remate e sem chance: domínio sem consequência — bloqueia.
+- Pressão ativa mas SEM remate e SEM chance no último terço: domínio sem consequência — bloqueia.
 
-PASSO 2 — CONFIRMAÇÃO:
-A pressão continuou real após o gol?
-- APROVADO se o time dominante continua atacando com consequência real
-- BLOQUEADO se claramente esfriou e está administrando
+═══════════════════════════════════════════════════
+PASSO 2 — DECISÃO
+═══════════════════════════════════════════════════
 
-Copa, liga, fase do campeonato: irrelevante.
+APROVADO se:
+- O lado dominante continua atacando com consequência real
+- Pressão segue ativa nos últimos 5-10 minutos
+- Há remates, chance de golo ou xG crescente
+
+BLOQUEADO se:
+- Claramente esfriou e está administrando
+- AP alto mas zero remates e zero dentro da área
+- u5 e u10 zerados após o gol
+
+Copa, liga, prestígio: irrelevante.
 
 Responda APENAS com JSON puro, sem markdown:
 {"decisao": "APROVADO" ou "BLOQUEADO", "confianca": numero 0-100}"""
@@ -3348,6 +3413,14 @@ async def trabalhador_envio():
                 )
                 if resultado_ia["decisao"] == "BLOQUEADO":
                     log(f"🤖 OpenAI BLOQUEOU | {jogo}")
+                    liga_audit = classificar_liga(alerta["metricas"].get("competicao", ""))
+                    await enviar_auditoria(
+                        client, estrategia, jogo, score_alfa,
+                        resultado_ia.get("confianca", 0),
+                        score_alfa, liga_audit,
+                        aprovado=False,
+                        motivo=f"OpenAI bloqueou (confiança {resultado_ia.get('confianca', 0)}%)"
+                    )
                     continue
                 score_ia = resultado_ia["confianca"]
 
@@ -3686,9 +3759,15 @@ async def processar_evento(event, origem="nova"):
 
         corte_evento = corte_gol_estrategia(estrategia)
         if sg < CORTE_OBSERVACAO_JANELA:
+            liga_audit = classificar_liga(metricas.get("competicao", ""))
             log(
                 f"⛔ BLOQUEADO POR SCORE | {estrategia} | "
                 f"Gol={sg}% < observação {CORTE_OBSERVACAO_JANELA}% | {jogo}"
+            )
+            await enviar_auditoria(
+                client, estrategia, jogo, sg, 0, sg, liga_audit,
+                aprovado=False,
+                motivo=f"Score {sg}% abaixo do corte de observação {CORTE_OBSERVACAO_JANELA}%"
             )
             return
 
