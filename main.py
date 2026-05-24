@@ -1,5 +1,10 @@
 from telethon import TelegramClient, events
 from telethon.errors import FloodWaitError
+try:
+    from telethon.errors.common import TypeNotFoundError
+except Exception:
+    class TypeNotFoundError(Exception):
+        pass
 from dotenv import load_dotenv
 import os
 import re
@@ -3898,30 +3903,74 @@ async def main():
     await client.run_until_disconnected()
 
 
+async def _notificar_crash_telegram(motivo: str, detalhe: str = ""):
+    """Envia mensagem ao canal técnico avisando que o bot caiu.
+    Tenta uma vez só, sem bloquear o restart se falhar.
+    """
+    try:
+        canal = CONFIRMATION_CHANNEL or TARGET_CHANNEL
+        if not canal:
+            return
+        agora = time.strftime("%H:%M:%S")
+        det = (detalhe[:200] + "...") if len(detalhe) > 200 else detalhe
+        msg = (
+            f"🚨 <b>ALERTA OPERACIONAL</b>\n"
+            f"⚠️ Bot caiu e está reiniciando\n"
+            f"🕐 {agora}\n"
+            f"📋 Motivo: {motivo}"
+            + (f"\n💬 {det}" if det else "")
+        )
+        cli_tmp = TelegramClient("coutips_v2_session", API_ID, API_HASH)
+        await cli_tmp.connect()
+        await cli_tmp.send_message(canal, msg, parse_mode="html")
+        await cli_tmp.disconnect()
+    except Exception as e:
+        log(f"⚠️ Não consegui notificar crash no Telegram: {e}")
+
+
 if __name__ == "__main__":
     _lock = verificar_instancia_unica()
     import time as _time
-    MAX_TENTATIVAS = 10
-    for tentativa in range(1, MAX_TENTATIVAS + 1):
+    MAX_TENTATIVAS = 99999  # praticamente infinito — nunca desistir
+    tentativa = 0
+    while True:
+        tentativa += 1
         try:
+            log(f"🚀 INICIANDO BOT | tentativa #{tentativa}")
             asyncio.run(main())
-            break
+            log("ℹ️ main() retornou normalmente. Reiniciando em 5s...")
+            _time.sleep(5)
         except KeyboardInterrupt:
             log("🛑 Bot encerrado manualmente.")
             break
-        except RuntimeError as e:
-            if "event loop" in str(e) or "AuthKeyDuplicated" in str(e) or "two different IP" in str(e):
-                log(f"⚠️ Sessão duplicada detectada (tentativa {tentativa}/{MAX_TENTATIVAS}). Aguardando 30s para deploy antigo encerrar...")
-                _time.sleep(30)
-            else:
-                log(f"❌ ERRO FATAL NO BOT: {e}")
-                log(traceback.format_exc())
-                break
+        except TypeNotFoundError as e:
+            log(f"⚠️ TypeNotFoundError (Telegram protocolo incompatível): {e}")
+            log("🔁 Reiniciando em 10s — esse erro é da Telethon, não do nosso código.")
+            try:
+                asyncio.run(_notificar_crash_telegram(
+                    "TypeNotFoundError (protocolo Telegram)",
+                    str(e)
+                ))
+            except Exception:
+                pass
+            _time.sleep(10)
         except Exception as e:
-            if "AuthKeyDuplicated" in str(e) or "two different IP" in str(e):
-                log(f"⚠️ Sessão duplicada detectada (tentativa {tentativa}/{MAX_TENTATIVAS}). Aguardando 30s para deploy antigo encerrar...")
+            erro_str = str(e)
+            if "AuthKeyDuplicated" in erro_str or "two different IP" in erro_str:
+                log(f"⚠️ Sessão duplicada detectada (tentativa #{tentativa}). Aguardando 30s para deploy antigo encerrar...")
                 _time.sleep(30)
+            elif "event loop" in erro_str:
+                log(f"⚠️ Erro de event loop: {e}. Aguardando 5s e reiniciando...")
+                _time.sleep(5)
             else:
-                log(f"❌ ERRO FATAL NO BOT: {e}")
+                log(f"❌ ERRO FATAL NO BOT: {type(e).__name__}: {e}")
                 log(traceback.format_exc())
-                break
+                try:
+                    asyncio.run(_notificar_crash_telegram(
+                        f"{type(e).__name__}",
+                        erro_str
+                    ))
+                except Exception:
+                    pass
+                log("🔁 Reiniciando em 15s...")
+                _time.sleep(15)
