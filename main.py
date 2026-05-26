@@ -66,16 +66,12 @@ client = TelegramClient(
     API_HASH,
 )
 
-# Cliente DEDICADO PARA ENVIO — separado do client principal.
-# Motivo: a Telethon tem um bug conhecido (TypeNotFoundError ID 95ef6f2b) que pode
-# corromper o estado do cliente. Ao manter um cliente separado só para envio,
-# se o cliente principal quebrar lendo updates, o envio continua funcionando.
-# Usa a MESMA sessão pra não precisar de novo login.
-client_envio = TelegramClient(
-    "coutips_envio_session",
-    API_ID,
-    API_HASH,
-)
+# Estratégia de envio resiliente:
+# Em vez de manter um segundo cliente Telethon (que causa AuthKeyDuplicated ou
+# precisa de novo login SMS no Railway), usamos o cliente principal com retry
+# automático. A função send_resiliente() faz 3 tentativas com reconexão entre
+# elas em caso de TypeNotFoundError (bug da Telethon).
+client_envio = client  # alias — usa o mesmo cliente, mas envio é resiliente
 
 
 async def send_resiliente(canal, mensagem, parse_mode=None, max_tentativas=3):
@@ -3960,16 +3956,6 @@ async def main():
                 raise
 
     log("✅ TELEGRAM CONECTADO COM SUCESSO")
-
-    # Inicializa cliente DEDICADO PARA ENVIO (Nível 2 de resiliência).
-    # Roda em paralelo ao client principal. Se o principal travar lendo updates,
-    # o envio continua funcionando porque usa conexão TCP separada.
-    try:
-        await client_envio.start()
-        log("✅ CLIENT_ENVIO CONECTADO (canal dedicado de envio)")
-    except Exception as e:
-        log(f"⚠️ Falha ao iniciar client_envio: {e}")
-        log("⚠️ Sistema vai operar SEM cliente dedicado de envio — usando client principal como fallback")
 
     tarefa_envio = asyncio.create_task(trabalhador_envio())
     asyncio.create_task(watchdog_envio())
