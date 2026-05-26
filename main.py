@@ -66,6 +66,70 @@ client = TelegramClient(
     API_HASH,
 )
 
+# Cliente DEDICADO PARA ENVIO — separado do client principal.
+# Motivo: a Telethon tem um bug conhecido (TypeNotFoundError ID 95ef6f2b) que pode
+# corromper o estado do cliente. Ao manter um cliente separado só para envio,
+# se o cliente principal quebrar lendo updates, o envio continua funcionando.
+# Usa a MESMA sessão pra não precisar de novo login.
+client_envio = TelegramClient(
+    "coutips_envio_session",
+    API_ID,
+    API_HASH,
+)
+
+
+async def send_resiliente(canal, mensagem, parse_mode=None, max_tentativas=3):
+    """Envia mensagem com reconexão automática em caso de TypeNotFoundError.
+    
+    Usa o client_envio dedicado. Se ele não estiver conectado, usa o client
+    principal como fallback. Se der erro do bug da Telethon, desconecta,
+    espera 2s, reconecta e tenta de novo (até 3x). Se mesmo assim falhar,
+    loga mas NÃO derruba o bot.
+    
+    Retorna True se enviou com sucesso, False se falhou todas as tentativas.
+    """
+    global client_envio, client
+    # Escolhe qual cliente usar — prefere o dedicado, mas cai pro principal se preciso
+    def _escolher_cliente():
+        try:
+            if client_envio and client_envio.is_connected():
+                return client_envio, "envio"
+        except Exception:
+            pass
+        return client, "principal"
+    
+    for tentativa in range(1, max_tentativas + 1):
+        cli, qual = _escolher_cliente()
+        try:
+            if parse_mode:
+                await cli.send_message(canal, mensagem, parse_mode=parse_mode)
+            else:
+                await cli.send_message(canal, mensagem)
+            return True
+        except FloodWaitError:
+            raise  # propaga FloodWait pra ser tratado fora
+        except TypeNotFoundError as e:
+            log(f"⚠️ TypeNotFoundError no envio via {qual} (tent. {tentativa}/{max_tentativas}) | canal={canal}")
+            # Tenta reconectar o cliente que falhou
+            try:
+                await cli.disconnect()
+            except Exception:
+                pass
+            await asyncio.sleep(2)
+            try:
+                await cli.connect()
+                log(f"🔄 Cliente {qual} reconectado (tent. {tentativa}/{max_tentativas})")
+            except Exception as rec_err:
+                log(f"⚠️ Falha ao reconectar {qual}: {rec_err}")
+                await asyncio.sleep(3)
+        except Exception as e:
+            # Outros erros: loga mas tenta de novo
+            log(f"⚠️ Erro no envio via {qual} (tent. {tentativa}/{max_tentativas}) | {type(e).__name__}: {e}")
+            await asyncio.sleep(1)
+    log(f"❌ ALERTA NÃO ENVIADO após {max_tentativas} tentativas | canal={canal}")
+    log(f"   mensagem perdida (primeiros 100 chars): {str(mensagem)[:100]}")
+    return False
+
 # =========================================================
 # CONFIGURAÇÃO OFICIAL ATUAL
 # =========================================================
@@ -176,7 +240,7 @@ async def enviar_auditoria(client, estrategia, jogo, score_alfa, score_ia, score
         )
 
         log(f"📤 AUDITORIA TENTANDO ENVIAR | {status} | canal={canal} | {jogo}")
-        await client.send_message(canal, mensagem)
+        await send_resiliente(canal, mensagem)
         log(f"📋 AUDITORIA ENVIADA | {status} | canal={canal} | {jogo}")
     except Exception as e:
         log(f"❌ AUDITORIA ERRO | canal={canal} | tipo={type(e).__name__} | {e}")
@@ -3451,19 +3515,19 @@ async def trabalhador_envio():
 
             if MODO_TESTE:
                 destino = CONFIRMATION_CHANNEL
-                await client.send_message(destino, mensagem, parse_mode="html")
+                await send_resiliente(destino, mensagem, parse_mode="html")
                 marcar_enviado(item["chave_envio"])
                 registrar_alerta_csv(alerta)
                 log(f"✅ ENVIADO | {estrategia} | ALFA={score_alfa}% IA={score_ia}% MÉDIA={score_medio}% | {jogo} | {destino}")
             elif eh_conf:
                 if score_medio >= 92:
-                    await client.send_message(TARGET_CHANNEL, mensagem, parse_mode="html")
-                    await client.send_message(CONFIRMATION_CHANNEL, mensagem, parse_mode="html")
+                    await send_resiliente(TARGET_CHANNEL, mensagem, parse_mode="html")
+                    await send_resiliente(CONFIRMATION_CHANNEL, mensagem, parse_mode="html")
                     marcar_enviado(item["chave_envio"])
                     registrar_alerta_csv(alerta)
                     log(f"✅ ENVIADO | {estrategia} | ALFA={score_alfa}% IA={score_ia}% MÉDIA={score_medio}% | Liga={liga} | {jogo} | AMBOS CANAIS")
                 elif score_medio >= 87:
-                    await client.send_message(CONFIRMATION_CHANNEL, mensagem, parse_mode="html")
+                    await send_resiliente(CONFIRMATION_CHANNEL, mensagem, parse_mode="html")
                     marcar_enviado(item["chave_envio"])
                     registrar_alerta_csv(alerta)
                     log(f"✅ ENVIADO | {estrategia} | ALFA={score_alfa}% IA={score_ia}% MÉDIA={score_medio}% | Liga={liga} | {jogo} | {CONFIRMATION_CHANNEL}")
@@ -3487,7 +3551,7 @@ async def trabalhador_envio():
                     log(f"⛔ BLOQUEADO MÉDIA FINAL | Liga={liga} | Média={score_medio}% < {corte_liga}% | {jogo}")
                     await enviar_auditoria(client, estrategia, jogo, score_alfa, score_ia, score_medio, liga, aprovado=False, motivo=f"Média {score_medio}% < corte {corte_liga}%")
                 else:
-                    await client.send_message(TARGET_CHANNEL, mensagem, parse_mode="html")
+                    await send_resiliente(TARGET_CHANNEL, mensagem, parse_mode="html")
                     marcar_enviado(item["chave_envio"])
                     registrar_alerta_csv(alerta)
                     log(f"✅ ENVIADO | {estrategia} | ALFA={score_alfa}% IA={score_ia}% MÉDIA={score_medio}% | Liga={liga} | {jogo} | {TARGET_CHANNEL}")
@@ -3539,7 +3603,7 @@ async def trabalhador_envio():
             else:
                 destino = item.get("destino") or TARGET_CHANNEL
 
-            await client.send_message(destino, mensagem, parse_mode="html")
+            await send_resiliente(destino, mensagem, parse_mode="html")
             marcar_enviado(item["chave_envio"])
             registrar_alerta_csv(alerta)
 
@@ -3896,6 +3960,16 @@ async def main():
                 raise
 
     log("✅ TELEGRAM CONECTADO COM SUCESSO")
+
+    # Inicializa cliente DEDICADO PARA ENVIO (Nível 2 de resiliência).
+    # Roda em paralelo ao client principal. Se o principal travar lendo updates,
+    # o envio continua funcionando porque usa conexão TCP separada.
+    try:
+        await client_envio.start()
+        log("✅ CLIENT_ENVIO CONECTADO (canal dedicado de envio)")
+    except Exception as e:
+        log(f"⚠️ Falha ao iniciar client_envio: {e}")
+        log("⚠️ Sistema vai operar SEM cliente dedicado de envio — usando client principal como fallback")
 
     tarefa_envio = asyncio.create_task(trabalhador_envio())
     asyncio.create_task(watchdog_envio())
