@@ -2595,6 +2595,10 @@ def aplicar_travas_ht_elite(metricas, estrategia, score):
 
 
 def aplicar_trava_consequencia_ofensiva(metricas, estrategia, score):
+    # R1/R2: exceções FT — diamantes borderline não são travados aqui
+    if eh_ft(estrategia) and (eh_quase_alfa_puro(metricas, estrategia) or eh_liga_premium_top_ft(metricas)):
+        return score
+
     nivel = pressao_sustentada_nivel(metricas, estrategia)
     lado_principal = lado_pressao_principal(metricas, estrategia)
     tem_consequencia_total = consequencia_ofensiva_total(metricas, estrategia)
@@ -2631,6 +2635,10 @@ def aplicar_trava_consequencia_ofensiva(metricas, estrategia, score):
 
 
 def aplicar_trava_liga_under(metricas, estrategia, score):
+    # R1/R2: exceções FT — não aplica trava under nesses casos
+    if eh_ft(estrategia) and (eh_quase_alfa_puro(metricas, estrategia) or eh_liga_premium_top_ft(metricas)):
+        return score
+
     liga = classificar_liga(metricas.get("competicao", ""))
     if liga not in ["UNDER", "PERIGOSA"]:
         return score
@@ -2663,6 +2671,10 @@ def aplicar_trava_liga_under(metricas, estrategia, score):
 
 def aplicar_trava_ft_jogo_morto(metricas, estrategia, score):
     if not eh_ft(estrategia):
+        return score
+
+    # R1/R2: exceções FT — não aplica trava jogo morto nesses casos
+    if eh_quase_alfa_puro(metricas, estrategia) or eh_liga_premium_top_ft(metricas):
         return score
 
     gc, gf = extrair_gols_placar(metricas.get("placar", ""))
@@ -2717,11 +2729,107 @@ def aplicar_trava_ft_jogo_morto(metricas, estrategia, score):
 
 
 def aplicar_trava_pressao_antiga(metricas, estrategia, score):
+    # R1/R2: exceções FT — não aplica trava pressão antiga nesses casos
+    if eh_ft(estrategia) and (eh_quase_alfa_puro(metricas, estrategia) or eh_liga_premium_top_ft(metricas)):
+        return score
+
     if pressao_recente_caiu(metricas):
         if eh_ht(estrategia):
             return min(score, 85)
         return min(score, 82)
     return score
+
+
+
+# =========================================================
+# R1 — REGRA 6/7 ALFA COM MARGEM 10% (só FT)
+# =========================================================
+
+_ALFA_THRESHOLDS_FT = {
+    "ip_dom":   17.0,
+    "ip_diff":   7.0,
+    "ap_total": 30.0,
+    "ap_ult5":   4.0,
+    "xg":        0.70,
+}
+
+
+def eh_quase_alfa_puro(metricas, estrategia):
+    if not eh_ft(estrategia):
+        return False
+
+    p = metricas.get("pressao_alfa", {})
+    dom = metricas.get("lado_dominante", "EQUILIBRADO")
+
+    if dom == "CASA":
+        ip_dom = p.get("ip_pico_casa", 0.0)
+        ip_adv = p.get("ip_pico_fora", 0.0)
+        apc_total, apf_total = metricas.get("ataques_perigosos", (0, 0))
+        u5_dom = metricas.get("ultimos5", (0, 0))[0]
+        xg_total = sum(metricas.get("xg", (0.0, 0.0)))
+    elif dom == "FORA":
+        ip_dom = p.get("ip_pico_fora", 0.0)
+        ip_adv = p.get("ip_pico_casa", 0.0)
+        apc_total, apf_total = metricas.get("ataques_perigosos", (0, 0))
+        u5_dom = metricas.get("ultimos5", (0, 0))[1]
+        xg_total = sum(metricas.get("xg", (0.0, 0.0)))
+    else:
+        return False
+
+    ap_total = apc_total + apf_total
+    ip_diff = abs(ip_dom - ip_adv)
+
+    resultados = {
+        "ip_dom":   ip_dom  >= _ALFA_THRESHOLDS_FT["ip_dom"],
+        "ip_diff":  ip_diff >= _ALFA_THRESHOLDS_FT["ip_diff"],
+        "ap_total": ap_total >= _ALFA_THRESHOLDS_FT["ap_total"],
+        "ap_ult5":  u5_dom  >= _ALFA_THRESHOLDS_FT["ap_ult5"],
+        "xg":       xg_total >= _ALFA_THRESHOLDS_FT["xg"],
+    }
+
+    falhas = [k for k, v in resultados.items() if not v]
+    if len(falhas) != 1:
+        return False
+
+    criterio_faltante = falhas[0]
+    threshold = _ALFA_THRESHOLDS_FT[criterio_faltante]
+    valores = {
+        "ip_dom":   ip_dom,
+        "ip_diff":  ip_diff,
+        "ap_total": ap_total,
+        "ap_ult5":  u5_dom,
+        "xg":       xg_total,
+    }
+    valor_obs = valores[criterio_faltante]
+
+    if threshold == 0:
+        return False
+    margem = (threshold - valor_obs) / threshold
+    return margem <= 0.10
+
+
+# =========================================================
+# R2 — LIGAS PREMIUM TOP FT (só FT)
+# =========================================================
+
+_LIGAS_PREMIUM_TOP_FT = {
+    "cruzeiro", "chapecoense",
+    "fiorentina", "atalanta", "hellas verona", "roma", "torino", "juventus",
+    "club brugge", "anderlecht", "union saint-gilloise", "mechelen", "gent",
+    "rijeka", "hajduk split", "vukovar", "gorica",
+    "al nassr", "damac", "al kuwait", "al fahaheel",
+    "celtic", "dunfermline", "fcsb", "botosani", "ajax", "utrecht", "heerenveen",
+}
+
+
+def eh_liga_premium_top_ft(metricas):
+    jogo = remover_acentos(str(metricas.get("jogo", "") or "")).lower()
+    time_premium = any(t in jogo for t in _LIGAS_PREMIUM_TOP_FT)
+    if not time_premium:
+        return False
+    p = metricas.get("pressao_alfa", {})
+    ip_dom = max(p.get("ip_pico_casa", 0.0), p.get("ip_pico_fora", 0.0))
+    return ip_dom >= 13.0
 
 
 def teto_contextual_gol(metricas, estrategia, score):
@@ -3238,7 +3346,9 @@ def montar_mensagem_gol_nova(jogo, estrategia, score_alfa, score_media, metricas
 ⏱ {metricas.get('tempo', '?')}' | {html.escape(str(metricas.get('placar', '?')))}
 🎯 {html.escape(str(metricas.get('mercado', '?')))}
 📊 COUTIPS: {score_media}%
-{linha_liga}{link}"""
+{linha_liga}
+💰 Odd mínima de entrada: 1.65
+⚠️ SIGA sua gestão de banca{link}"""
 
 
 def montar_mensagem_canto(jogo, estrategia, score, metricas):
@@ -3369,7 +3479,7 @@ async def consultar_openai(texto_alerta: str, score_alfa: int, jogo: str,
         return {"decisao": "APROVADO", "confianca": score_alfa}
 
     prompt_sistema = _PROMPT_CONFIRMACAO if eh_conf else _PROMPT_NORMAL
-    prompt_usuario = f"Jogo: {jogo}\nEstratégia: {estrategia}\nScore ALFA: {score_alfa}%\n\n{texto_alerta}"
+    prompt_usuario = f"Jogo: {jogo}\nEstratégia: {estrategia}\n\n{texto_alerta}"
 
     try:
         async with httpx.AsyncClient(timeout=15.0) as cli:
@@ -3679,6 +3789,18 @@ async def decidir_e_enviar(chave_jogo):
                         log(f"⚠️ FILA CHEIA — alerta descartado: {escolhido['jogo']} | {mercado}")
         else:
             log(f"⛔ BLOQUEADO FINAL | Gol={escolhido['score_gol']}% | {escolhido['jogo']}")
+            liga_bf = classificar_liga(escolhido["metricas"].get("competicao", ""))
+            await enviar_auditoria(
+                client,
+                escolhido["estrategia"],
+                escolhido["jogo"],
+                escolhido["score_gol"],
+                0,
+                escolhido["score_gol"],
+                liga_bf,
+                aprovado=False,
+                motivo=f"Score {escolhido['score_gol']}% abaixo do corte {corte_escolhido}%",
+            )
 
         # Confirmações: somente GOL.
         # Se melhorou forte ou gol contra fluxo, vai ao principal.
