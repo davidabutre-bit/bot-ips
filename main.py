@@ -2595,9 +2595,12 @@ def aplicar_travas_ht_elite(metricas, estrategia, score):
 
 
 def aplicar_trava_consequencia_ofensiva(metricas, estrategia, score):
-    # R1/R2: exceções FT — diamantes borderline não são travados aqui
-    if eh_ft(estrategia) and (eh_quase_alfa_puro(metricas, estrategia) or eh_liga_premium_top_ft(metricas)):
+    # R1: exceção FT para diamantes borderline — não trava quem quase passou no ALFA puro
+    if eh_ft(estrategia) and eh_quase_alfa_puro(metricas, estrategia):
         return score
+    # R2: liga premium top vira bônus leve (+3), não bypass da trava
+    if eh_ft(estrategia) and eh_liga_premium_top_ft(metricas):
+        score = score + 3
 
     nivel = pressao_sustentada_nivel(metricas, estrategia)
     lado_principal = lado_pressao_principal(metricas, estrategia)
@@ -2635,9 +2638,10 @@ def aplicar_trava_consequencia_ofensiva(metricas, estrategia, score):
 
 
 def aplicar_trava_liga_under(metricas, estrategia, score):
-    # R1/R2: exceções FT — não aplica trava under nesses casos
-    if eh_ft(estrategia) and (eh_quase_alfa_puro(metricas, estrategia) or eh_liga_premium_top_ft(metricas)):
+    # R1: exceção FT para diamantes borderline
+    if eh_ft(estrategia) and eh_quase_alfa_puro(metricas, estrategia):
         return score
+    # R2: liga premium top — bônus já aplicado em aplicar_trava_consequencia_ofensiva
 
     liga = classificar_liga(metricas.get("competicao", ""))
     if liga not in ["UNDER", "PERIGOSA"]:
@@ -2673,9 +2677,10 @@ def aplicar_trava_ft_jogo_morto(metricas, estrategia, score):
     if not eh_ft(estrategia):
         return score
 
-    # R1/R2: exceções FT — não aplica trava jogo morto nesses casos
-    if eh_quase_alfa_puro(metricas, estrategia) or eh_liga_premium_top_ft(metricas):
+    # R1: exceção FT para diamantes borderline
+    if eh_quase_alfa_puro(metricas, estrategia):
         return score
+    # R2: liga premium top não bypassa trava de jogo morto — bônus já foi aplicado antes
 
     gc, gf = extrair_gols_placar(metricas.get("placar", ""))
     if gc is None:
@@ -2729,9 +2734,10 @@ def aplicar_trava_ft_jogo_morto(metricas, estrategia, score):
 
 
 def aplicar_trava_pressao_antiga(metricas, estrategia, score):
-    # R1/R2: exceções FT — não aplica trava pressão antiga nesses casos
-    if eh_ft(estrategia) and (eh_quase_alfa_puro(metricas, estrategia) or eh_liga_premium_top_ft(metricas)):
+    # R1: exceção FT para diamantes borderline
+    if eh_ft(estrategia) and eh_quase_alfa_puro(metricas, estrategia):
         return score
+    # R2: liga premium top não bypassa trava de pressão antiga — bônus já foi aplicado antes
 
     if pressao_recente_caiu(metricas):
         if eh_ht(estrategia):
@@ -2805,7 +2811,21 @@ def eh_quase_alfa_puro(metricas, estrategia):
     if threshold == 0:
         return False
     margem = (threshold - valor_obs) / threshold
-    return margem <= 0.10
+    if margem > 0.10:
+        return False
+
+    # Trava de consequência obrigatória: IP/AP bonito sem chegada real = fake pressure
+    # Sem pelo menos 1 remate à baliza OU 2 remates dentro da área OU xG ≥ 0.55,
+    # o jogo não merece exceção mesmo sendo 6/7 ALFA.
+    rb_total = sum(metricas.get("remates_baliza", (0, 0)))
+    rda_total = sum(metricas.get("remates_dentro_area", (0, 0)))
+    xg_total = sum(metricas.get("xg", (0.0, 0.0)))
+    consequencia_real = (
+        rb_total >= 1
+        or rda_total >= 2
+        or xg_total >= 0.55
+    )
+    return consequencia_real
 
 
 # =========================================================
@@ -3673,63 +3693,6 @@ async def trabalhador_envio():
         finally:
             fila_envio.task_done()
 
-    while True:
-        item = await fila_envio.get()
-
-        try:
-            # Descartar alertas que ficaram muito tempo na fila (ex: após FloodWait longo)
-            idade_item = time.time() - item.get("gerado_em", time.time())
-            if idade_item > 120:
-                log(
-                    f"🗑️ ALERTA EXPIRADO NA FILA | idade={int(idade_item)}s | "
-                    f"{item.get('alerta', {}).get('jogo', '?')} — descartado."
-                )
-                continue
-
-            alerta  = item["alerta"]
-            mercado = item["mercado"]
-
-            if mercado != "GOL":
-                log(f"⚠️ Mercado ignorado na fase atual: {mercado}")
-                continue
-
-            # ── Montar mensagem ───────────────────────────────────────────────
-            mensagem = montar_mensagem_gol_nova(
-                jogo=alerta["jogo"],
-                estrategia=alerta["estrategia"],
-                score_alfa=alerta["score_gol"],
-                score_media=alerta["score_gol"],
-                metricas=alerta["metricas"],
-                link_bet365=alerta["metricas"].get("bet365", ""),
-            )
-
-            # Definir destino — modo teste envia tudo para canal de confirmação
-            if MODO_TESTE:
-                destino = CONFIRMATION_CHANNEL
-            else:
-                destino = item.get("destino") or TARGET_CHANNEL
-
-            await send_resiliente(destino, mensagem, parse_mode="html")
-            marcar_enviado(item["chave_envio"])
-            registrar_alerta_csv(alerta)
-
-            log(
-                f"✅ ENVIADO GOL | {alerta['estrategia']} | "
-                f"score={alerta['score_gol']}% | {alerta['jogo']} | canal={destino}"
-            )
-
-            await asyncio.sleep(INTERVALO_ENVIO_SEGUNDOS)
-
-        except FloodWaitError as e:
-            log(f"⛔ FLOOD WAIT: aguardando {e.seconds} segundos.")
-            await asyncio.sleep(e.seconds + 1)
-
-        except Exception as e:
-            log(f"❌ ERRO AO ENVIAR MENSAGEM: {e}")
-            log(traceback.format_exc())
-
-        finally:
-            fila_envio.task_done()
 
 
 async def decidir_e_enviar(chave_jogo):
