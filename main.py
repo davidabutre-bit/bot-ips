@@ -612,6 +612,9 @@ def extrair_metricas(texto):
         total = pegar_float(r"\bxgi:\s*([0-9.,]+)", tl, 0.0)
         xgi = (total / 2, total / 2)
 
+    # avgXGaFavor — XG histórico médio por lado (só disponível em alertas recentes)
+    avgxg = pegar_float_par(r"avgXGaFavor:Casa=([0-9.,]+)\s*/\s*Fora=([0-9.,]+)", tl)
+
     return {
         "tempo": tempo,
         "placar": placar,
@@ -638,6 +641,7 @@ def extrair_metricas(texto):
         "xg": xg,
         "xgl": xgl,
         "xgi": xgi,
+        "avgxg": avgxg,
         "pressao_alfa": extrair_pressao_alfa(tl),
         "bet365": extrair_link_bet365(tl),
     }
@@ -2852,6 +2856,95 @@ def eh_liga_premium_top_ft(metricas):
     return ip_dom >= 13.0
 
 
+# =========================================================
+# DNA 3 PILARES — XG histórico + L15 + Odd favorito
+# Validado em 383 jogos de maio/2026:
+#   DNA completo (3/3): 71.1%
+#   DNA parcial  (1/2): 50.0%  ← cara ou coroa
+#   DNA fraco    (0/2): 36.7%  ← pior que acaso
+#
+# Thresholds mínimos (pior cenário):
+#   Odd ≤ 1.55: XG ≥ 1.60 + L15 ≥ 0.50
+#   Odd 1.56-2.00: XG ≥ 1.70 + L15 ≥ 0.55
+#
+# Só aplica quando os dados históricos estão disponíveis no alerta.
+# Se não disponíveis, sistema continua exatamente como antes.
+# =========================================================
+
+def avaliar_dna_tres_pilares(metricas, estrategia):
+    """Avalia os 3 pilares históricos do DNA COUTIPS.
+
+    Retorna (pilares_ok, pilares_total, penalidade, motivo).
+    Se dados não disponíveis, retorna (None, 0, 0, "SEM_DADOS_HISTORICOS").
+    Só aplica para CHAMA_FT e ALFA_FT — FT exclusivo.
+    """
+    if not eh_ft(estrategia):
+        return None, 0, 0, "NAO_FT"
+
+    # Extrai avgXG histórico do favorito
+    avgxg = metricas.get("avgxg", (0.0, 0.0))
+    avgxg_c, avgxg_f = avgxg if isinstance(avgxg, tuple) else (avgxg, avgxg)
+
+    # Se não tem dados históricos, não interfere
+    if avgxg_c == 0.0 and avgxg_f == 0.0:
+        return None, 0, 0, "SEM_DADOS_HISTORICOS"
+
+    # Extrai xgl (L15) histórico
+    xgl = metricas.get("xgl", (0.0, 0.0))
+    xgl_c, xgl_f = xgl if isinstance(xgl, tuple) else (xgl, xgl)
+
+    # Odd do favorito
+    fav, odd_fav = lado_favorito(metricas)
+    if fav == "CASA":
+        avgxg_fav = avgxg_c
+        l15_fav = xgl_c
+    elif fav == "FORA":
+        avgxg_fav = avgxg_f
+        l15_fav = xgl_f
+    else:
+        # Equilibrado: usa o maior
+        avgxg_fav = max(avgxg_c, avgxg_f)
+        l15_fav = max(xgl_c, xgl_f)
+
+    if not odd_fav or odd_fav <= 0:
+        return None, 0, 0, "SEM_ODD"
+
+    # Thresholds por faixa de odd
+    if odd_fav <= 1.55:
+        xg_threshold = 1.60
+        l15_threshold = 0.50
+        odd_bate = True
+    elif odd_fav <= 2.00:
+        xg_threshold = 1.70
+        l15_threshold = 0.55
+        odd_bate = False  # odd fora da faixa ideal — não conta como pilar
+    else:
+        # Odd > 2.00: fora do escopo do DNA
+        return None, 0, 0, "ODD_FORA_ESCOPO"
+
+    xg_bate = avgxg_fav >= xg_threshold
+    l15_bate = l15_fav >= l15_threshold
+
+    pilares_ok = sum([odd_bate, xg_bate, l15_bate])
+    pilares_total = 3 if odd_bate else 2  # odd 1.56-2.00 só tem 2 pilares possíveis
+
+    # Penalidade apenas quando DNA está claramente incompleto
+    # DNA completo ou dados insuficientes: sem penalidade
+    if pilares_ok == pilares_total:
+        penalidade = 0
+        motivo = "DNA_COMPLETO"
+    elif pilares_ok == pilares_total - 1:
+        # Faltou 1 pilar — penalidade leve
+        penalidade = -5
+        motivo = f"DNA_PARCIAL_XG={xg_bate}_L15={l15_bate}"
+    else:
+        # Faltaram 2+ pilares — penalidade maior
+        penalidade = -10
+        motivo = f"DNA_FRACO_XG={xg_bate}_L15={l15_bate}"
+
+    return pilares_ok, pilares_total, penalidade, motivo
+
+
 def teto_contextual_gol(metricas, estrategia, score):
     tempo = metricas["tempo"]
     placar = metricas["placar"]
@@ -3055,6 +3148,14 @@ def score_gol(metricas, estrategia, chave_jogo):
         return int(max(0, min(score, 99))), metricas
 
     score = score_classificacao_institucional(metricas, estrategia)
+
+    # DNA 3 PILARES — aplica penalidade se dados históricos disponíveis e DNA incompleto
+    _pilares_ok, _pilares_total, _pen_dna, _motivo_dna = avaliar_dna_tres_pilares(metricas, estrategia)
+    metricas["dna_pilares_ok"] = _pilares_ok
+    metricas["dna_pilares_motivo"] = _motivo_dna
+    if _pen_dna != 0:
+        score = score + _pen_dna
+        log(f"🧬 DNA {_pilares_ok}/{_pilares_total} | {_motivo_dna} | penalidade={_pen_dna} | {metricas.get('jogo','')}")
 
     # Travas finais mantidas como proteção extra. Elas só reduzem, nunca aprovam.
     score = aplicar_trava_consequencia_ofensiva(metricas, estrategia, score)
@@ -3635,25 +3736,27 @@ async def trabalhador_envio():
                 metricas=alerta["metricas"],
                 link_bet365=alerta["metricas"].get("bet365", ""),
             )
+            # Mensagem nova é texto puro (sem HTML) — não usar parse_mode html
+            parse_mode_envio = None
 
             # ── Destino por liga e tipo ───────────────────────────────────────
             liga = classificar_liga(alerta["metricas"].get("competicao", ""))
 
             if MODO_TESTE:
                 destino = CONFIRMATION_CHANNEL
-                await send_resiliente(destino, mensagem, parse_mode="html")
+                await send_resiliente(destino, mensagem, parse_mode=parse_mode_envio)
                 marcar_enviado(item["chave_envio"])
                 registrar_alerta_csv(alerta)
                 log(f"✅ ENVIADO | {estrategia} | ALFA={score_alfa}% IA={score_ia}% MÉDIA={score_medio}% | {jogo} | {destino}")
             elif eh_conf:
                 if score_medio >= 92:
-                    await send_resiliente(TARGET_CHANNEL, mensagem, parse_mode="html")
-                    await send_resiliente(CONFIRMATION_CHANNEL, mensagem, parse_mode="html")
+                    await send_resiliente(TARGET_CHANNEL, mensagem, parse_mode=parse_mode_envio)
+                    await send_resiliente(CONFIRMATION_CHANNEL, mensagem, parse_mode=parse_mode_envio)
                     marcar_enviado(item["chave_envio"])
                     registrar_alerta_csv(alerta)
                     log(f"✅ ENVIADO | {estrategia} | ALFA={score_alfa}% IA={score_ia}% MÉDIA={score_medio}% | Liga={liga} | {jogo} | AMBOS CANAIS")
                 elif score_medio >= 87:
-                    await send_resiliente(CONFIRMATION_CHANNEL, mensagem, parse_mode="html")
+                    await send_resiliente(CONFIRMATION_CHANNEL, mensagem, parse_mode=parse_mode_envio)
                     marcar_enviado(item["chave_envio"])
                     registrar_alerta_csv(alerta)
                     log(f"✅ ENVIADO | {estrategia} | ALFA={score_alfa}% IA={score_ia}% MÉDIA={score_medio}% | Liga={liga} | {jogo} | {CONFIRMATION_CHANNEL}")
@@ -3677,7 +3780,7 @@ async def trabalhador_envio():
                     log(f"⛔ BLOQUEADO MÉDIA FINAL | Liga={liga} | Média={score_medio}% < {corte_liga}% | {jogo}")
                     await enviar_auditoria(client, estrategia, jogo, score_alfa, score_ia, score_medio, liga, aprovado=False, motivo=f"Média {score_medio}% < corte {corte_liga}%")
                 else:
-                    await send_resiliente(TARGET_CHANNEL, mensagem, parse_mode="html")
+                    await send_resiliente(TARGET_CHANNEL, mensagem, parse_mode=parse_mode_envio)
                     marcar_enviado(item["chave_envio"])
                     registrar_alerta_csv(alerta)
                     log(f"✅ ENVIADO | {estrategia} | ALFA={score_alfa}% IA={score_ia}% MÉDIA={score_medio}% | Liga={liga} | {jogo} | {TARGET_CHANNEL}")
