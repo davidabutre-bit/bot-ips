@@ -18,6 +18,9 @@ import csv
 import httpx
 from datetime import datetime
 
+# ── Assinatura de versão — NÃO usada em nenhuma decisão de score/envio ──────
+VERSAO_COUTIPS = "ALFA_COUTIPS_2026_05_29_DIAGNOSTICO_001"
+
 load_dotenv()
 
 # Configura logging estruturado — nível configurável via env var LOG_LEVEL (padrão INFO)
@@ -259,6 +262,17 @@ def log(msg):
         logging.warning(msg)
     else:
         logging.info(msg)
+
+
+def logar_versao_inicial():
+    """Diagnóstico de versão — apenas log, nenhuma decisão operacional."""
+    try:
+        log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        log(f"🚀 VERSAO_COUTIPS_ATIVA = {VERSAO_COUTIPS}")
+        log("✅ Diagnóstico de versão ativo")
+        log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    except Exception as e:
+        print(f"ERRO AO LOGAR VERSAO: {e}", flush=True)
 
 
 def remover_acentos(texto):
@@ -4314,6 +4328,7 @@ def verificar_instancia_unica():
 async def main():
     global tarefa_envio
 
+    logar_versao_inicial()
     log("🚀 COUTIPS / ALFA ONLINE - SOMENTE GOLS ATIVO")
     log("📊 Estratégias ativas: ALFA_HT | ALFA_HT CONFIRMAÇÃO | ALFA_FT | ALFA_FT CONFIRMAÇÃO | ARCE_HT | CHAMA_FT")
     log(f"⚽ Canal gols: {TARGET_CHANNEL}")
