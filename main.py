@@ -1,302 +1,180 @@
-from telethon import TelegramClient, events
-from telethon.errors import FloodWaitError
-try:
-    from telethon.errors.common import TypeNotFoundError
-except Exception:
-    class TypeNotFoundError(Exception):
-        pass
-from dotenv import load_dotenv
+# -*- coding: utf-8 -*-
+"""
+COUTIPS / ALFA — REBUILD CONTEXTUAL V002 HÍBRIDO
+
+Novo main.py reconstruído para operar com:
+- Telethon / Telegram
+- OpenAI como auditora, não cérebro
+- Motor Python contextual
+- Valor pós-evento
+- Proteção contra IA derrubando cenário institucional forte
+- CSV de auditoria
+- Fila, watchdog, cooldown, locks e anti-duplicidade
+
+Start command: python main.py
+"""
+
+from __future__ import annotations
+
+import asyncio
+import csv
+import html
+import logging
 import os
 import re
 import time
-import asyncio
 import traceback
-import html
 import unicodedata
-import logging
-import csv
-import httpx
+from dataclasses import dataclass, field, asdict
 from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
-# ── Assinatura de versão — NÃO usada em nenhuma decisão de score/envio ──────
-VERSAO_COUTIPS = "ALFA_COUTIPS_2026_05_29_DIAGNOSTICO_001"
+import httpx
+from dotenv import load_dotenv
+from telethon import TelegramClient, events
+from telethon.errors import FloodWaitError
+
+try:
+    from telethon.errors.common import TypeNotFoundError
+except Exception:  # pragma: no cover
+    class TypeNotFoundError(Exception):
+        pass
+
+
+# =========================================================
+# VERSÃO / CONFIGURAÇÃO BASE
+# =========================================================
+
+VERSAO_COUTIPS = "ALFA_COUTIPS_REBUILD_CONTEXTUAL_V003_PRODUCAO"
 
 load_dotenv()
 
-# Configura logging estruturado — nível configurável via env var LOG_LEVEL (padrão INFO)
-_LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
-    level=getattr(logging, _LOG_LEVEL, logging.INFO),
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
     format="%(asctime)s %(levelname)s %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 
-API_ID = os.getenv("API_ID")
-API_HASH = os.getenv("API_HASH")
-# Nomes das variáveis alinhados com o Railway do David
+API_ID_RAW = os.getenv("API_ID", "").strip()
+API_HASH = os.getenv("API_HASH", "").strip()
+if not API_ID_RAW or not API_HASH:
+    raise RuntimeError("API_ID ou API_HASH não configurado no Railway/.env.")
+try:
+    API_ID = int(API_ID_RAW)
+except ValueError as exc:
+    raise RuntimeError("API_ID inválido — precisa ser número inteiro.") from exc
+
+SESSION_NAME = os.getenv("SESSION_NAME", "coutips_v2_session")
+
 TARGET_CHANNEL = (
     os.getenv("TARGET_CHANNEL")
     or os.getenv("TARGET_CHANNEL_GOLS")
     or "@CoutipsIPS"
-)
-CORNERS_CHANNEL = (
-    os.getenv("CORNERS_CHANNEL")
-    or os.getenv("TARGET_CHANNEL_CANTOS")
-    or "@Goat_Bot01"
 )
 CONFIRMATION_CHANNEL = (
     os.getenv("CONFIRMATION_CHANNEL")
     or os.getenv("TARGET_CHANNEL_CONFIRMACAO")
     or "@ALFA_CON"
 )
-
-# Modo teste — True = envia tudo para CONFIRMATION_CHANNEL
-# Mude para false no .env quando quiser voltar ao normal
-MODO_TESTE = os.getenv("MODO_TESTE", "false").lower() == "true"
-
-if not API_ID or not API_HASH:
-    raise RuntimeError("API_ID ou API_HASH não configurado.")
-
-try:
-    API_ID = int(API_ID.strip())
-except ValueError:
-    raise RuntimeError("API_ID inválido — deve ser um número inteiro sem espaços ou caracteres especiais.")
-
-# receive_updates=True garante recebimento de todas as atualizações incluindo mensagens de bots
-client = TelegramClient(
-    "coutips_v2_session",
-    API_ID,
-    API_HASH,
+CORNERS_CHANNEL = (
+    os.getenv("CORNERS_CHANNEL")
+    or os.getenv("TARGET_CHANNEL_CANTOS")
+    or "@Goat_Bot01"
 )
 
-# Estratégia de envio resiliente:
-# Em vez de manter um segundo cliente Telethon (que causa AuthKeyDuplicated ou
-# precisa de novo login SMS no Railway), usamos o cliente principal com retry
-# automático. A função send_resiliente() faz 3 tentativas com reconexão entre
-# elas em caso de TypeNotFoundError (bug da Telethon).
-client_envio = client  # alias — usa o mesmo cliente, mas envio é resiliente
+AUDIT_HT_OK = os.getenv("AUDIT_HT_OK", "")
+AUDIT_HT_NO = os.getenv("AUDIT_HT_NO", "")
+AUDIT_FT_OK = os.getenv("AUDIT_FT_OK", "")
+AUDIT_FT_NO = os.getenv("AUDIT_FT_NO", "")
 
+MODO_TESTE = os.getenv("MODO_TESTE", "false").lower() == "true"
 
-async def send_resiliente(canal, mensagem, parse_mode=None, max_tentativas=3):
-    """Envia mensagem com reconexão automática em caso de TypeNotFoundError.
-    
-    Usa o client_envio dedicado. Se ele não estiver conectado, usa o client
-    principal como fallback. Se der erro do bug da Telethon, desconecta,
-    espera 2s, reconecta e tenta de novo (até 3x). Se mesmo assim falhar,
-    loga mas NÃO derruba o bot.
-    
-    Retorna True se enviou com sucesso, False se falhou todas as tentativas.
-    """
-    global client_envio, client
-    # Escolhe qual cliente usar — prefere o dedicado, mas cai pro principal se preciso
-    def _escolher_cliente():
-        try:
-            if client_envio and client_envio.is_connected():
-                return client_envio, "envio"
-        except Exception:
-            pass
-        return client, "principal"
-    
-    for tentativa in range(1, max_tentativas + 1):
-        cli, qual = _escolher_cliente()
-        try:
-            if parse_mode:
-                await cli.send_message(canal, mensagem, parse_mode=parse_mode)
-            else:
-                await cli.send_message(canal, mensagem)
-            return True
-        except FloodWaitError:
-            raise  # propaga FloodWait pra ser tratado fora
-        except TypeNotFoundError as e:
-            log(f"⚠️ TypeNotFoundError no envio via {qual} (tent. {tentativa}/{max_tentativas}) | canal={canal}")
-            # Tenta reconectar o cliente que falhou
-            try:
-                await cli.disconnect()
-            except Exception:
-                pass
-            await asyncio.sleep(2)
-            try:
-                await cli.connect()
-                log(f"🔄 Cliente {qual} reconectado (tent. {tentativa}/{max_tentativas})")
-            except Exception as rec_err:
-                log(f"⚠️ Falha ao reconectar {qual}: {rec_err}")
-                await asyncio.sleep(3)
-        except Exception as e:
-            # Outros erros: loga mas tenta de novo
-            log(f"⚠️ Erro no envio via {qual} (tent. {tentativa}/{max_tentativas}) | {type(e).__name__}: {e}")
-            await asyncio.sleep(1)
-    log(f"❌ ALERTA NÃO ENVIADO após {max_tentativas} tentativas | canal={canal}")
-    log(f"   mensagem perdida (primeiros 100 chars): {str(mensagem)[:100]}")
-    return False
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_HABILITADO = os.getenv("OPENAI_HABILITADO", "true").lower() == "true"
+OPENAI_TIMEOUT = float(os.getenv("OPENAI_TIMEOUT", "30"))
 
-# =========================================================
-# CONFIGURAÇÃO OFICIAL ATUAL
-# =========================================================
-# Fase atual: SOMENTE GOLS. Cantos desativados.
-# Cortes ajustados após auditoria completa do score:
-# Com o score mais honesto (lado correto, IP contínuo, teto 95),
-# 88 HT equivale ao antigo 93-94 / 83 FT equivale ao antigo 88-89.
-CORTE_GOL = int(os.getenv("CORTE_GOL", "88"))
 CORTE_GOL_HT = int(os.getenv("CORTE_GOL_HT", "88"))
 CORTE_GOL_FT = int(os.getenv("CORTE_GOL_FT", "83"))
-
-# Confirmação: corte menor pois já passou por validação extra de continuidade.
 CORTE_CONFIRMACAO_GOL_HT = int(os.getenv("CORTE_CONFIRMACAO_GOL_HT", "85"))
 CORTE_CONFIRMACAO_GOL_FT = int(os.getenv("CORTE_CONFIRMACAO_GOL_FT", "80"))
-CORTE_CONFIRMACAO_GOL = int(os.getenv("CORTE_CONFIRMACAO_GOL", str(CORTE_CONFIRMACAO_GOL_HT)))
-
-# Janela de observação alinhada com os novos cortes.
-CORTE_OBSERVACAO_JANELA = int(os.getenv("CORTE_OBSERVACAO_JANELA", "82"))
-CORTE_CANTO = 999  # DESATIVADO — cantos não são enviados na fase atual
-
-# Memória longa apenas para bots de confirmação.
-# Não interfere no score dos bots principais.
-MEMORIA_CONFIRMACAO_SEGUNDOS = int(os.getenv("MEMORIA_CONFIRMACAO_SEGUNDOS", "900"))
+CORTE_OBSERVACAO = int(os.getenv("CORTE_OBSERVACAO_JANELA", "82"))
 
 COOLDOWN_SEGUNDOS = int(os.getenv("COOLDOWN_SEGUNDOS", "600"))
 CACHE_MAX_SEGUNDOS = int(os.getenv("CACHE_MAX_SEGUNDOS", "3600"))
+CACHE_MAX_ENTRADAS = int(os.getenv("CACHE_MAX_ENTRADAS", "800"))
 JANELA_DECISAO_SEGUNDOS = float(os.getenv("JANELA_DECISAO_SEGUNDOS", "8"))
 INTERVALO_ENVIO_SEGUNDOS = float(os.getenv("INTERVALO_ENVIO_SEGUNDOS", "5"))
-CONFIRMACAO_DELTA_FORTE = int(os.getenv("CONFIRMACAO_DELTA_FORTE", "8"))
-CONFIRMACAO_SCORE_MINIMO = int(os.getenv("CONFIRMACAO_SCORE_MINIMO", str(CORTE_CONFIRMACAO_GOL_HT)))
 WATCHDOG_SEGUNDOS = int(os.getenv("WATCHDOG_SEGUNDOS", "60"))
+CSV_PATH = Path(os.getenv("CSV_PATH", "auditoria_alfa.csv"))
 
-# ── Canais ────────────────────────────────────────────────────────────────────
-TARGET_CHANNEL = (
-    os.getenv("TARGET_CHANNEL")
-    or os.getenv("TARGET_CHANNEL_GOLS")
-    or "@CoutipsIPS"
-)
-CORNERS_CHANNEL = (
-    os.getenv("CORNERS_CHANNEL")
-    or os.getenv("TARGET_CHANNEL_CANTOS")
-    or "@Goat_Bot01"
-)
-CONFIRMATION_CHANNEL = (
-    os.getenv("CONFIRMATION_CHANNEL")
-    or os.getenv("TARGET_CHANNEL_CONFIRMACAO")
-    or "@ALFA_CON"
-)
-MODO_TESTE = os.getenv("MODO_TESTE", "false").lower() == "true"
+ODD_MINIMA_CLIENTE = os.getenv("ODD_MINIMA_CLIENTE", "1.65")
 
-# ── Canais de Auditoria (opcionais — só ativa se variável existir no Railway) ─
-AUDIT_HT_OK  = os.getenv("AUDIT_HT_OK", "")   # ex: @HT_APROVADO
-AUDIT_HT_NO  = os.getenv("AUDIT_HT_NO", "")   # ex: @HT_REPROVADO
-AUDIT_FT_OK  = os.getenv("AUDIT_FT_OK", "")   # ex: @FT_APROVADO
-AUDIT_FT_NO  = os.getenv("AUDIT_FT_NO", "")   # ex: @FT_REPROVADO
-
-# ── OpenAI ────────────────────────────────────────────────────────────────────
-OPENAI_API_KEY   = os.getenv("OPENAI_API_KEY", "")
-OPENAI_MODEL     = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-OPENAI_HABILITADO = os.getenv("OPENAI_HABILITADO", "true").lower() == "true"
-
-ultimas_leituras_por_jogo = {}
-ultimos_enviados = {}
-pendentes_por_jogo = {}
-tarefas_decisao = {}
-mensagens_processadas = {}
-fila_envio = asyncio.Queue(maxsize=100)  # Limite de segurança: evita acúmulo em flood
-tarefa_envio = None
-
-# Lock por jogo — protege pendentes_por_jogo e tarefas_decisao contra
-# duas mensagens do mesmo jogo chegando simultaneamente (nova + edição).
-_locks_por_jogo: dict = {}
+client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
 
 
 # =========================================================
-# FUNÇÕES BASE
+# ESTADO GLOBAL
 # =========================================================
 
-async def enviar_auditoria(client, estrategia, jogo, score_alfa, score_ia, score_medio, liga, aprovado, motivo=""):
-    """Envia mensagem de auditoria para o canal correspondente.
-    Só executa se a variável de canal estiver configurada no Railway.
-    Usa texto puro sem links para evitar preview cards do Telegram.
-    """
-    try:
-        eh_ht = "HT" in estrategia
-        if aprovado:
-            canal = AUDIT_HT_OK if eh_ht else AUDIT_FT_OK
-            emoji = "✅"
-            status = "APROVADO"
-        else:
-            canal = AUDIT_HT_NO if eh_ht else AUDIT_FT_NO
-            emoji = "❌"
-            status = "REPROVADO"
-
-        if not canal:
-            log(f"⚠️ AUDITORIA SEM CANAL | {status} | {estrategia} | variável de ambiente vazia")
-            return  # Canal não configurado — auditoria desativada
-
-        tipo = "HT" if eh_ht else "FT"
-        ia_str = f" | IA={score_ia}%" if score_ia else ""
-        motivo_str = (f"\n📝 {motivo}" if motivo else "")
-
-        mensagem = (
-            f"{emoji} {status} | {tipo} | {estrategia}\n"
-            f"🏟 {jogo}\n"
-            f"📊 ALFA={score_alfa}%{ia_str} | MÉDIA={score_medio}%\n"
-            f"🏆 Liga: {liga}{motivo_str}"
-        )
-
-        log(f"📤 AUDITORIA TENTANDO ENVIAR | {status} | canal={canal} | {jogo}")
-        await send_resiliente(canal, mensagem)
-        log(f"📋 AUDITORIA ENVIADA | {status} | canal={canal} | {jogo}")
-    except Exception as e:
-        log(f"❌ AUDITORIA ERRO | canal={canal} | tipo={type(e).__name__} | {e}")
-        log(traceback.format_exc())
+fila_envio: asyncio.Queue = asyncio.Queue(maxsize=200)
+tarefa_envio: Optional[asyncio.Task] = None
+ultimos_enviados: Dict[str, Dict[str, Any]] = {}
+mensagens_processadas: Dict[str, float] = {}
+ultimas_leituras_por_jogo: Dict[str, Dict[str, Any]] = {}
+pendentes_por_jogo: Dict[str, List[Dict[str, Any]]] = {}
+tarefas_decisao: Dict[str, asyncio.Task] = {}
+locks_por_jogo: Dict[str, asyncio.Lock] = {}
 
 
-def log(msg):
-    """Log compatível com o padrão anterior e integrado ao módulo logging.
+# =========================================================
+# LOG / UTILITÁRIOS
+# =========================================================
 
-    Mantém o print com timestamp para Railway/stdout e também alimenta o
-    sistema de logging para facilitar filtragem futura por nível.
-    """
+def log(msg: str) -> None:
     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
-    # Escolhe nível pelo prefixo do emoji para facilitar filtragem
     if msg.startswith("❌"):
         logging.error(msg)
-    elif msg.startswith("⚠️") or msg.startswith("🟡"):
-        logging.warning(msg)
-    elif msg.startswith("⛔"):
+    elif msg.startswith(("⚠️", "⛔", "🟡")):
         logging.warning(msg)
     else:
         logging.info(msg)
 
 
-def logar_versao_inicial():
-    """Diagnóstico de versão — apenas log, nenhuma decisão operacional."""
-    try:
-        log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-        log(f"🚀 VERSAO_COUTIPS_ATIVA = {VERSAO_COUTIPS}")
-        log("✅ Diagnóstico de versão ativo")
-        log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    except Exception as e:
-        print(f"ERRO AO LOGAR VERSAO: {e}", flush=True)
+def logar_versao_inicial() -> None:
+    log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    log(f"🚀 VERSAO_COUTIPS_ATIVA = {VERSAO_COUTIPS}")
+    log("✅ Rebuild contextual ativo")
+    log(f"📤 Canal gols: {TARGET_CHANNEL}")
+    log(f"🧪 Canal confirmação: {CONFIRMATION_CHANNEL}")
+    log(f"📊 Cortes: HT={CORTE_GOL_HT}% | FT={CORTE_GOL_FT}% | Conf HT={CORTE_CONFIRMACAO_GOL_HT}% | Conf FT={CORTE_CONFIRMACAO_GOL_FT}%")
+    log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
 
-def remover_acentos(texto):
-    texto = str(texto or "")
-    texto = unicodedata.normalize("NFD", texto)
-    return "".join(ch for ch in texto if unicodedata.category(ch) != "Mn")
+def remover_acentos(texto: Any) -> str:
+    txt = str(texto or "")
+    txt = unicodedata.normalize("NFD", txt)
+    return "".join(ch for ch in txt if unicodedata.category(ch) != "Mn")
 
 
-def normalizar(texto):
+def normalizar(texto: Any) -> str:
     return str(texto or "").replace("*", "").replace("_", "").replace("**", "").strip()
 
 
-def limpar_linha(texto):
+def limpar_linha(texto: Any) -> str:
     return re.sub(r"\s+", " ", str(texto or "")).strip()
 
 
-def normalizar_chave_jogo(jogo):
-    jogo = remover_acentos(str(jogo or "").lower())
-    jogo = re.sub(r"\([^)]*\)", "", jogo)
-    jogo = re.sub(r"[^a-z0-9]+", " ", jogo)
-    return re.sub(r"\s+", " ", jogo).strip()
+def normalizar_chave_jogo(jogo: str) -> str:
+    j = remover_acentos(jogo).lower()
+    j = re.sub(r"\([^)]*\)", "", j)
+    j = re.sub(r"[^a-z0-9]+", " ", j)
+    return re.sub(r"\s+", " ", j).strip()
 
 
-def pegar_numero(pattern, texto, padrao=0):
+def pegar_numero(pattern: str, texto: str, padrao: int = 0) -> int:
     m = re.search(pattern, texto, re.IGNORECASE)
     if not m:
         return padrao
@@ -306,7 +184,7 @@ def pegar_numero(pattern, texto, padrao=0):
         return padrao
 
 
-def pegar_float(pattern, texto, padrao=0.0):
+def pegar_float(pattern: str, texto: str, padrao: float = 0.0) -> float:
     m = re.search(pattern, texto, re.IGNORECASE)
     if not m:
         return padrao
@@ -316,252 +194,323 @@ def pegar_float(pattern, texto, padrao=0.0):
         return padrao
 
 
-def pegar_par(pattern, texto):
+def pegar_par(pattern: str, texto: str) -> Tuple[int, int]:
     m = re.search(pattern, texto, re.IGNORECASE)
     if not m:
-        return 0, 0
+        return (0, 0)
     try:
         return int(m.group(1)), int(m.group(2))
     except Exception:
-        return 0, 0
+        return (0, 0)
 
 
-def pegar_float_par(pattern, texto):
+def pegar_float_par(pattern: str, texto: str) -> Tuple[float, float]:
     m = re.search(pattern, texto, re.IGNORECASE)
     if not m:
-        return 0.0, 0.0
+        return (0.0, 0.0)
     try:
         return float(m.group(1).replace(",", ".")), float(m.group(2).replace(",", "."))
     except Exception:
-        return 0.0, 0.0
+        return (0.0, 0.0)
 
 
-def extrair_link_bet365(texto):
-    m = re.search(r"https?://(?:www\.)?bet365[^\s*]+", texto, re.IGNORECASE)
-    return m.group(0).strip() if m else ""
+def clamp(valor: float, minimo: int = 0, maximo: int = 100) -> int:
+    return max(minimo, min(maximo, int(round(valor))))
 
 
-def extrair_link_betfair(texto):
-    # Gera link Betfair a partir do link Bet365 — substitui domínio
-    m = re.search(r"https?://(?:www\.)?bet365[^\s*]+", texto, re.IGNORECASE)
-    if not m:
-        return ""
-    link365 = m.group(0).strip()
-    # Extrai o nome do time do link Bet365 (ex: K^Antwerp)
-    nome = re.search(r"K\^([^\s/]+)", link365)
-    if nome:
-        return f"https://www.betfair.com/sport/football"
-    return ""
+def now_iso() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def bloquear_categoria_base(texto):
-    t = remover_acentos(texto).upper()
-    for padrao in [
-        r"\bU19\b", r"\bU20\b",
-        r"\bSUB[-\s]?19\b", r"\bSUB[-\s]?20\b",
-        r"\bUNDER[-\s]?19\b", r"\bUNDER[-\s]?20\b",
-    ]:
-        if re.search(padrao, t):
-            return True
-    return False
+def lock_jogo(chave: str) -> asyncio.Lock:
+    if chave not in locks_por_jogo:
+        locks_por_jogo[chave] = asyncio.Lock()
+    return locks_por_jogo[chave]
 
 
-CACHE_MAX_ENTRADAS = 500  # Limite de segurança por cache
-
-
-def _lock_jogo(chave_jogo: str) -> asyncio.Lock:
-    """Retorna (criando se necessário) o lock exclusivo para um jogo.
-    Garante que duas mensagens do mesmo jogo não processem simultaneamente.
-    """
-    if chave_jogo not in _locks_por_jogo:
-        _locks_por_jogo[chave_jogo] = asyncio.Lock()
-    return _locks_por_jogo[chave_jogo]
-
-
-def limpar_memoria_interna():
+def limpar_memoria_interna() -> None:
     agora = time.time()
-
-    for cache in [ultimos_enviados, mensagens_processadas, ultimas_leituras_por_jogo]:
-        for chave in list(cache.keys()):
-            valor = cache.get(chave, {})
-            ts = valor.get("recebido_em", 0) if isinstance(valor, dict) else valor
+    for cache in (ultimos_enviados, mensagens_processadas, ultimas_leituras_por_jogo):
+        for k in list(cache.keys()):
+            valor = cache.get(k)
+            if isinstance(valor, dict):
+                ts = float(valor.get("recebido_em", 0) or 0)
+            else:
+                ts = float(valor or 0)
             if agora - ts > CACHE_MAX_SEGUNDOS:
-                cache.pop(chave, None)
-
-        # Segurança: se ainda estiver grande demais, remove as entradas mais antigas
+                cache.pop(k, None)
         if len(cache) > CACHE_MAX_ENTRADAS:
-            def _ts(v):
-                return v.get("recebido_em", 0) if isinstance(v, dict) else v
-            excesso = len(cache) - CACHE_MAX_ENTRADAS
-            chaves_antigas = sorted(cache.keys(), key=lambda k: _ts(cache[k]))[:excesso]
-            for chave in chaves_antigas:
-                cache.pop(chave, None)
-            log(f"⚠️ Cache truncado: {excesso} entradas removidas por limite de tamanho.")
+            ordenadas = sorted(cache.keys(), key=lambda x: cache[x].get("recebido_em", 0) if isinstance(cache[x], dict) else cache[x])
+            for k in ordenadas[: len(cache) - CACHE_MAX_ENTRADAS]:
+                cache.pop(k, None)
 
-    for chave in list(pendentes_por_jogo.keys()):
-        alertas = pendentes_por_jogo.get(chave, [])
+    for k in list(pendentes_por_jogo.keys()):
+        alertas = pendentes_por_jogo.get(k, [])
         if not alertas:
-            pendentes_por_jogo.pop(chave, None)
-            tarefas_decisao.pop(chave, None)
-            _locks_por_jogo.pop(chave, None)
+            pendentes_por_jogo.pop(k, None)
+            tarefas_decisao.pop(k, None)
+            locks_por_jogo.pop(k, None)
             continue
-
-        mais_recente = max(a.get("recebido_em", 0) for a in alertas)
-        if agora - mais_recente > 120:
-            pendentes_por_jogo.pop(chave, None)
-            tarefas_decisao.pop(chave, None)
-            _locks_por_jogo.pop(chave, None)
+        recente = max(a.get("recebido_em", 0) for a in alertas)
+        if agora - recente > 180:
+            pendentes_por_jogo.pop(k, None)
+            tarefas_decisao.pop(k, None)
+            locks_por_jogo.pop(k, None)
 
 
 # =========================================================
-# PARSER / ESTRATÉGIAS
+# MODELOS DE DADOS
 # =========================================================
 
-def detectar_estrategia(texto):
+@dataclass
+class Metricas:
+    jogo: str = "Jogo não identificado"
+    competicao: str = ""
+    estrategia: str = "ALFA_FT"
+    tempo: int = 0
+    placar: str = "0 x 0"
+    mercado: str = "Over 0.5 Gol"
+    ataques_perigosos: Tuple[int, int] = (0, 0)
+    ataques: Tuple[int, int] = (0, 0)
+    cantos: Tuple[int, int] = (0, 0)
+    posse: Tuple[int, int] = (0, 0)
+    remates_baliza: Tuple[int, int] = (0, 0)
+    remates_lado: Tuple[int, int] = (0, 0)
+    remates_dentro_area: Tuple[int, int] = (0, 0)
+    vermelhos: Tuple[int, int] = (0, 0)
+    ultimos5: Tuple[int, int] = (0, 0)
+    ultimos10: Tuple[int, int] = (0, 0)
+    odds: Tuple[float, float, float] = (0.0, 0.0, 0.0)
+    ultimo_gol: int = 0
+    ultimo_gol_lado: str = "DESCONHECIDO"
+    ultimos_cantos_lados: List[Tuple[int, str]] = field(default_factory=list)
+    chance_golo: Tuple[int, int] = (0, 0)
+    xg: Tuple[float, float] = (0.0, 0.0)
+    xgl: Tuple[float, float] = (0.0, 0.0)
+    xgi: Tuple[float, float] = (0.0, 0.0)
+    avgxg: Tuple[float, float] = (0.0, 0.0)
+    pressao_alfa: Dict[str, float] = field(default_factory=dict)
+    bet365: str = ""
+    cornerpro: str = ""
+    texto_bruto: str = ""
+
+    # campos calculados
+    liga: str = "NEUTRA"
+    lado_favorito: str = "DESCONHECIDO"
+    odd_favorito: float = 0.0
+    lado_zebra: str = "DESCONHECIDO"
+    lado_dominante: str = "EQUILIBRADO"
+    lado_pressionante: str = "DESCONHECIDO"
+    valor_pos_evento_classe: str = "SEM_VALOR_ESPECIAL"
+    valor_pos_evento_motivo: str = ""
+    protecao_ia_ativa: bool = False
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class DecisaoPython:
+    score: int
+    aprovado_pre_ia: bool
+    status: str
+    motivo: str
+    detalhes: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class DecisaoIA:
+    decisao: str
+    confianca_original: int
+    confianca_corrigida: int
+    motivo: str
+    protecao_ativa: bool
+    protecao_motivo: str
+
+
+@dataclass
+class Alerta:
+    texto: str
+    metricas: Metricas
+    chave_jogo: str
+    recebido_em: float
+    origem: str = "telegram"
+
+
+# =========================================================
+# DETECÇÃO / PARSER
+# =========================================================
+
+def detectar_estrategia(texto: str) -> str:
+    """Detecta estratégias antigas e novas da CornerPro.
+
+    Mantém compatibilidade com nomes históricos usados no projeto:
+    ARCE_HT, CHAMA_FT, BOT_HT/FT, HT/FT_PREMIUM, HT/FT_MODERADO,
+    IPS HT/FT, POS-70 e confirmações.
+    """
     t = remover_acentos(texto).upper()
     t = re.sub(r"\s+", " ", t)
 
-    if "BOT_HT CONFIRMACAO" in t:
+    # Confirmações sempre têm prioridade.
+    if "BOT_HT CONFIRMACAO" in t or "HT CONFIRMACAO" in t or "HT CONFIRMAÇÃO" in t or "ALFA HT CONFIRMACAO" in t:
         return "ALFA_HT_CONFIRMACAO"
-    if "BOT_FT CONFIRMACAO" in t:
+    if "BOT_FT CONFIRMACAO" in t or "FT CONFIRMACAO" in t or "FT CONFIRMAÇÃO" in t or "ALFA FT CONFIRMACAO" in t:
         return "ALFA_FT_CONFIRMACAO"
 
+    # Radares canônicos.
     if "ARCE_HT" in t or "ARCE HT" in t or " ARCE " in t:
         return "ARCE_HT"
     if "CHAMA_FT" in t or "CHAMA FT" in t or " CHAMA " in t:
         return "CHAMA_FT"
 
-    if "BOT_HT" in t or "HT_PREMIUM" in t or "HT_PREMIUN" in t or "HT_MODERADO" in t or "IPS HT" in t:
+    # Nomes antigos/variações de HT.
+    if (
+        "BOT_HT" in t or "BOT HT" in t or "HT_PREMIUM" in t or "HT PREMIUM" in t
+        or "HT_PREMIUN" in t or "HT_MODERADO" in t or "HT MODERADO" in t
+        or "IPS HT" in t or "ALFA HT" in t
+        or "PRIMEIRO TEMPO" in t or "1ºT" in t or "1T" in t
+    ):
         return "ALFA_HT"
 
-    if "BOT_FT" in t or "FT_PREMIUM" in t or "FT_PREMIUN" in t or "FT_MODERADO" in t or "IPS FT" in t or "POS-70" in t or "PÓS-70" in t:
+    # Nomes antigos/variações de FT.
+    if (
+        "BOT_FT" in t or "BOT FT" in t or "FT_PREMIUM" in t or "FT PREMIUM" in t
+        or "FT_PREMIUN" in t or "FT_MODERADO" in t or "FT MODERADO" in t
+        or "IPS FT" in t or "POS-70" in t or "POS 70" in t or "PÓS-70" in t
+        or "ALFA FT" in t or "SEGUNDO TEMPO" in t or "2ºT" in t or "2T" in t
+    ):
         return "ALFA_FT"
 
-    if "1ºT" in t or "1T" in t or "INTERVALO" in t:
+    # Fallback: sinais com intervalo costumam ser HT; caso contrário FT.
+    if "INTERVALO" in t and "SEGUNDO TEMPO" not in t:
         return "ALFA_HT"
-
     return "ALFA_FT"
 
-
-def eh_ht(estrategia):
-    return estrategia in ["ALFA_HT", "ALFA_HT_CONFIRMACAO", "ARCE_HT"]
-
-
-def eh_ft(estrategia):
-    return estrategia in ["ALFA_FT", "ALFA_FT_CONFIRMACAO", "CHAMA_FT"]
+def eh_ht(estrategia: str) -> bool:
+    return estrategia in {"ALFA_HT", "ALFA_HT_CONFIRMACAO", "ARCE_HT"}
 
 
-def eh_confirmacao(estrategia):
-    return estrategia in ["ALFA_HT_CONFIRMACAO", "ALFA_FT_CONFIRMACAO"]
+def eh_ft(estrategia: str) -> bool:
+    return estrategia in {"ALFA_FT", "ALFA_FT_CONFIRMACAO", "CHAMA_FT"}
 
 
-def mensagem_valida(texto):
+def eh_confirmacao(estrategia: str) -> bool:
+    return estrategia in {"ALFA_HT_CONFIRMACAO", "ALFA_FT_CONFIRMACAO"}
+
+
+def mensagem_valida(texto: str) -> bool:
     t = remover_acentos(texto).upper()
     return "ALERTA ESTRATEGIA" in t and "JOGO:" in t and "TEMPO:" in t
 
 
-def extrair_jogo(texto):
-    texto = normalizar(texto)
-    m = re.search(r"Jogo:\s*(.+)", texto, re.IGNORECASE)
+def extrair_jogo(texto: str) -> str:
+    t = normalizar(texto)
+    m = re.search(r"Jogo:\s*(.+)", t, re.IGNORECASE)
     if m:
         return limpar_linha(m.group(1).split("\n")[0])
-
-    for linha in texto.splitlines():
+    for linha in t.splitlines():
         if " x " in linha.lower() or " vs " in linha.lower():
             return limpar_linha(linha)
-
     return "Jogo não identificado"
 
 
-def extrair_competicao(texto):
-    m = re.search(r"Competição:\s*(.+)", texto, re.IGNORECASE)
+def extrair_competicao(texto: str) -> str:
+    m = re.search(r"Competição:\s*(.+)", normalizar(texto), re.IGNORECASE)
     return limpar_linha(m.group(1).split("\n")[0]) if m else ""
 
 
-def extrair_tempo(texto):
+def extrair_tempo(texto: str) -> int:
     return pegar_numero(r"Tempo:\s*(\d+)", texto, 0)
 
 
-def extrair_resultado(texto):
+def extrair_resultado(texto: str) -> str:
     m = re.search(r"Resultado:\s*([0-9]+)\s*x\s*([0-9]+)", texto, re.IGNORECASE)
-    return f"{m.group(1)} x {m.group(2)}" if m else "Placar não identificado"
+    if m:
+        return f"{m.group(1)} x {m.group(2)}"
+    return "0 x 0"
 
 
-def extrair_gols_placar(placar):
+def extrair_gols_placar(placar: str) -> Tuple[Optional[int], Optional[int]]:
     m = re.search(r"([0-9]+)\s*x\s*([0-9]+)", str(placar or ""))
-    return (int(m.group(1)), int(m.group(2))) if m else (None, None)
+    if not m:
+        return None, None
+    return int(m.group(1)), int(m.group(2))
 
 
-def mercado_dinamico(placar):
+def mercado_dinamico(placar: str) -> str:
     gc, gf = extrair_gols_placar(placar)
-    if gc is None:
+    if gc is None or gf is None:
         return "Over 0.5 Gol"
     return f"Over {gc + gf + 0.5:.1f} Gol"
 
 
-def mercado_cantos_dinamico(metricas):
-    return "Over Cantos"
-
-
-def extrair_odds(texto):
-    m = re.search(r"Odds.*?:\s*([0-9.]+)\s*/\s*([0-9.]+)\s*/\s*([0-9.]+)", texto, re.IGNORECASE)
+def extrair_odds(texto: str) -> Tuple[float, float, float]:
+    m = re.search(r"Odds.*?:\s*([0-9.,]+)\s*/\s*([0-9.,]+)\s*/\s*([0-9.,]+)", texto, re.IGNORECASE)
     if not m:
-        return 0, 0, 0
+        return (0.0, 0.0, 0.0)
     try:
-        return float(m.group(1)), float(m.group(2)), float(m.group(3))
+        return tuple(float(x.replace(",", ".")) for x in m.groups())  # type: ignore
     except Exception:
-        return 0, 0, 0
+        return (0.0, 0.0, 0.0)
 
 
-def extrair_ultimo_gol_lado(texto):
+def extrair_ultimo_gol_lado(texto: str) -> str:
     t = remover_acentos(texto).upper()
-    for p in [
+    for padrao in (
         r"ULTIMO\s+GOLO:\s*\d+\s*['’]?\s*(CASA|FORA|HOME|AWAY)",
         r"ULTIMO\s+GOL:\s*\d+\s*['’]?\s*(CASA|FORA|HOME|AWAY)",
-    ]:
-        m = re.search(p, t, re.IGNORECASE)
+    ):
+        m = re.search(padrao, t)
         if m:
-            return "CASA" if m.group(1).upper() in ["CASA", "HOME"] else "FORA"
+            return "CASA" if m.group(1) in {"CASA", "HOME"} else "FORA"
     return "DESCONHECIDO"
 
 
-def extrair_ultimos_cantos_lados(texto):
+def extrair_ultimo_gol_minuto(texto: str) -> int:
+    t = remover_acentos(texto)
+    return (
+        pegar_numero(r"Ultimo\s+golo:\s*(\d+)", t, 0)
+        or pegar_numero(r"Ultimo\s+gol:\s*(\d+)", t, 0)
+        or pegar_numero(r"Último\s+golo:\s*(\d+)", texto, 0)
+        or pegar_numero(r"Último\s+gol:\s*(\d+)", texto, 0)
+    )
+
+
+def extrair_ultimos_cantos_lados(texto: str) -> List[Tuple[int, str]]:
     t = remover_acentos(texto).upper()
-    m = re.search(r"ULTIMOS\s+CANTOS:\s*(.+)", t, re.IGNORECASE)
+    m = re.search(r"ULTIMOS\s+CANTOS:\s*(.+)", t)
     if not m:
         return []
-
     linha = m.group(1).split("\n")[0]
-    eventos = []
+    eventos: List[Tuple[int, str]] = []
     for minuto, lado in re.findall(r"(\d+)\s*['’]?\s*(CASA|FORA|HOME|AWAY)", linha):
-        eventos.append((int(minuto), "CASA" if lado in ["CASA", "HOME"] else "FORA"))
+        eventos.append((int(minuto), "CASA" if lado in {"CASA", "HOME"} else "FORA"))
     return eventos
 
 
-def extrair_pressao_alfa(texto):
+def extrair_links(texto: str) -> Tuple[str, str]:
+    bet365 = ""
+    corner = ""
+    for link in re.findall(r"https?://[^\s*]+", texto, re.IGNORECASE):
+        if "bet365" in link.lower() and not bet365:
+            bet365 = link.strip()
+        if "cornerprobet" in link.lower() and "/analysis/" in link.lower() and not corner:
+            corner = link.strip()
+    return bet365, corner
+
+
+def extrair_pressao_alfa(texto: str) -> Dict[str, float]:
     base = normalizar(texto)
     sem = remover_acentos(base)
     m = re.search(r"Índice de Pressão:(.+)", base, re.IGNORECASE | re.DOTALL)
     if not m:
         m = re.search(r"Indice de Pressao:(.+)", sem, re.IGNORECASE | re.DOTALL)
-
     if not m:
-        return {
-            "ip_pico_casa": 0.0,
-            "ip_pico_fora": 0.0,
-            "ip_consec_10_casa": 0,
-            "ip_consec_10_fora": 0,
-            "ip_consec_15_casa": 0,
-            "ip_consec_15_fora": 0,
-            "ip_consec_18_casa": 0,
-            "ip_consec_18_fora": 0,
-            "ip_consec_22_casa": 0,
-            "ip_consec_22_fora": 0,
-        }
+        return _pressao_vazia()
 
     bloco = m.group(1).split("https://")[0]
-    casa_vals, fora_vals = [], []
-
+    casa_vals: List[float] = []
+    fora_vals: List[float] = []
     for seg in bloco.split(";"):
         nums = re.findall(r"\d+(?:[.,]\d+)?", seg)
         if len(nums) == 2:
@@ -569,9 +518,9 @@ def extrair_pressao_alfa(texto):
                 casa_vals.append(float(nums[0].replace(",", ".")))
                 fora_vals.append(float(nums[1].replace(",", ".")))
             except Exception:
-                pass
+                continue
 
-    def consec(vals, limite):
+    def consec(vals: List[float], limite: float) -> int:
         atual = maior = 0
         for v in vals:
             if v >= limite:
@@ -581,9 +530,14 @@ def extrair_pressao_alfa(texto):
                 atual = 0
         return maior
 
+    def media(vals: List[float]) -> float:
+        return sum(vals) / len(vals) if vals else 0.0
+
     return {
         "ip_pico_casa": max(casa_vals) if casa_vals else 0.0,
         "ip_pico_fora": max(fora_vals) if fora_vals else 0.0,
+        "ip_media_casa": media(casa_vals),
+        "ip_media_fora": media(fora_vals),
         "ip_consec_10_casa": consec(casa_vals, 10),
         "ip_consec_10_fora": consec(fora_vals, 10),
         "ip_consec_15_casa": consec(casa_vals, 15),
@@ -595,21 +549,26 @@ def extrair_pressao_alfa(texto):
     }
 
 
-def extrair_metricas(texto):
+def _pressao_vazia() -> Dict[str, float]:
+    return {
+        "ip_pico_casa": 0.0, "ip_pico_fora": 0.0,
+        "ip_media_casa": 0.0, "ip_media_fora": 0.0,
+        "ip_consec_10_casa": 0, "ip_consec_10_fora": 0,
+        "ip_consec_15_casa": 0, "ip_consec_15_fora": 0,
+        "ip_consec_18_casa": 0, "ip_consec_18_fora": 0,
+        "ip_consec_22_casa": 0, "ip_consec_22_fora": 0,
+    }
+
+
+def extrair_metricas(texto: str) -> Metricas:
     tl = normalizar(texto)
-    tempo = extrair_tempo(tl)
+    estrategia = detectar_estrategia(tl)
     placar = extrair_resultado(tl)
+    bet365, corner = extrair_links(tl)
 
     rda = pegar_par(r"R\.\s*Dentro\s*Área:Casa=(\d+)\s*/\s*Fora=(\d+)", tl)
     if rda == (0, 0):
-        rda = pegar_par(r"R\.\s*Dentro\s*Area:Casa=(\d+)\s*/\s*Fora=(\d+)", tl)
-
-    ultimo_gol = (
-        pegar_numero(r"Último golo:\s*(\d+)", tl, 0)
-        or pegar_numero(r"Ultimo golo:\s*(\d+)", tl, 0)
-        or pegar_numero(r"Último gol:\s*(\d+)", tl, 0)
-        or pegar_numero(r"Ultimo gol:\s*(\d+)", tl, 0)
-    )
+        rda = pegar_par(r"R\.\s*Dentro\s*Area:Casa=(\d+)\s*/\s*Fora=(\d+)", remover_acentos(tl))
 
     xg = pegar_float_par(r"xg:Casa=([0-9.,]+)\s*/\s*Fora=([0-9.,]+)", tl)
     if xg == (0.0, 0.0):
@@ -626,300 +585,153 @@ def extrair_metricas(texto):
         total = pegar_float(r"\bxgi:\s*([0-9.,]+)", tl, 0.0)
         xgi = (total / 2, total / 2)
 
-    # avgXGaFavor — XG histórico médio por lado (só disponível em alertas recentes)
-    avgxg = pegar_float_par(r"avgXGaFavor:Casa=([0-9.,]+)\s*/\s*Fora=([0-9.,]+)", tl)
-
-    return {
-        "tempo": tempo,
-        "placar": placar,
-        "jogo": extrair_jogo(tl),
-        "mercado": mercado_dinamico(placar),
-        "competicao": extrair_competicao(tl),
-        "ataques_perigosos": pegar_par(r"Ataques Perigosos:\s*(\d+)\s*-\s*(\d+)", tl),
-        "ataques": pegar_par(r"Ataques:\s*(\d+)\s*-\s*(\d+)", tl),
-        "cantos": pegar_par(r"Cantos:\s*(\d+)\s*-\s*(\d+)", tl),
-        "ultimos_cantos_lados": extrair_ultimos_cantos_lados(tl),
-        "posse": pegar_par(r"Posse bola:\s*(\d+)\s*-\s*(\d+)", tl),
-        "remates_baliza": pegar_par(r"Remates Baliza:\s*(\d+)\s*-\s*(\d+)", tl),
-        "remates_lado": pegar_par(r"Remates lado:\s*(\d+)\s*-\s*(\d+)", tl),
-        "remates_dentro_area": rda,
-        "vermelhos": pegar_par(r"Cartões vermelhos:\s*(\d+)\s*-\s*(\d+)", tl),
-        "odds": extrair_odds(tl),
-        "ultimos5": pegar_par(r"(?:Ultimos|Últimos)\s*5['’]?:\s*(\d+)\s*\([^)]*\)\s*-\s*(\d+)", tl),
-        "ultimos10": pegar_par(r"(?:Ultimos|Últimos)\s*10['’]?:\s*(\d+)\s*\([^)]*\)\s*-\s*(\d+)", tl),
-        "ultimo_gol": ultimo_gol,
-        "ultimo_gol_lado": extrair_ultimo_gol_lado(tl),
-        "chance_golo": pegar_par(r"Chance de Golo:Casa=(\d+)\s*/\s*Fora=(\d+)", tl),
-        "heatmap": pegar_par(r"heatmapFull:Casa=(\d+)\s*/\s*Fora=(\d+)", tl),
-        "heatmap_middle": pegar_par(r"heatmapMiddle:Casa=(\d+)\s*/\s*Fora=(\d+)", tl),
-        "xg": xg,
-        "xgl": xgl,
-        "xgi": xgi,
-        "avgxg": avgxg,
-        "pressao_alfa": extrair_pressao_alfa(tl),
-        "bet365": extrair_link_bet365(tl),
-    }
+    m = Metricas(
+        jogo=extrair_jogo(tl),
+        competicao=extrair_competicao(tl),
+        estrategia=estrategia,
+        tempo=extrair_tempo(tl),
+        placar=placar,
+        mercado=mercado_dinamico(placar),
+        ataques_perigosos=pegar_par(r"Ataques Perigosos:\s*(\d+)\s*-\s*(\d+)", tl),
+        ataques=pegar_par(r"Ataques:\s*(\d+)\s*-\s*(\d+)", tl),
+        cantos=pegar_par(r"Cantos:\s*(\d+)\s*-\s*(\d+)", tl),
+        posse=pegar_par(r"Posse bola:\s*(\d+)\s*-\s*(\d+)", tl),
+        remates_baliza=pegar_par(r"Remates Baliza:\s*(\d+)\s*-\s*(\d+)", tl),
+        remates_lado=pegar_par(r"Remates lado:\s*(\d+)\s*-\s*(\d+)", tl),
+        remates_dentro_area=rda,
+        vermelhos=pegar_par(r"Cartões vermelhos:\s*(\d+)\s*-\s*(\d+)", tl),
+        ultimos5=pegar_par(r"(?:Ultimos|Últimos)\s*5['’]?:\s*(-?\d+)\s*\([^)]*\)\s*-\s*(-?\d+)", tl),
+        ultimos10=pegar_par(r"(?:Ultimos|Últimos)\s*10['’]?:\s*(-?\d+)\s*\([^)]*\)\s*-\s*(-?\d+)", tl),
+        odds=extrair_odds(tl),
+        ultimo_gol=extrair_ultimo_gol_minuto(tl),
+        ultimo_gol_lado=extrair_ultimo_gol_lado(tl),
+        ultimos_cantos_lados=extrair_ultimos_cantos_lados(tl),
+        chance_golo=pegar_par(r"Chance de Golo:Casa=(\d+)\s*/\s*Fora=(\d+)", tl),
+        xg=xg,
+        xgl=xgl,
+        xgi=xgi,
+        avgxg=pegar_float_par(r"avgXGaFavor:Casa=([0-9.,]+)\s*/\s*Fora=([0-9.,]+)", tl),
+        pressao_alfa=extrair_pressao_alfa(tl),
+        bet365=bet365,
+        cornerpro=corner,
+        texto_bruto=texto,
+    )
+    preencher_contexto_calculado(m)
+    return m
 
 
 # =========================================================
-# LIGAS / CONTEXTO
-# Classificação baseada em taxa de conversão de gol (experiência real),
-# não em prestígio do campeonato.
+# LIGAS
 # =========================================================
 
-# PREMIUM — convertem bem, bônus no score
-_LIGAS_PREMIUM = {
-    # Inglaterra
-    "england premier league", "england championship", "england league one",
-    "england league two", "england national league",
-    # Alemanha — todas as divisões convertem
-    "germany bundesliga", "germany 2. bundesliga", "germany 3. liga",
-    "germany regionalliga",
-    # França
-    "france ligue 1", "france ligue 2",
-    # Competições europeias
-    "champions league", "europa league", "conference league",
-    # EUA — MLS e divisões convertem bem
-    "usa major league soccer", "usa mls", "usa usl championship",
-    "usa usl league", "usa nwsl", "nwsl",
-    # Austrália — todas as divisões convertem
-    "australia",
-    # Espanha séries B e abaixo
-    "spain segunda", "spain primera rfef", "spain segunda rfef",
-    "spain tercera",
-    # Outros que convertem
-    "netherlands eredivisie", "belgium pro league",
-    "portugal liga", "switzerland super league",
-    # ── FUTEBOL FEMININO ─────────────────────────────────────────────────────
-    # Futebol feminino fora das ligas sul-americanas fraca converte muito bem.
-    # A casa raramente oferece Over 0.5 — começa direto em Over 2.5.
-    "womens", "women", "feminine", "feminin", "femenino", "feminino",
-    "frauen", "dames", "naiset", "kvinder", "damas",
-    "women championship", "women league", "women super league",
-    "women division", "women cup",
+LIGAS_PREMIUM = {
+    "england premier", "england championship", "germany", "france ligue",
+    "usa", "mls", "australia", "netherlands", "belgium", "switzerland",
+    "champions league", "europa league", "conference league", "women", "womens",
+    "feminino", "femenino", "feminine", "frauen", "naiset", "kvinder", "w "
+}
+LIGAS_MODERADAS = {
+    "brazil", "brasil", "spain", "italy serie b", "turkey", "saudi", "uae",
+    "qatar", "japan", "china", "norway", "sweden", "denmark", "finland",
+    "poland", "czech", "scotland", "greece", "korea", "faroe", "iceland",
+    "latvia", "lithuania", "estonia", "austria", "switzerland 2", "georgia",
+}
+LIGAS_UNDER = {
+    "argentina primera", "colombia primera", "peru liga", "chile primera",
+    "uruguay primera", "ecuador", "bolivia", "paraguay", "venezuela", "italy serie a",
+    "nigeria", "ghana", "kenya", "tanzania", "egypt", "morocco", "algeria",
+}
+LIGAS_PERIGOSAS = {
+    "mongolia", "myanmar", "cambodia", "laos", "bhutan", "san marino",
+    "andorra", "gibraltar", "kosovo", "moldova", "armenia", "azerbaijan",
 }
 
-# Identificador de futebol feminino para bônus extra no liga_score
-def _eh_futebol_feminino(competicao: str) -> bool:
-    c = remover_acentos(competicao).lower()
-    return any(x in c for x in [
-        "women", "womens", "feminine", "feminin", "femenino", "feminino",
-        "frauen", "dames", "naiset", "kvinder", " w ", "- w", "w -",
-        "ladies", "girls",
-    ])
-
-# MODERADA — convertem razoavelmente, exigir números sólidos
-_LIGAS_MODERADAS = {
-    # Brasil — série A e B, buscar números ótimos
-    "brazil serie a", "brazil brasileiro", "brazil serie b",
-    "brazil copa do brasil",
-    # Espanha série A — depende do jogo, não é consistente
-    "spain la liga",
-    # Itália — série B e C convertem mais que série A
-    "italy serie b", "italy serie c",
-    # Turquia — converte mas com ressalva
-    "turkey super lig", "turkey 1. lig",
-    # Japão e China — alguns times
-    "japan j1 league", "japan j2 league", "china super league",
-    # Ligas árabes — convertem razoavelmente
-    "saudi arabia", "uae", "qatar", "kuwait", "bahrain",
-    # Outros moderados
-    "norway", "sweden", "denmark", "finland",
-    "poland", "czech republic", "scotland",
-    "greece",  # movido de UNDER após auditoria 21/05/2026 — 2 greens perdidos
-    "korea republic", "k-league",
-    "faroe islands", "iceland", "northern ireland",
-    # Sul-americanos série B e abaixo — convertem bem nesse nível
-    "argentina primera b", "argentina primera c", "argentina primera d",
-    "colombia segunda", "peru segunda", "chile primera b",
-    "uruguay segunda", "venezuela segunda",
-}
-
-# UNDER — convertem pouco, exigir números extremos para entrar
-_LIGAS_UNDER = {
-    # Sul-americanos série A — estruturalmente truncados
-    "argentina primera division", "argentina liga profesional",
-    "colombia primera a", "peru liga 1",
-    "chile primera division", "chile primera a",
-    "uruguay primera division",
-    "ecuador liga pro", "bolivia",
-    "paraguay", "paraguay division intermedia", "paraguay primera division",
-    "netherlands eerste divisie", "brazil serie d", "usa mls next pro",
-    "australia victoria npl women", "asia afc u20 women",
-    "asia afc u20 women's asian cup",
-    "venezuela primera",
-    # Itália série A — não converte bem exceto com times grandes
-    "italy serie a",
-    # Ligas africanas — convertem pouco
-    "africa", "nigeria", "ghana", "kenya", "tanzania",
-    "egypt", "morocco", "algeria", "tunisia", "senegal",
-    "south africa", "cameroon", "ivory coast",
-    # Outros under
-    "romania", "bulgaria", "serbia",
-    "croatia", "slovakia", "hungary",
-}
-
-# PERIGOSA — evitar, dados poucos confiáveis ou conversão muito baixa
-_LIGAS_PERIGOSAS = {
-    "mongolia", "new zealand regional", "jordan regional",
-    "myanmar", "cambodia", "laos", "bhutan",
-    "san marino", "andorra", "gibraltar",
-    "kosovo", "moldova", "armenia", "azerbaijan",
-}
-
-
-def classificar_liga(competicao):
-    c = remover_acentos(competicao).lower()
-
-    # Futebol feminino fora das ligas sul-americanas fracas = PREMIUM
-    # Detectado antes de qualquer outra classificação
-    if _eh_futebol_feminino(competicao):
-        # Exceção: ligas femininas sul-americanas fracas seguem a regra UNDER
-        sul_am_fracas = ["argentina", "colombia", "peru", "bolivia",
-                         "paraguay", "ecuador", "venezuela"]
-        if any(x in c for x in sul_am_fracas):
-            return "UNDER"
-        return "PREMIUM"
-
-    # Ordem: perigosa → under → moderada → premium → neutra
-    if any(x in c for x in _LIGAS_PERIGOSAS):
-        return "PERIGOSA"
-    if any(x in c for x in _LIGAS_UNDER):
-        return "UNDER"
-    if any(x in c for x in _LIGAS_MODERADAS):
-        return "MODERADA"
-    if any(x in c for x in _LIGAS_PREMIUM):
-        return "PREMIUM"
-
-    return "NEUTRA"
 
 
 # =========================================================
 # TIMES DE ELITE DE TRANSIÇÃO
-# Quando perdendo ou empatando, esses times convertem
-# mesmo sem dominar — qualidade técnica para matar no contra-ataque.
 # =========================================================
-
+# Lista herdada da base central. Esses times, quando empatando ou perdendo,
+# costumam manter valor ofensivo mesmo quando um ou outro número não está perfeito.
 _TIMES_ELITE_TRANSICAO = {
-    # Espanha
     "atletico madrid", "atletico de madrid", "real madrid", "barcelona",
-    # França
-    "paris saint-germain", "psg",
-    # Alemanha
-    "bayern munich", "bayer leverkusen", "borussia dortmund",
-    "rb leipzig", "eintracht frankfurt",
-    # Inglaterra
+    "paris saint-germain", "psg", "bayern munich", "bayer leverkusen",
+    "borussia dortmund", "rb leipzig", "eintracht frankfurt",
     "manchester city", "liverpool", "arsenal", "chelsea",
-    # Itália
     "inter milan", "inter", "napoli", "juventus",
-    # Brasil masculino
-    "flamengo", "palmeiras",
-    # Brasil feminino
-    "corinthians",
+    "flamengo", "palmeiras", "corinthians",
 }
 
+def time_elite_transicao_lado(m: Metricas) -> str:
+    jogo = remover_acentos(m.jogo).lower()
+    partes = re.split(r"\s+x\s+|\s+vs\s+", jogo, maxsplit=1)
+    if len(partes) < 2:
+        return "DESCONHECIDO"
+    casa, fora = partes[0], partes[1]
+    for nome in _TIMES_ELITE_TRANSICAO:
+        if nome in casa:
+            return "CASA"
+        if nome in fora:
+            return "FORA"
+    return "DESCONHECIDO"
 
-def _bonus_time_elite(metricas) -> int:
-    """Bônus para times de elite de transição quando perdendo ou empatando.
+def bonus_time_elite_transicao(m: Metricas) -> Tuple[int, str]:
+    lado_elite = time_elite_transicao_lado(m)
+    if lado_elite not in {"CASA", "FORA"}:
+        return 0, "SEM_TIME_ELITE"
+    vencedor = lado_vencendo(m)
+    # Aplica apenas se o time elite está empatando ou perdendo.
+    if vencedor == "EMPATE" or vencedor != lado_elite:
+        return 6, f"TIME_ELITE_TRANSICAO_{lado_elite}"
+    return 0, "TIME_ELITE_JA_VENCENDO"
 
-    Esses times convertem mesmo sem dominar — têm qualidade para matar
-    no contra-ataque. O bônus só se aplica quando o time elite está
-    perdendo ou empatando (não quando está vencendo — aí o jogo esfria).
-    """
-    jogo = remover_acentos(str(metricas.get("jogo", "") or "")).lower()
+def classificar_liga(competicao: str) -> str:
+    c = remover_acentos(competicao).lower()
+    if any(x in c for x in LIGAS_PERIGOSAS):
+        return "PERIGOSA"
+    if any(x in c for x in LIGAS_UNDER):
+        return "UNDER"
+    if any(x in c for x in LIGAS_PREMIUM):
+        return "PREMIUM"
+    if any(x in c for x in LIGAS_MODERADAS):
+        return "MODERADA"
+    return "NEUTRA"
 
-    # Identifica se algum time elite está no jogo
-    time_elite_encontrado = None
-    for time in _TIMES_ELITE_TRANSICAO:
-        if time in jogo:
-            time_elite_encontrado = time
-            break
 
-    if not time_elite_encontrado:
+def liga_ajuste(liga: str) -> int:
+    return {"PREMIUM": 5, "MODERADA": 1, "NEUTRA": 0, "UNDER": -8, "PERIGOSA": -12}.get(liga, 0)
+
+
+# =========================================================
+# LADOS / CONTEXTO
+# =========================================================
+
+def valor_lado(m: Metricas, campo: str, lado: str) -> float:
+    val = getattr(m, campo, (0, 0))
+    if not isinstance(val, tuple) or len(val) < 2:
         return 0
-
-    # Verifica se o time elite está perdendo ou empatando
-    gc, gf = 0, 0
-    placar = metricas.get("placar", "")
-    import re as _re
-    m = _re.search(r"(\d+)\s*x\s*(\d+)", str(placar))
-    if m:
-        gc, gf = int(m.group(1)), int(m.group(2))
-
-    # Descobre se o time elite é casa ou fora pelo nome no jogo
-    # Formato típico: "Time Casa x Time Fora"
-    partes = jogo.split(" x ")
-    if len(partes) >= 2:
-        lado_casa = partes[0].strip()
-        # Time elite é casa?
-        elite_e_casa = any(t in lado_casa for t in _TIMES_ELITE_TRANSICAO)
-        if elite_e_casa:
-            # Elite é CASA — aplica bônus se perdendo ou empatando
-            if gc <= gf:
-                return 6
-        else:
-            # Elite é FORA — aplica bônus se perdendo ou empatando
-            if gf <= gc:
-                return 6
-
-    return 0
+    return float(val[0] if lado == "CASA" else val[1] if lado == "FORA" else 0)
 
 
-def liga_score(metricas, mercado="gol"):
-    liga = metricas.get("_cache_liga") or classificar_liga(metricas.get("competicao", ""))
-    comp = remover_acentos(metricas.get("competicao", "")).lower()
-    feminino = _eh_futebol_feminino(metricas.get("competicao", ""))
-
-    if mercado == "canto":
-        if liga == "PREMIUM":   return 3
-        if liga == "MODERADA":  return 1
-        if liga == "PERIGOSA":  return -3
+def soma_lados(m: Metricas, campo: str) -> float:
+    val = getattr(m, campo, (0, 0))
+    if not isinstance(val, tuple) or len(val) < 2:
         return 0
-
-    # ── Score de gol por liga ─────────────────────────────────────────────────
-    if liga == "PREMIUM":
-        base = 5
-        if feminino:
-            base = 9
-        return base
-
-    if liga == "MODERADA":
-        if "brazil" in comp or "brasil" in comp:
-            return 0
-        if "italy serie a" in comp or "spain la liga" in comp:
-            return -2
-        return 1
-
-    if liga == "UNDER":
-        return -8
-
-    if liga == "PERIGOSA":
-        return -12
-
-    return 0
+    return float(val[0] + val[1])
 
 
-def lado_favorito(metricas):
-    # BUG-01 corrigido: usa .get() para evitar KeyError em mensagens incompletas
-    odds = metricas.get("odds", (0, 0, 0))
-    if not isinstance(odds, (tuple, list)) or len(odds) < 3:
-        return "DESCONHECIDO", 0
-    oc, _, of = odds
-
+def lado_favorito(m: Metricas) -> Tuple[str, float]:
+    oc, _, of = m.odds
     if not oc or not of:
-        return "DESCONHECIDO", 0
-
+        return "DESCONHECIDO", 0.0
     if oc < of:
         return "CASA", oc
-
     if of < oc:
         return "FORA", of
-
     return "EQUILIBRADO", oc
 
 
-def lado_zebra(metricas):
-    fav, _ = lado_favorito(metricas)
+def lado_zebra(fav: str) -> str:
     if fav == "CASA":
         return "FORA"
     if fav == "FORA":
@@ -927,153 +739,9 @@ def lado_zebra(metricas):
     return "DESCONHECIDO"
 
 
-def lado_dominante(metricas):
-    # BUG-02 corrigido: todos os campos acessados com .get() para evitar KeyError
-    apc, apf = metricas.get("ataques_perigosos", (0, 0))
-    u5c, u5f = metricas.get("ultimos5", (0, 0))
-    u10c, u10f = metricas.get("ultimos10", (0, 0))
-    rbc, rbf = metricas.get("remates_baliza", (0, 0))
-    rlc, rlf = metricas.get("remates_lado", (0, 0))
-    rdac, rdaf = metricas.get("remates_dentro_area", (0, 0))
-    cc, cf = metricas["cantos"]
-    hc, hf = metricas.get("heatmap", (0, 0))
-    ch_c, ch_f = metricas.get("chance_golo", (0, 0))
-    xgc, xgf = metricas.get("xg", (0.0, 0.0))
-    p = metricas.get("pressao_alfa", {})
-
-    casa = (
-        apc * 1.2 + u5c * 2 + u10c * 1.4 + rbc * 3.8
-        + rdac * 2.2 + rlc * 1.2 + cc * 0.7 + ch_c * 1.1
-        + xgc * 8 + hc * 0.1
-        + p.get("ip_pico_casa", 0) * 0.45
-        + p.get("ip_consec_18_casa", 0) * 2
-        + p.get("ip_consec_22_casa", 0) * 3
-    )
-
-    fora = (
-        apf * 1.2 + u5f * 2 + u10f * 1.4 + rbf * 3.8
-        + rdaf * 2.2 + rlf * 1.2 + cf * 0.7 + ch_f * 1.1
-        + xgf * 8 + hf * 0.1
-        + p.get("ip_pico_fora", 0) * 0.45
-        + p.get("ip_consec_18_fora", 0) * 2
-        + p.get("ip_consec_22_fora", 0) * 3
-    )
-
-    dif = casa - fora
-
-    if dif >= 8:
-        return "CASA", dif
-    if dif <= -8:
-        return "FORA", abs(dif)
-
-    return "EQUILIBRADO", abs(dif)
-
-
-def lado_sofrendo_pressao(metricas):
-    dom, _ = lado_dominante(metricas)
-    if dom == "CASA":
-        return "FORA"
-    if dom == "FORA":
-        return "CASA"
-    return "DESCONHECIDO"
-
-
-def lado_com_vermelho(metricas):
-    vc, vf = metricas.get("vermelhos", (0, 0))
-    if vc > vf:
-        return "CASA"
-    if vf > vc:
-        return "FORA"
-    if vc > 0 and vf > 0:
-        return "AMBOS"
-    return "NENHUM"
-
-
-def pressao_viva(metricas):
-    u5 = sum(metricas.get("ultimos5", (0, 0)))
-    u10 = sum(metricas.get("ultimos10", (0, 0)))
-    rb = sum(metricas.get("remates_baliza", (0, 0)))
-    rl = sum(metricas.get("remates_lado", (0, 0)))
-    rda = sum(metricas.get("remates_dentro_area", (0, 0)))
-    ap = sum(metricas.get("ataques_perigosos", (0, 0)))
-    xg = sum(metricas.get("xg", (0.0, 0.0)))
-    p = metricas.get("pressao_alfa", {})
-
-    ip_pico = max(p.get("ip_pico_casa", 0), p.get("ip_pico_fora", 0))
-    ip18 = max(p.get("ip_consec_18_casa", 0), p.get("ip_consec_18_fora", 0))
-    ip22 = max(p.get("ip_consec_22_casa", 0), p.get("ip_consec_22_fora", 0))
-
-    return (
-        ip22 >= 2
-        or ip18 >= 3
-        or (ip_pico >= 22 and (u5 >= 2 or u10 >= 5))
-        or u5 >= 5
-        or (u10 >= 9 and u5 >= 3)
-        or (ap >= 30 and (rb >= 3 or rda >= 3 or rl >= 7 or xg >= 0.55))
-    )
-
-
-def tempo_operacional_valido(metricas, estrategia):
-    tempo = metricas.get("tempo", 0)
-
-    if eh_ht(estrategia):
-        return tempo <= 37
-
-    if eh_ft(estrategia):
-        return tempo <= 82
-
-    return True
-
-
-def corte_gol_estrategia(estrategia):
-    if estrategia == "ALFA_HT_CONFIRMACAO":
-        return CORTE_CONFIRMACAO_GOL_HT
-    if estrategia == "ALFA_FT_CONFIRMACAO":
-        return CORTE_CONFIRMACAO_GOL_FT
-    if eh_ht(estrategia):
-        return CORTE_GOL_HT
-    if eh_ft(estrategia):
-        return CORTE_GOL_FT
-    return CORTE_GOL
-
-
-def bonus_bot_confianca(estrategia):
-    # ARCE e CHAMA são bots de maior confiança operacional.
-    # O bônus ajuda jogos bons desses bots a não morrerem por detalhe,
-    # mas entra antes das travas finais para não liberar jogo ruim/fake pressure.
-    if estrategia in ["ARCE_HT", "CHAMA_FT"]:
-        return 3
-    return 0
-
-
-def valor_lado(metricas, campo, lado, padrao=(0, 0)):
-    valores = metricas.get(campo, padrao)
-    if not isinstance(valores, tuple) or len(valores) < 2:
-        return 0
-    return valores[0] if lado == "CASA" else valores[1] if lado == "FORA" else 0
-
-
-def soma_lados(metricas, campo, padrao=(0, 0)):
-    valores = metricas.get(campo, padrao)
-    if not isinstance(valores, tuple) or len(valores) < 2:
-        return 0
-    return valores[0] + valores[1]
-
-
-def lado_perdendo(metricas):
-    gc, gf = extrair_gols_placar(metricas.get("placar", ""))
-    if gc is None:
-        return "DESCONHECIDO"
-    if gc < gf:
-        return "CASA"
-    if gf < gc:
-        return "FORA"
-    return "EMPATE"
-
-
-def lado_vencendo(metricas):
-    gc, gf = extrair_gols_placar(metricas.get("placar", ""))
-    if gc is None:
+def lado_vencendo(m: Metricas) -> str:
+    gc, gf = extrair_gols_placar(m.placar)
+    if gc is None or gf is None:
         return "DESCONHECIDO"
     if gc > gf:
         return "CASA"
@@ -1082,3355 +750,1059 @@ def lado_vencendo(metricas):
     return "EMPATE"
 
 
-def gol_empate_ft_com_virada_potencial(metricas, lado_gol, dom=None, fav=None):
-    """Exceção institucional para confirmação FT.
-
-    Se o time que vinha pressionando marcou nos últimos 5 minutos,
-    normalmente a pressão foi premiada e a confirmação deve ser cancelada.
-
-    Exceção apenas no FT: quando esse gol foi empate, e o time ainda tem perfil
-    claro de buscar a virada nos minutos finais — favorito visível ou domínio
-    numérico muito forte, com produção real.
-    """
-    if lado_gol not in ["CASA", "FORA"]:
-        return False
-
-    gc, gf = extrair_gols_placar(metricas.get("placar", ""))
-    if gc is None or gc != gf:
-        return False
-
-    # Se o placar atual está empatado e o lado marcou, então antes do gol
-    # esse lado estava perdendo por 1. É o cenário de empate tardio.
-    if lado_gol == "CASA" and gc <= 0:
-        return False
-    if lado_gol == "FORA" and gf <= 0:
-        return False
-
-    fav = fav or lado_favorito(metricas)[0]
-    _, odd_fav = lado_favorito(metricas)
-    dom = dom or lado_dominante(metricas)[0]
-    dados = dados_lado(metricas, lado_gol)
-    p = metricas.get("pressao_alfa", {})
-
-    ip_pico_lado = p.get("ip_pico_casa", 0) if lado_gol == "CASA" else p.get("ip_pico_fora", 0)
-    c18_lado = p.get("ip_consec_18_casa", 0) if lado_gol == "CASA" else p.get("ip_consec_18_fora", 0)
-    c22_lado = p.get("ip_consec_22_casa", 0) if lado_gol == "CASA" else p.get("ip_consec_22_fora", 0)
-
-    favorito_visivel = fav == lado_gol and odd_fav and odd_fav <= 1.75
-    dominio_em_campo = dom == lado_gol and (
-        dados["u5"] >= 3
-        or dados["u10"] >= 7
-        or dados["rb"] >= 2
-        or dados["rda"] >= 2
-        or dados["cantos"] >= 2
-        or dados["xg"] >= 0.45
-        or ip_pico_lado >= 24
-        or c18_lado >= 3
-        or c22_lado >= 2
-    )
-    producao_real = (
-        dados["rb"] >= 1
-        or dados["remates"] >= 4
-        or dados["rda"] >= 2
-        or dados["cantos"] >= 2
-        or dados["xg"] >= 0.35
-    )
-
-    return producao_real and (favorito_visivel or dominio_em_campo)
+def lado_perdendo(m: Metricas) -> str:
+    gc, gf = extrair_gols_placar(m.placar)
+    if gc is None or gf is None:
+        return "DESCONHECIDO"
+    if gc < gf:
+        return "CASA"
+    if gf < gc:
+        return "FORA"
+    return "EMPATE"
 
 
-def dados_lado(metricas, lado):
-    rb = valor_lado(metricas, "remates_baliza", lado)
-    rl = valor_lado(metricas, "remates_lado", lado)
-    rda = valor_lado(metricas, "remates_dentro_area", lado)
-    cantos = valor_lado(metricas, "cantos", lado)
-    u5 = valor_lado(metricas, "ultimos5", lado)
-    u10 = valor_lado(metricas, "ultimos10", lado)
-    ap = valor_lado(metricas, "ataques_perigosos", lado)
-    xg = valor_lado(metricas, "xg", lado, (0.0, 0.0))
+def dados_lado(m: Metricas, lado: str) -> Dict[str, float]:
     return {
-        "rb": rb,
-        "rl": rl,
-        "remates": rb + rl,
-        "rda": rda,
-        "cantos": cantos,
-        "u5": u5,
-        "u10": u10,
-        "ap": ap,
-        "xg": xg,
+        "ap": valor_lado(m, "ataques_perigosos", lado),
+        "ataques": valor_lado(m, "ataques", lado),
+        "cantos": valor_lado(m, "cantos", lado),
+        "posse": valor_lado(m, "posse", lado),
+        "rb": valor_lado(m, "remates_baliza", lado),
+        "rl": valor_lado(m, "remates_lado", lado),
+        "rda": valor_lado(m, "remates_dentro_area", lado),
+        "u5": max(0, valor_lado(m, "ultimos5", lado)),
+        "u10": max(0, valor_lado(m, "ultimos10", lado)),
+        "chance": valor_lado(m, "chance_golo", lado),
+        "xg": valor_lado(m, "xg", lado),
+        "xgl": valor_lado(m, "xgl", lado),
     }
 
 
-def consequencia_ofensiva_total(metricas, estrategia):
-    rb = soma_lados(metricas, "remates_baliza")
-    rl = soma_lados(metricas, "remates_lado")
-    rda = soma_lados(metricas, "remates_dentro_area")
-    cantos = soma_lados(metricas, "cantos")
-    xg = soma_lados(metricas, "xg", (0.0, 0.0))
+def ip_lado(m: Metricas, lado: str) -> Dict[str, float]:
+    p = m.pressao_alfa or _pressao_vazia()
+    suf = "casa" if lado == "CASA" else "fora"
+    return {
+        "pico": float(p.get(f"ip_pico_{suf}", 0)),
+        "media": float(p.get(f"ip_media_{suf}", 0)),
+        "c10": float(p.get(f"ip_consec_10_{suf}", 0)),
+        "c15": float(p.get(f"ip_consec_15_{suf}", 0)),
+        "c18": float(p.get(f"ip_consec_18_{suf}", 0)),
+        "c22": float(p.get(f"ip_consec_22_{suf}", 0)),
+    }
 
-    if eh_ht(estrategia):
-        return rb >= 1 or rb + rl >= 4 or rda >= 2 or cantos >= 2 or xg >= 0.30
 
-    return rb >= 1 or rb + rl >= 4 or rda >= 2 or cantos >= 2 or xg >= 0.35
+def pontuar_lado(m: Metricas, lado: str) -> float:
+    d = dados_lado(m, lado)
+    ip = ip_lado(m, lado)
+    return (
+        d["ap"] * 1.0
+        + d["u5"] * 2.2
+        + d["u10"] * 1.4
+        + d["rb"] * 4.2
+        + d["rl"] * 1.2
+        + d["rda"] * 1.5
+        + d["cantos"] * 0.9
+        + d["chance"] * 1.35
+        + d["xg"] * 9.0
+        + ip["pico"] * 0.5
+        + ip["c18"] * 2.0
+        + ip["c22"] * 3.0
+    )
 
 
-def lado_pressao_principal(metricas, estrategia):
-    """Define o lado que precisa provar consequência ofensiva.
+def lado_dominante(m: Metricas) -> Tuple[str, float]:
+    casa = pontuar_lado(m, "CASA")
+    fora = pontuar_lado(m, "FORA")
+    dif = casa - fora
+    if dif >= 8:
+        return "CASA", dif
+    if dif <= -8:
+        return "FORA", abs(dif)
+    return "EQUILIBRADO", abs(dif)
 
-    - Em FT com placar de 2+ gols, o lado que perde precisa mostrar vida.
-    - Em jogo apertado, usamos o lado dominante.
-    - Se o domínio está equilibrado, usamos o favorito; se não houver favorito claro, fica desconhecido.
-    """
-    if eh_ft(estrategia):
-        gc, gf = extrair_gols_placar(metricas.get("placar", ""))
-        if gc is not None and abs(gc - gf) >= 2:
-            perdendo = lado_perdendo(metricas)
-            if perdendo in ["CASA", "FORA"]:
-                return perdendo
 
-    dom, _ = lado_dominante(metricas)
-    if dom in ["CASA", "FORA"]:
+def lado_pressionante(m: Metricas) -> str:
+    dom, dif = lado_dominante(m)
+    fav, odd = lado_favorito(m)
+    if dom in {"CASA", "FORA"}:
         return dom
-
-    fav, _ = lado_favorito(metricas)
-    if fav in ["CASA", "FORA"]:
+    if fav in {"CASA", "FORA"} and odd <= (1.50 if eh_ht(m.estrategia) else 1.85):
         return fav
-
     return "DESCONHECIDO"
 
 
-def consequencia_ofensiva_lado(metricas, estrategia, lado):
-    if lado not in ["CASA", "FORA"]:
-        return consequencia_ofensiva_total(metricas, estrategia)
-
-    dados = dados_lado(metricas, lado)
-
-    if eh_ht(estrategia):
-        return (
-            dados["rb"] >= 1
-            or dados["remates"] >= 3
-            or dados["rda"] >= 1
-            or dados["cantos"] >= 1
-            or dados["xg"] >= 0.22
-        )
-
-    return (
-        dados["rb"] >= 1
-        or dados["remates"] >= 3
-        or dados["rda"] >= 2
-        or dados["cantos"] >= 2
-        or dados["xg"] >= 0.28
-    )
+def preencher_contexto_calculado(m: Metricas) -> None:
+    m.liga = classificar_liga(m.competicao)
+    m.lado_favorito, m.odd_favorito = lado_favorito(m)
+    m.lado_zebra = lado_zebra(m.lado_favorito)
+    m.lado_dominante, _ = lado_dominante(m)
+    m.lado_pressionante = lado_pressionante(m)
 
 
-def pressao_sustentada_nivel(metricas, estrategia):
-    p = metricas.get("pressao_alfa", {})
-    c10 = max(p.get("ip_consec_10_casa", 0), p.get("ip_consec_10_fora", 0))
-    c15 = max(p.get("ip_consec_15_casa", 0), p.get("ip_consec_15_fora", 0))
-    c18 = max(p.get("ip_consec_18_casa", 0), p.get("ip_consec_18_fora", 0))
-    c22 = max(p.get("ip_consec_22_casa", 0), p.get("ip_consec_22_fora", 0))
-    ip_pico = max(p.get("ip_pico_casa", 0), p.get("ip_pico_fora", 0))
-
-    if ip_pico >= 35 and c22 >= 2:
-        return "COLAPSO"
-    if ip_pico >= 30:
-        return "ELITE"
-    if eh_ht(estrategia):
-        if c22 >= 3 or c18 >= 4:
-            return "FORTE"
-        if c15 >= 5:
-            return "OBSERVACAO"
-    else:
-        if c22 >= 5 or c18 >= 5:
-            return "FORTE"
-        if c15 >= 5:
-            return "OBSERVACAO"
-    if c10 >= 5:
-        return "VIVA_BAIXA"
-    return "FRACA"
+def favorito_nao_vencendo(m: Metricas) -> bool:
+    if m.lado_favorito not in {"CASA", "FORA"}:
+        return False
+    vencedor = lado_vencendo(m)
+    return vencedor == "EMPATE" or vencedor != m.lado_favorito
 
 
-def pressao_recente_caiu(metricas):
-    # LOGIC-01 corrigido: usa dados do lado alvo identificado pelo funil,
-    # não a soma dos dois lados — evita penalizar lado dominante por causa do lado passivo.
-    lado_alvo = metricas.get("lado_dominante", "EQUILIBRADO")
-    p = metricas.get("pressao_alfa", {})
-
-    if lado_alvo == "CASA":
-        u5  = metricas.get("ultimos5",  (0, 0))[0]
-        u10 = metricas.get("ultimos10", (0, 0))[0]
-        ip_pico = p.get("ip_pico_casa", 0)
-    elif lado_alvo == "FORA":
-        u5  = metricas.get("ultimos5",  (0, 0))[1]
-        u10 = metricas.get("ultimos10", (0, 0))[1]
-        ip_pico = p.get("ip_pico_fora", 0)
-    else:
-        # Equilibrado: mantém comportamento original com soma
-        u5  = soma_lados(metricas, "ultimos5")
-        u10 = soma_lados(metricas, "ultimos10")
-        ip_pico = max(p.get("ip_pico_casa", 0), p.get("ip_pico_fora", 0))
-
-    return ip_pico >= 22 and (u5 <= 3 or u10 <= 6)
+def faixa_favorito(m: Metricas) -> str:
+    odd = m.odd_favorito
+    if not odd:
+        return "SEM_ODD"
+    if odd <= 1.30:
+        return "SUPER_FAVORITO"
+    if eh_ht(m.estrategia):
+        if odd <= 1.50:
+            return "FAVORITO_FORTE"
+        return "SEM_BONUS_FAVORITO"
+    if odd <= 1.55:
+        return "FAVORITO_FORTE"
+    if odd <= 1.85:
+        return "FAVORITO_CONTEXTUAL"
+    if odd <= 2.20:
+        return "FAVORITO_FRACO_SO_EXTREMO"
+    return "SEM_BONUS_FAVORITO"
 
 
+def pressao_viva_lado(m: Metricas, lado: str) -> bool:
+    d = dados_lado(m, lado)
+    ip = ip_lado(m, lado)
+    if eh_ht(m.estrategia):
+        return d["u5"] >= 4 or d["u10"] >= 8 or ip["pico"] >= 22 or ip["c18"] >= 2 or ip["c22"] >= 1
+    return d["u5"] >= 3 or d["u10"] >= 7 or ip["pico"] >= 20 or ip["c18"] >= 2 or ip["c22"] >= 1
 
 
-# =========================================================
-# FUNIL INSTITUCIONAL ANTI-FAKE PRESSURE
-# =========================================================
-
-def perfil_origem_estrategia(estrategia):
-    if estrategia in ["ARCE_HT", "CHAMA_FT"]:
-        return "RADAR_CONFIAVEL"
-    if eh_confirmacao(estrategia):
-        return "CONFIRMACAO"
-    return "RADAR_ABERTO"
+def pressao_morta_lado(m: Metricas, lado: str) -> bool:
+    d = dados_lado(m, lado)
+    ip = ip_lado(m, lado)
+    return d["u5"] <= 1 and d["u10"] <= 3 and ip["pico"] < 18 and ip["c18"] == 0
 
 
-def lado_alvo_contextual(metricas, estrategia):
-    """Define quem precisa provar perigo real.
+def consequencia_real_lado(m: Metricas, lado: str) -> bool:
+    d = dados_lado(m, lado)
+    if eh_ht(m.estrategia):
+        return d["rb"] >= 1 or d["rb"] + d["rl"] >= 3 or d["cantos"] >= 1 or d["chance"] >= 6 or d["xg"] >= 0.20
+    return d["rb"] >= 1 or d["rb"] + d["rl"] >= 4 or d["cantos"] >= 2 or d["chance"] >= 8 or d["xg"] >= 0.28
 
-    Esta função evita o erro antigo de somar estatística dos dois lados.
-    O score só deve respeitar a pressão do lado que realmente carrega o contexto.
+
+def vermelho_contra_pressionante(m: Metricas) -> bool:
+    vc, vf = m.vermelhos
+    if m.lado_pressionante == "CASA" and vc > vf:
+        return True
+    if m.lado_pressionante == "FORA" and vf > vc:
+        return True
+    return False
+
+
+def contexto_emocional_vivo(m: Metricas, lado: str) -> Tuple[bool, str]:
+    """Valida se o placar ainda dá valor real para over.
+
+    Essa função recupera a filosofia do main.py antigo: pressão não basta.
+    O sistema precisa saber se o contexto emocional ainda pede gol ou se a
+    pressão já foi paga pelo jogo.
     """
-    dom, dif_dom = lado_dominante(metricas)
-    fav, odd_fav = lado_favorito(metricas)
-    perdendo = lado_perdendo(metricas)
-    vencendo = lado_vencendo(metricas)
-
-    # Em FT, se o favorito está perdendo ou empatando e domina, ele é o lado-alvo.
-    if eh_ft(estrategia) and fav in ["CASA", "FORA"]:
-        if perdendo == fav and dom == fav:
-            return fav, "FAVORITO_PERDENDO_E_PRESSIONANDO"
-        if vencendo == "EMPATE" and dom == fav:
-            return fav, "FAVORITO_EMPATANDO_E_PRESSIONANDO"
-
-    # Em qualquer tempo, domínio claro é a melhor referência.
-    if dom in ["CASA", "FORA"] and dif_dom >= 8:
-        return dom, "LADO_DOMINANTE_EM_CAMPO"
-
-    # Se não houver domínio claro, usa favorito apenas como fallback, nunca como passe livre.
-    if fav in ["CASA", "FORA"] and odd_fav and odd_fav <= 1.70:
-        return fav, "FAVORITO_ESTRUTURAL_FALLBACK"
-
-    return "DESCONHECIDO", "SEM_LADO_ALVO_CLARO"
-
-
-def valores_pressao_lado(metricas, lado):
-    p = metricas.get("pressao_alfa", {})
-    if lado == "CASA":
-        return {
-            "ip_pico": p.get("ip_pico_casa", 0),
-            "c10": p.get("ip_consec_10_casa", 0),
-            "c15": p.get("ip_consec_15_casa", 0),
-            "c18": p.get("ip_consec_18_casa", 0),
-            "c22": p.get("ip_consec_22_casa", 0),
-        }
-    if lado == "FORA":
-        return {
-            "ip_pico": p.get("ip_pico_fora", 0),
-            "c10": p.get("ip_consec_10_fora", 0),
-            "c15": p.get("ip_consec_15_fora", 0),
-            "c18": p.get("ip_consec_18_fora", 0),
-            "c22": p.get("ip_consec_22_fora", 0),
-        }
-    return {"ip_pico": 0, "c10": 0, "c15": 0, "c18": 0, "c22": 0}
-
-
-def qualidade_pressao_lado(metricas, estrategia, lado):
-    """Mede a pressão do lado certo, não do jogo inteiro."""
-    dados = dados_lado(metricas, lado)
-    ip = valores_pressao_lado(metricas, lado)
-    chance = valor_lado(metricas, "chance_golo", lado)
-    heat = valor_lado(metricas, "heatmap", lado)
-
-    pressao_recente = 0
-    if dados["u5"] >= 3:
-        pressao_recente += 1
-    if dados["u5"] >= 5:
-        pressao_recente += 1
-    if dados["u10"] >= 6:
-        pressao_recente += 1
-    if dados["u10"] >= 10:
-        pressao_recente += 1
-
-    continuidade = 0
-    if ip["c10"] >= 5:
-        continuidade += 1
-    if ip["c15"] >= 4:
-        continuidade += 1
-    if ip["c18"] >= 3:
-        continuidade += 1
-    if ip["c22"] >= 2:
-        continuidade += 1
-    if ip["ip_pico"] >= 24 and dados["u10"] >= 5:
-        continuidade += 1
-
-    consequencia = 0
-    if dados["rb"] >= 1:
-        consequencia += 1
-    if dados["rb"] >= 2:
-        consequencia += 1
-    if dados["remates"] >= 4:
-        consequencia += 1
-    if dados["rda"] >= 2:
-        consequencia += 1
-    if dados["cantos"] >= 2:
-        consequencia += 1
-    if dados["xg"] >= 0.35:
-        consequencia += 1
-    if chance >= 8:
-        consequencia += 1
-
-    territorio = 0
-    if dados["ap"] >= 12:
-        territorio += 1
-    if dados["ap"] >= 20:
-        territorio += 1
-    if heat >= 60:
-        territorio += 1
-
-    return {
-        "dados": dados,
-        "ip": ip,
-        "chance": chance,
-        "pressao_recente": pressao_recente,
-        "continuidade": continuidade,
-        "consequencia": consequencia,
-        "territorio": territorio,
-    }
-
-
-def contexto_emocional_vivo(metricas, estrategia, lado):
-    gc, gf = extrair_gols_placar(metricas.get("placar", ""))
-    if gc is None:
+    gc, gf = extrair_gols_placar(m.placar)
+    if gc is None or gf is None:
         return True, "PLACAR_DESCONHECIDO"
 
-    gols_total = gc + gf
+    total_gols = gc + gf
     dif = abs(gc - gf)
-    fav, _ = lado_favorito(metricas)
-    perdendo = lado_perdendo(metricas)
-    vencendo = lado_vencendo(metricas)
+    fav = m.lado_favorito
+    perdendo = lado_perdendo(m)
+    vencendo = lado_vencendo(m)
 
-    if eh_ht(estrategia):
-        # HT ainda pode estar vivo mesmo com 1x0/0x1, mas 3+ gols cedo exige muita cautela.
-        if gols_total >= 3 and dif >= 2:
-            return False, "HT_PLACAR_JA_ABRIU_DEMAIS"
+    # HT: ainda aceita 1x0/0x1, mas evita placar muito aberto cedo sem massacre.
+    if eh_ht(m.estrategia):
+        if total_gols >= 3 and dif >= 2:
+            if lado == vencendo and pressao_extrema_lado(m, lado) and consequencia_real_lado(m, lado):
+                return True, "HT_MASSACRE_CONTINUA_MESMO_PLACAR_ABERTO"
+            return False, "HT_PLACAR_ABERTO_DEMAIS_SEM_VALOR"
         return True, "HT_CONTEXTO_VIVO"
 
-    # FT: placar apertado, empate ou favorito perdendo é o melhor cenário.
+    # FT: empate, diferença de 1 gol e favorito não vencendo são cenários vivos.
+    if vencendo == "EMPATE":
+        return True, "FT_EMPATE_CONTEXTO_VIVO"
     if dif <= 1:
-        return True, "FT_PLACAR_ABERTO"
-    if fav in ["CASA", "FORA"] and perdendo == fav:
-        return True, "FAVORITO_ATRAS_DO_PLACAR"
+        return True, "FT_PLACAR_APERTADO"
+    if fav in {"CASA", "FORA"} and perdendo == fav:
+        return True, "FT_FAVORITO_ATRAS_DO_PLACAR"
 
-    # Massacre só continua vivo se a pressão atual do próprio dominante segue extrema.
-    q = qualidade_pressao_lado(metricas, estrategia, lado)
+    # Se o lado que está vencendo por 2+ é também o pressionante, só aceita
+    # quando existe massacre vivo comprovado; caso contrário é placar resolvido.
     if dif >= 2 and lado == vencendo:
-        massacre_continua = (
-            q["pressao_recente"] >= 2
-            and q["continuidade"] >= 2
-            and q["consequencia"] >= 2
-            and q["dados"]["u5"] >= 4
-        )
-        if massacre_continua:
+        if pressao_extrema_lado(m, lado) and consequencia_real_lado(m, lado):
             return True, "MASSACRE_CONTINUA_VIVO"
         return False, "PLACAR_RESOLVIDO_SEM_FOME"
 
-    return dif <= 2, "CONTEXTO_NEUTRO"
+    # Se o lado pressionante está perdendo por 2+, ainda há urgência, mas exige
+    # pressão real para não virar entrada emocional vazia.
+    if dif >= 2 and lado == perdendo:
+        if pressao_viva_lado(m, lado) and consequencia_real_lado(m, lado):
+            return True, "TIME_ATRAS_PRECISA_REAGIR_COM_PRESSAO"
+        return False, "TIME_ATRAS_SEM_PRESSAO_REAL"
+
+    return True, "CONTEXTO_NEUTRO_VIVO"
 
 
-def trava_pos_gol_institucional(metricas, estrategia, lado):
-    tempo = metricas.get("tempo", 0)
-    ultimo = metricas.get("ultimo_gol", 0)
-    lado_gol = metricas.get("ultimo_gol_lado", "DESCONHECIDO")
+def consequencia_minima_emocional(m: Metricas, lado: str) -> bool:
+    """Consequência mínima para exceções contextuais.
 
-    if not ultimo or ultimo <= 0:
-        return False, 0, "SEM_GOL_RECENTE_INSTITUCIONAL"
-
-    minutos = tempo - ultimo
-    if minutos < 0:
-        return True, 70, "GOL_INCONSISTENTE_BLOQUEIO"
-
-    if minutos > 8:
-        return False, 0, "GOL_NAO_RECENTE"
-
-    q = qualidade_pressao_lado(metricas, estrategia, lado)
-    dom, _ = lado_dominante(metricas)
-    fav, _ = lado_favorito(metricas)
-    pressionado = lado_sofrendo_pressao(metricas)
-    zebra = lado_zebra(metricas)
-
-    pressao_extrema_pos_gol = (
-        q["pressao_recente"] >= 2
-        and q["continuidade"] >= 2
-        and q["consequencia"] >= 2
-        and q["dados"]["u5"] >= 4
+    Mesmo quando há gol contra o fluxo ou favorito não vencendo, o jogo precisa
+    provar pelo menos algum caminho real de gol. Isso evita liberar contexto
+    emocional sem finalização nenhuma.
+    """
+    d = dados_lado(m, lado)
+    ip = ip_lado(m, lado)
+    return (
+        d["rb"] >= 1
+        or d["rl"] >= 2
+        or d["cantos"] >= 2
+        or d["chance"] >= (6 if eh_ht(m.estrategia) else 8)
+        or d["xg"] >= (0.18 if eh_ht(m.estrategia) else 0.25)
+        or (ip["pico"] >= 24 and d["ap"] >= 15)
     )
 
-    # Confirmação existe para isso: se o dominante marcou recente, a entrada principal não deve ir direto.
-    if lado_gol == lado and minutos <= 5:
-        if pressao_extrema_pos_gol and eh_confirmacao(estrategia):
-            return False, 0, "CONFIRMACAO_VALIDOU_MASSACRE_POS_GOL"
-        if pressao_extrema_pos_gol:
-            return True, 83, "MASSACRE_POS_GOL_AGUARDAR_CONFIRMACAO"
-        return True, 76, "PRESSAO_PREMIADA_BLOQUEIO"
 
-    # Gol a favor do lado dominante entre 5-12 minutos:
-    # pressão foi convertida — jogo muda de natureza.
-    # Só mantém se a pressão continuou forte após o gol.
-    if lado_gol == lado and 5 < minutos <= 12:
-        if q["dados"]["u5"] >= 4 and q["dados"]["u10"] >= 8:
-            # FT: pressão continuou forte após gol — não bloqueia, apenas aplica teto leve no score
-            if eh_ft(estrategia):
-                return False, 0, "GOL_A_FAVOR_PRESSAO_CONTINUOU_FT"
-            return True, 84, "GOL_A_FAVOR_PRESSAO_CONTINUOU"
-        else:
-            # Pressão esfriou após gol — penaliza
-            return True, 72, "GOL_A_FAVOR_PRESSAO_ESFRIOU"
+# =========================================================
+# VALOR PÓS-EVENTO
+# =========================================================
 
-    # Zebra/time pressionado marcando contra o fluxo abre o jogo.
-    # Bônus: favorito/dominante perdendo agora tem pressão + necessidade emocional.
-    if lado_gol in [pressionado, zebra] and lado == dom and minutos <= 8:
-        return False, 0, "GOL_CONTRA_FLUXO_ABRIU_JOGO"
+def avaliar_valor_pos_evento(m: Metricas) -> Tuple[str, str, int, bool]:
+    """Retorna classe, motivo, ajuste_score, proteger_ia.
 
-    # Gol de outro lado sem clareza: cautela.
-    if minutos <= 3:
-        return True, 82, "GOL_MUITO_RECENTE_CAUTELA"
-
-    return False, 0, "GOL_RECENTE_SEM_TRAVA"
-
-
-def funil_institucional_gol(metricas, estrategia, chave_jogo):
-    """Funil antes do score.
-
-    Retorna se o jogo está aprovado para pontuar de verdade.
-    Caso bloqueado, retorna teto máximo para impedir score inflado.
+    A função não duplica bônus em excesso. Ela é o núcleo humano:
+    quem pressionava, quem marcou e se a pressão ainda vale.
     """
-    perfil = perfil_origem_estrategia(estrategia)
-    lado, motivo_lado = lado_alvo_contextual(metricas, estrategia)
-    metricas["perfil_origem"] = perfil
-    metricas["lado_alvo"] = lado
-    metricas["motivo_lado_alvo"] = motivo_lado
+    lado = m.lado_pressionante
+    fav = m.lado_favorito
+    zebra = m.lado_zebra
+    ultimo_lado = m.ultimo_gol_lado
+    tempo = m.tempo
+    ultimo = m.ultimo_gol
+    minutos = tempo - ultimo if ultimo else 999
 
-    if lado not in ["CASA", "FORA"]:
-        return False, 72, "SEM_LADO_ALVO_CLARO"
+    if lado not in {"CASA", "FORA"}:
+        return "SEM_VALOR_ESPECIAL", "SEM_LADO_PRESSIONANTE", 0, False
 
-    q = qualidade_pressao_lado(metricas, estrategia, lado)
-    metricas["qualidade_lado_alvo"] = q
+    fav_nv = favorito_nao_vencendo(m)
+    fav_press = fav == lado and pressao_viva_lado(m, lado)
 
-    # Validações obrigatórias.
-    tem_pressao = q["pressao_recente"] >= 1
-    tem_continuidade = q["continuidade"] >= 1
-    tem_consequencia = q["consequencia"] >= 1
-    emocional_vivo, motivo_emocional = contexto_emocional_vivo(metricas, estrategia, lado)
-    metricas["motivo_emocional"] = motivo_emocional
+    # Favorito não vencendo e pressão sustentada: caso Rīgas / Donaufeld.
+    if fav in {"CASA", "FORA"} and fav_nv and fav_press:
+        faixa = faixa_favorito(m)
+        if faixa == "SUPER_FAVORITO":
+            return "FAVORITO_NAO_VENCE_PRESSAO_SUSTENTADA", "SUPER_FAVORITO_NAO_VENCE_E_PRESSIONA", 10, True
+        if faixa == "FAVORITO_FORTE":
+            return "FAVORITO_NAO_VENCE_PRESSAO_SUSTENTADA", "FAVORITO_FORTE_NAO_VENCE_E_PRESSIONA", 7, True
+        if faixa == "FAVORITO_CONTEXTUAL" and consequencia_real_lado(m, lado):
+            return "FAVORITO_NAO_VENCE_PRESSAO_SUSTENTADA", "FAVORITO_CONTEXTUAL_NAO_VENCE_COM_CONSEQUENCIA", 4, True
+        if faixa == "FAVORITO_FRACO_SO_EXTREMO" and pressao_extrema_lado(m, lado):
+            return "FAVORITO_NAO_VENCE_PRESSAO_SUSTENTADA", "FAVORITO_FRACO_SO_EXTREMO_VALIDADO", 1, True
 
-    validacoes = sum([tem_pressao, tem_continuidade, tem_consequencia, emocional_vivo])
-    metricas["validacoes_funil"] = validacoes
+    # Sem gol recente, não há valor pós-evento de gol.
+    if not ultimo or minutos > 12 or ultimo_lado == "DESCONHECIDO":
+        return "SEM_VALOR_ESPECIAL", "SEM_GOL_RECENTE_RELEVANTE", 0, fav_press and fav_nv
 
-    # Bots abertos precisam provar mais. CHAMA/ARCE já vêm pré-filtrados, mas não têm passe livre.
-    minimo_validacoes = 4 if perfil == "RADAR_ABERTO" else 3
-    if validacoes < minimo_validacoes:
-        return False, 74 if perfil == "RADAR_ABERTO" else 79, "FALHOU_VALIDACOES_OBRIGATORIAS"
+    # Gol contra fluxo: zebra/adversário marcou enquanto o pressionante/favorito segue vivo.
+    if ultimo_lado != lado and pressao_viva_lado(m, lado):
+        if fav == lado or ultimo_lado == zebra:
+            ajuste = 10 if m.odd_favorito and m.odd_favorito <= 1.30 else 7
+            return "GOL_CONTRA_FLUXO_VALORIZA", "ZEBRA_MARCOU_E_PRESSIONANTE_SEGUE_VIVO", ajuste, True
+        return "GOL_CONTRA_FLUXO_VALORIZA", "ADVERSARIO_MARCOU_E_PRESSAO_CONTINUA", 5, True
 
-    # Travas anti-fake pressure.
-    dados = q["dados"]
-    ip = q["ip"]
-    chance = q["chance"]
+    # Gol do lado pressionante.
+    if ultimo_lado == lado:
+        if pressao_morta_lado(m, lado):
+            return "PRESSAO_PREMIADA_MORREU", "GOL_PREMIOU_PRESSAO_E_RITMO_CAIU", -14, False
+        if pressao_viva_lado(m, lado):
+            return "PRESSAO_PREMIADA_MAS_CONTINUA", "GOL_PREMIOU_MAS_PRESSAO_CONTINUA", -2, True
+        return "PRESSAO_PREMIADA_MORREU", "GOL_PREMIOU_PRESSAO_SEM_CONTINUIDADE_CLARA", -8, False
 
-    if not tem_consequencia:
-        return False, 76, "SEM_CONSEQUENCIA_OFENSIVA_DO_LADO_CERTO"
+    return "SEM_VALOR_ESPECIAL", "GOL_RECENTE_SEM_LEITURA_ESPECIAL", 0, False
 
-    if ip["ip_pico"] >= 22 and dados["rb"] == 0 and dados["remates"] <= 2 and dados["xg"] < 0.30:
-        return False, 76, "IP_ALTO_SEM_FINALIZACAO"
 
-    if dados["ap"] >= 20 and dados["rb"] == 0 and dados["rda"] == 0 and dados["xg"] < 0.30:
-        return False, 76, "ATAQUE_PERIGOSO_SEM_AREA"
+def pressao_extrema_lado(m: Metricas, lado: str) -> bool:
+    d = dados_lado(m, lado)
+    ip = ip_lado(m, lado)
+    return (
+        d["ap"] >= 25
+        and (d["chance"] >= 10 or d["rb"] >= 2 or d["cantos"] >= 4 or d["rl"] >= 7)
+        and (ip["pico"] >= 24 or ip["c18"] >= 3 or ip["c22"] >= 2)
+    )
 
-    if q["territorio"] >= 2 and q["consequencia"] <= 1 and dados["xg"] < 0.35:
-        return False, 78, "TERRITORIO_SEM_RUPTURA"
 
-    if q["continuidade"] == 0 and dados["u5"] <= 2:
-        return False, 75, "PRESSAO_ANTIGA_SEM_CONTINUIDADE"
+# =========================================================
+# SCORE PYTHON CONTEXTUAL
+# =========================================================
+
+def score_pressao_viva(m: Metricas) -> int:
+    lado = m.lado_pressionante
+    if lado not in {"CASA", "FORA"}:
+        return 0
+    d = dados_lado(m, lado)
+    ip = ip_lado(m, lado)
+    score = 0
+    score += min(14, d["u5"] * 2.0)
+    score += min(14, d["u10"] * 1.2)
+    if ip["pico"] >= 20:
+        score += 5
+    if ip["pico"] >= 24:
+        score += 4
+    if ip["pico"] >= 30:
+        score += 4
+    score += min(8, ip["c18"] * 2)
+    score += min(8, ip["c22"] * 3)
+    return clamp(score, 0, 32)
+
+
+def score_consequencia(m: Metricas) -> int:
+    lado = m.lado_pressionante
+    if lado not in {"CASA", "FORA"}:
+        return 0
+    d = dados_lado(m, lado)
+    score = 0
+    score += min(12, d["rb"] * 4)
+    score += min(8, d["rl"] * 1.2)
+    score += min(6, d["cantos"] * 0.9)
+    score += min(9, d["chance"] * 0.8)
+    score += min(7, d["xg"] * 10)
+    if d["ap"] >= 20:
+        score += 3
+    if d["ap"] >= 35:
+        score += 3
+    return clamp(score, 0, 32)
+
+
+def score_favoritismo(m: Metricas) -> int:
+    fav = m.lado_favorito
+    if fav not in {"CASA", "FORA"}:
+        elite_bonus, _ = bonus_time_elite_transicao(m)
+        return clamp(elite_bonus, -8, 18)
+    faixa = faixa_favorito(m)
+    base = {"SUPER_FAVORITO": 10, "FAVORITO_FORTE": 7, "FAVORITO_CONTEXTUAL": 4, "FAVORITO_FRACO_SO_EXTREMO": 1}.get(faixa, 0)
+    if favorito_nao_vencendo(m):
+        base += 6 if faixa in {"SUPER_FAVORITO", "FAVORITO_FORTE"} else 3
+    elif lado_vencendo(m) == fav:
+        gc, gf = extrair_gols_placar(m.placar)
+        if gc is not None and gf is not None and abs(gc - gf) >= 2:
+            base -= 5
+
+    elite_bonus, _ = bonus_time_elite_transicao(m)
+    base += elite_bonus
+    return clamp(base, -8, 22)
+
+
+def score_relogio(m: Metricas) -> int:
+    if eh_ht(m.estrategia):
+        if 18 <= m.tempo <= 35:
+            return 6
+        if m.tempo < 15:
+            return -4
+        return 1
+    if 62 <= m.tempo <= 80:
+        return 7
+    if 81 <= m.tempo <= 85:
+        return 3
+    if m.tempo > 85:
+        return -5
+    return 1
+
+
+def score_confirmacao(m: Metricas, chave: str) -> Tuple[int, str]:
+    if not eh_confirmacao(m.estrategia):
+        return 0, "NAO_E_CONFIRMACAO"
+    anterior = ultimas_leituras_por_jogo.get(chave)
+    if not anterior:
+        return 2, "CONFIRMACAO_SEM_HISTORICO"
+    old: Metricas = anterior.get("metricas")  # type: ignore
+    if not old:
+        return 2, "CONFIRMACAO_SEM_METRICAS_ANTERIORES"
+
+    lado = m.lado_pressionante if m.lado_pressionante in {"CASA", "FORA"} else m.lado_favorito
+    if lado not in {"CASA", "FORA"}:
+        return 1, "CONFIRMACAO_SEM_LADO"
+
+    pontos = 0
+    motivos = []
+    for campo, peso in (("ataques_perigosos", 2), ("cantos", 2), ("chance_golo", 3), ("remates_lado", 1), ("remates_baliza", 2)):
+        if valor_lado(m, campo, lado) > valor_lado(old, campo, lado):
+            pontos += peso
+            motivos.append(f"{campo}_subiu")
+    if ip_lado(m, lado)["pico"] >= ip_lado(old, lado)["pico"]:
+        pontos += 2
+        motivos.append("ip_manteve_ou_subiu")
+    if favorito_nao_vencendo(m):
+        pontos += 2
+        motivos.append("favorito_ainda_nao_resolveu")
+    return clamp(pontos, 0, 12), "+".join(motivos) if motivos else "CONFIRMACAO_FRACA"
+
+
+def aplicar_travas_finais(m: Metricas, score: int) -> Tuple[int, str, bool]:
+    lado = m.lado_pressionante
+    if m.liga == "PERIGOSA":
+        return min(score, 74), "LIGA_PERIGOSA", True
+    if vermelho_contra_pressionante(m):
+        return min(score, 76), "VERMELHO_CONTRA_PRESSIONANTE", True
+    if lado not in {"CASA", "FORA"}:
+        return min(score, 72), "SEM_LADO_PRESSIONANTE", True
+    if pressao_morta_lado(m, lado):
+        return min(score, 74), "PRESSAO_MORTA", True
+    if not consequencia_real_lado(m, lado):
+        # Exceção para super favorito não vencendo com IP absurdo.
+        if not (m.odd_favorito <= 1.30 and favorito_nao_vencendo(m) and pressao_extrema_lado(m, lado)):
+            return min(score, 76), "SEM_CONSEQUENCIA_REAL", True
+    d = dados_lado(m, lado)
+    ip = ip_lado(m, lado)
+    if ip["pico"] >= 24 and d["chance"] <= 3 and d["rb"] == 0 and d["rl"] <= 2 and d["xg"] < 0.25:
+        return min(score, 76), "FAKE_PRESSURE_IP_SEM_CONSEQUENCIA", True
+    if m.valor_pos_evento_classe == "PRESSAO_PREMIADA_MORREU":
+        return min(score, 74), "PRESSAO_PREMIADA_MORREU", True
+    return score, "SEM_TRAVA_FINAL", False
+
+
+
+# =========================================================
+# FUNIL OBRIGATÓRIO HÍBRIDO
+# =========================================================
+def funil_obrigatorio_hibrido(m: Metricas) -> Tuple[bool, int, str, Dict[str, Any]]:
+    """Portão antes do score aditivo.
+
+    Preserva a filosofia central do ALFA antigo: RADAR → VALIDAÇÃO → TRAVAS → CLASSIFICAÇÃO.
+    O rebuild continua limpo, mas não deixa um jogo mediano somar pontos soltos
+    sem provar pressão, consequência, lado e valor contextual mínimo.
+    """
+    lado = m.lado_pressionante
+    detalhes: Dict[str, Any] = {}
+
+    if m.liga == "PERIGOSA":
+        return False, 72, "FUNIL_LIGA_PERIGOSA", detalhes
+    if lado not in {"CASA", "FORA"}:
+        return False, 72, "FUNIL_SEM_LADO_PRESSIONANTE", detalhes
+    if vermelho_contra_pressionante(m):
+        return False, 74, "FUNIL_VERMELHO_CONTRA_PRESSIONANTE", detalhes
+
+    pressao = pressao_viva_lado(m, lado)
+    consequencia = consequencia_real_lado(m, lado)
+    extremo = pressao_extrema_lado(m, lado)
+    fav_nao_vence = favorito_nao_vencendo(m) and m.lado_favorito == lado
+    super_fav = bool(m.odd_favorito and m.odd_favorito <= 1.30 and fav_nao_vence)
+    valor_forte = m.valor_pos_evento_classe in {
+        "GOL_CONTRA_FLUXO_VALORIZA",
+        "FAVORITO_NAO_VENCE_PRESSAO_SUSTENTADA",
+        "PRESSAO_PREMIADA_MAS_CONTINUA",
+    }
+
+    detalhes.update({
+        "pressao_viva": pressao,
+        "consequencia": consequencia,
+        "pressao_extrema": extremo,
+        "favorito_nao_vence": fav_nao_vence,
+        "super_favorito_nao_vence": super_fav,
+        "valor_pos_evento_forte": valor_forte,
+    })
+
+    if pressao_morta_lado(m, lado):
+        return False, 74, "FUNIL_PRESSAO_MORTA", detalhes
+
+    emocional_vivo, motivo_emocional = contexto_emocional_vivo(m, lado)
+    consequencia_minima = consequencia_minima_emocional(m, lado)
+    detalhes["contexto_emocional_vivo"] = emocional_vivo
+    detalhes["motivo_emocional"] = motivo_emocional
+    detalhes["consequencia_minima_emocional"] = consequencia_minima
 
     if not emocional_vivo:
-        return False, 78, motivo_emocional
-
-    bloqueia_gol, teto_gol, motivo_gol = trava_pos_gol_institucional(metricas, estrategia, lado)
-    metricas["motivo_pos_gol_institucional"] = motivo_gol
-    if bloqueia_gol:
-        return False, teto_gol, motivo_gol
-
-    # Para bots normais, exigir anomalia de valor; não basta parecer razoável.
-    if perfil == "RADAR_ABERTO":
-        anomalia = (
-            q["pressao_recente"] >= 2
-            and q["continuidade"] >= 2
-            and q["consequencia"] >= 2
-            and (chance >= 8 or dados["u10"] >= 8 or dados["rb"] >= 2 or dados["remates"] >= 5)
-        )
-        if not anomalia:
-            return False, 82, "BOT_ABERTO_SEM_ANOMALIA_PREMIUM"
-
-    # Confirmação precisa provar manutenção/melhora real.
-    # BUG-05 corrigido: CONFIRMACAO_ESTAVEL também é válido — pressão sustentada forte
-    # conta como confirmação legítima, não apenas quando melhorou.
-    if eh_confirmacao(estrategia):
-        d, md = score_delta_confirmacao(metricas, estrategia, chave_jogo)
-        metricas["delta_confirmacao_funil"] = d
-        metricas["motivo_delta_contextual"] = md
-        motivos_validos = ["CONFIRMACAO_MELHOROU", "CONFIRMACAO_ESTAVEL"]
-        if md not in motivos_validos and metricas.get("motivo_pos_gol_institucional") != "CONFIRMACAO_VALIDOU_MASSACRE_POS_GOL":
-            return False, 82, "CONFIRMACAO_SEM_MELHORA_REAL"
-
-    return True, 99, "FUNIL_APROVADO"
-
-
-def score_classificacao_institucional(metricas, estrategia):
-    """Pontuação limitada após o funil aprovar.
-
-    Aqui não há soma livre. A nota classifica qualidade, não cria aprovação do nada.
-    """
-    perfil = metricas.get("perfil_origem", perfil_origem_estrategia(estrategia))
-    lado = metricas.get("lado_alvo", "DESCONHECIDO")
-    q = metricas.get("qualidade_lado_alvo") or qualidade_pressao_lado(metricas, estrategia, lado)
-    dados = q["dados"]
-    ip = q["ip"]
-    chance = q["chance"]
-
-    if perfil == "RADAR_CONFIAVEL":
-        score = 80
-    elif perfil == "CONFIRMACAO":
-        score = 82
-    else:
-        score = 76
-
-    # Pressão recente e continuidade valem mais que acumulado.
-    score += min(q["pressao_recente"] * 3, 10)
-    score += min(q["continuidade"] * 3, 10)
-    score += min(q["consequencia"] * 3, 12)
-
-    # Continuidade IP ponderada — filosofia central do sistema ALFA.
-    # IP contínuo com consequência vale mais que pico isolado.
-    cont_ip = score_continuidade_ip(metricas, estrategia)
-    score += int(min(cont_ip, 20))  # cap de 20 dentro do score total
-
-    if dados["u5"] >= 6:
-        score += 3
-    if dados["u10"] >= 10:
-        score += 3
-    if ip["c22"] >= 3:
-        score += 4
-    if ip["ip_pico"] >= 30 and ip["c18"] >= 3:
-        score += 3
-    if chance >= 10:
-        score += 4
-    elif chance >= 8:
-        score += 2
-    if dados["rb"] >= 3:
-        score += 3
-    if dados["xg"] >= 0.60:
-        score += 3
-
-    # Contexto emocional/valor.
-    fav, odd_fav = lado_favorito(metricas)
-    perdendo = lado_perdendo(metricas)
-    vencendo = lado_vencendo(metricas)
-    if lado == fav and perdendo == fav:
-        score += 5
-    elif lado == fav and vencendo == "EMPATE":
-        score += 3
-
-    # Odds parelhas com domínio real = edge de mercado; favorito baixo não dá bônus direto.
-    oc, oe, of = metricas.get("odds", (0, 0, 0))
-    if oc and of:
-        odds_parelhas = min(oc, of) >= 1.65 and max(oc, of) <= 4.5
-        if odds_parelhas and perfil == "RADAR_ABERTO" and q["pressao_recente"] >= 2 and q["consequencia"] >= 2:
-            score += 5
-            metricas["valor_mercado_contextual"] = "ODDS_PARELHAS_COM_DOMINIO_AO_VIVO"
-        else:
-            metricas["valor_mercado_contextual"] = "SEM_BONUS_ODD"
-
-    # Liga e relógio entram como ajuste, não como aprovação.
-    score += liga_score(metricas, "gol")
-    score += int(relogio_score(metricas, estrategia) * 0.5)
-
-    # Score de confiança separado.
-    confianca = 50
-    confianca += q["pressao_recente"] * 8
-    confianca += q["continuidade"] * 7
-    confianca += q["consequencia"] * 8
-    if metricas.get("motivo_emocional") in ["FT_PLACAR_ABERTO", "FAVORITO_ATRAS_DO_PLACAR", "HT_CONTEXTO_VIVO"]:
-        confianca += 8
-    if metricas.get("motivo_pos_gol_institucional") in ["PRESSAO_PREMIADA_BLOQUEIO", "MASSACRE_POS_GOL_AGUARDAR_CONFIRMACAO"]:
-        confianca -= 20
-    metricas["score_confianca_contextual"] = int(max(0, min(confianca, 99)))
-
-    # Classificação institucional: 93+ é raro.
-    if score >= 93:
-        absurdo = (
-            q["pressao_recente"] >= 3
-            and q["continuidade"] >= 3
-            and q["consequencia"] >= 3
-            and (dados["rb"] >= 3 or chance >= 12 or dados["xg"] >= 0.75)
-        )
-        if not absurdo:
-            score = 92
-
-    # Bots abertos só chegam alto com anomalia verdadeira.
-    if perfil == "RADAR_ABERTO" and score >= 90:
-        if not (q["pressao_recente"] >= 2 and q["continuidade"] >= 2 and q["consequencia"] >= 3):
-            score = 87
-
-    return int(max(0, min(score, 95)))
-
-
-# =========================================================
-# SCORE DE GOL
-# =========================================================
-
-def favorito_score(metricas):
-    # Bônus reduzido — odds favorita não pode dominar o score sozinha.
-    # Pressão real deve ser o motor principal, não a disparidade de odds.
-    bonus = 0
-    odds = metricas.get("odds", (0, 0, 0))
-    if not isinstance(odds, (tuple, list)) or len(odds) < 3:
-        return 0
-
-    for odd in [odds[0], odds[2]]:
-        if not odd:
-            continue
-        if odd <= 1.35:
-            bonus += 7
-        elif odd <= 1.50:
-            bonus += 5
-        elif odd <= 1.70:
-            bonus += 3
-        elif odd <= 2.00:
-            bonus += 1
-
-    return min(bonus, 8)
-
-
-def score_continuidade_ip(metricas, estrategia):
-    """Pontuação de IP contínuo com consequência obrigatória.
-
-    Filosofia central do sistema ALFA:
-    IP contínuo por 5+ minutos vale mais do que pico isolado de 25-30.
-    Mas IP contínuo SÓ conta se vier acompanhado de consequência real
-    (remate à baliza, xG, chance de golo).
-
-    Usa dados do lado dominante — não soma os dois times.
-    """
-    p = metricas.get("pressao_alfa", {})
-    dom = metricas.get("lado_dominante", "EQUILIBRADO")
-
-    if dom == "CASA":
-        c10 = p.get("ip_consec_10_casa", 0)
-        c15 = p.get("ip_consec_15_casa", 0)
-        c18 = p.get("ip_consec_18_casa", 0)
-        c22 = p.get("ip_consec_22_casa", 0)
-        rb   = metricas.get("remates_baliza", (0, 0))[0]
-        rda  = metricas.get("remates_dentro_area", (0, 0))[0]
-        xg   = metricas.get("xg", (0.0, 0.0))[0]
-        chance = metricas.get("chance_golo", (0, 0))[0]
-    elif dom == "FORA":
-        c10 = p.get("ip_consec_10_fora", 0)
-        c15 = p.get("ip_consec_15_fora", 0)
-        c18 = p.get("ip_consec_18_fora", 0)
-        c22 = p.get("ip_consec_22_fora", 0)
-        rb   = metricas.get("remates_baliza", (0, 0))[1]
-        rda  = metricas.get("remates_dentro_area", (0, 0))[1]
-        xg   = metricas.get("xg", (0.0, 0.0))[1]
-        chance = metricas.get("chance_golo", (0, 0))[1]
-    else:
-        # Equilibrado: usa max dos dois lados
-        c10 = max(p.get("ip_consec_10_casa", 0), p.get("ip_consec_10_fora", 0))
-        c15 = max(p.get("ip_consec_15_casa", 0), p.get("ip_consec_15_fora", 0))
-        c18 = max(p.get("ip_consec_18_casa", 0), p.get("ip_consec_18_fora", 0))
-        c22 = max(p.get("ip_consec_22_casa", 0), p.get("ip_consec_22_fora", 0))
-        rb     = sum(metricas.get("remates_baliza", (0, 0)))
-        rda    = sum(metricas.get("remates_dentro_area", (0, 0)))
-        xg     = sum(metricas.get("xg", (0.0, 0.0)))
-        chance = max(metricas.get("chance_golo", (0, 0)))
-
-    # Score de continuidade ponderado:
-    # c10 × 1.0 + c15 × 1.5 + c18 × 2.0 + c22 × 3.0
-    # IP moderado contínuo (c15=6min) vale mais que pico isolado de 30
-    score_cont = (
-        c10 * 1.0 +
-        c15 * 1.5 +
-        c18 * 2.0 +
-        c22 * 3.0
-    )
-
-    # Consequência obrigatória — sem ela, IP contínuo é território sem ruptura
-    tem_consequencia = rb >= 1 or rda >= 1 or xg >= 0.25 or chance >= 5
-    if not tem_consequencia:
-        score_cont *= 0.25  # penaliza forte — pressão sem finalização
-        metricas["continuidade_ip_motivo"] = "SEM_CONSEQUENCIA_PENALIZADO"
-    else:
-        metricas["continuidade_ip_motivo"] = "COM_CONSEQUENCIA_VALIDADO"
-
-    # Bônus extra quando continuidade é excepcional
-    bonus = 0
-    if c22 >= 3 and rb >= 2:
-        bonus = 8   # pressão dominante de alto nível com finalização
-    elif c18 >= 4 and rb >= 1:
-        bonus = 5
-    elif c15 >= 6 and tem_consequencia:
-        bonus = 3
-
-    resultado = min(score_cont + bonus, 35)  # cap de 35 para não dominar o score
-    metricas["score_continuidade_ip"] = round(resultado, 1)
-    return resultado
-
-
-
-    p = metricas.get("pressao_alfa", {})
-    ch_c, ch_f = metricas.get("chance_golo", (0, 0))
-
-    # LOGIC-02 corrigido: usa dados do lado dominante (lado alvo),
-    # não o máximo entre os dois lados — evita bônus ALFA indo para o lado errado.
-    dom = metricas.get("lado_dominante") or metricas.get("_cache_dom", ("EQUILIBRADO",))[0] if isinstance(metricas.get("_cache_dom"), tuple) else "EQUILIBRADO"
-    # fallback: recalcula se não estiver cacheado
-    if not dom or dom == "EQUILIBRADO":
-        dom, _ = lado_dominante(metricas)
-
-    if dom == "CASA":
-        ip_pico  = p.get("ip_pico_casa", 0)
-        c15      = p.get("ip_consec_15_casa", 0)
-        c18      = p.get("ip_consec_18_casa", 0)
-        c22      = p.get("ip_consec_22_casa", 0)
-        chance   = ch_c
-    elif dom == "FORA":
-        ip_pico  = p.get("ip_pico_fora", 0)
-        c15      = p.get("ip_consec_15_fora", 0)
-        c18      = p.get("ip_consec_18_fora", 0)
-        c22      = p.get("ip_consec_22_fora", 0)
-        chance   = ch_f
-    else:
-        # Equilibrado: mantém comportamento original com max
-        ip_pico  = max(p.get("ip_pico_casa", 0), p.get("ip_pico_fora", 0))
-        c15      = max(p.get("ip_consec_15_casa", 0), p.get("ip_consec_15_fora", 0))
-        c18      = max(p.get("ip_consec_18_casa", 0), p.get("ip_consec_18_fora", 0))
-        c22      = max(p.get("ip_consec_22_casa", 0), p.get("ip_consec_22_fora", 0))
-        chance   = max(ch_c, ch_f)
-
-    # Bônus extra quando dominância e maior chance coincidem no mesmo lado
-    lado_chance = "CASA" if ch_c >= ch_f else "FORA"
-    extra = 3 if dom == lado_chance and dom != "EQUILIBRADO" else 0
-
-    if c15 < 5:
-        if ip_pico >= 22 and chance >= 10:
-            return 8 + extra, "ALFA_OBSERVACAO_SEM_CONTINUIDADE"
-        return 0, "SEM_PADRAO_ALFA"
-
-    if eh_ft(estrategia):
-        if c22 >= 3 and chance >= 14:
-            return 30 + extra, "ALFA_FT_DIAMANTE"
-        if c18 >= 3 and chance >= 10:
-            return 26 + extra, "ALFA_FT_FORTE"
-        if chance >= 8:
-            return 20 + extra, "ALFA_FT_BASE"
-        return 12 + extra, "ALFA_FT_PRESSAO_SEM_CHANCE"
-
-    if eh_ht(estrategia):
-        if c22 >= 3 and chance >= 10:
-            return 30 + extra, "ALFA_HT_DIAMANTE"
-        if c18 >= 3 and chance >= 6:
-            return 26 + extra, "ALFA_HT_FORTE"
-        if chance >= 5:
-            return 18 + extra, "ALFA_HT_BASE"
-        return 10 + extra, "ALFA_HT_PRESSAO_SEM_CHANCE"
-
-    return 0, "SEM_PADRAO_ALFA"
-
-
-def dominio_score_gol(metricas):
-    # LOGIC-03 corrigido: métricas do lado dominante têm peso maior que o lado passivo.
-    # Antes: somava tudo dos dois lados — jogo equilibrado pontuava igual a unidirecional.
-    # Agora: lado dominante contribui 70%, lado passivo 30% — favorece pressão unidirecional.
-    apc, apf = metricas.get("ataques_perigosos", (0, 0))
-    rbc, rbf = metricas.get("remates_baliza", (0, 0))
-    rlc, rlf = metricas.get("remates_lado", (0, 0))
-    rdac, rdaf = metricas.get("remates_dentro_area", (0, 0))
-    cc, cf = metricas.get("cantos", (0, 0))
-    atc, atf = metricas.get("ataques", (0, 0))
-    hc, hf = metricas.get("heatmap", (0, 0))
-    chc, chf = metricas.get("chance_golo", (0, 0))
-    xgc, xgf = metricas.get("xg", (0, 0))
-    xic, xif = metricas.get("xgi", (0, 0))
-    p = metricas.get("pressao_alfa", {})
-
-    dom = metricas.get("lado_dominante", "EQUILIBRADO")
-    if not dom or dom == "EQUILIBRADO":
-        dom, _ = lado_dominante(metricas)
-
-    # Pesos: lado dominante = 0.70, lado passivo = 0.30
-    if dom == "CASA":
-        ap   = apc * 0.70 + apf * 0.30
-        rb   = rbc * 0.70 + rbf * 0.30
-        rl   = rlc * 0.70 + rlf * 0.30
-        rda  = rdac * 0.70 + rdaf * 0.30
-        cant = cc  * 0.70 + cf  * 0.30
-        at   = atc * 0.70 + atf * 0.30
-        xg   = xgc * 0.70 + xgf * 0.30
-        xgi  = xic * 0.70 + xif * 0.30
-        ip_pico = p.get("ip_pico_casa", 0)
-        ip18    = p.get("ip_consec_18_casa", 0)
-        ip22    = p.get("ip_consec_22_casa", 0)
-    elif dom == "FORA":
-        ap   = apf * 0.70 + apc * 0.30
-        rb   = rbf * 0.70 + rbc * 0.30
-        rl   = rlf * 0.70 + rlc * 0.30
-        rda  = rdaf * 0.70 + rdac * 0.30
-        cant = cf  * 0.70 + cc  * 0.30
-        at   = atf * 0.70 + atc * 0.30
-        xg   = xgf * 0.70 + xgc * 0.30
-        xgi  = xif * 0.70 + xic * 0.30
-        ip_pico = p.get("ip_pico_fora", 0)
-        ip18    = p.get("ip_consec_18_fora", 0)
-        ip22    = p.get("ip_consec_22_fora", 0)
-    else:
-        # Equilibrado: comportamento original com soma simples
-        ap   = apc + apf
-        rb   = rbc + rbf
-        rl   = rlc + rlf
-        rda  = rdac + rdaf
-        cant = cc + cf
-        at   = atc + atf
-        xg   = xgc + xgf
-        xgi  = xic + xif
-        ip_pico = max(p.get("ip_pico_casa", 0), p.get("ip_pico_fora", 0))
-        ip18    = max(p.get("ip_consec_18_casa", 0), p.get("ip_consec_18_fora", 0))
-        ip22    = max(p.get("ip_consec_22_casa", 0), p.get("ip_consec_22_fora", 0))
-
-    score = 0
-
-    if ip_pico >= 18:
-        score += 3
-    if ip_pico >= 22:
-        score += 4
-    if ip18 >= 3:
-        score += 4
-    if ip22 >= 3:
-        score += 5
-
-    if ap >= 18:
-        score += 3
-    if ap >= 25:
-        score += 3
-    if ap >= 35:
-        score += 3
-
-    if abs(apc - apf) >= 10:
-        score += 4
-    if abs(apc - apf) >= 18:
-        score += 3
-
-    if at >= 70:
-        score += 2
-    if at >= 95:
-        score += 2
-
-    if rb >= 2:
-        score += 4
-    if rb >= 3:
-        score += 4
-    if rb >= 5:
-        score += 4
-
-    if rda >= 2:
-        score += 3
-    if rda >= 4:
-        score += 4
-
-    if rl >= 5:
-        score += 2
-    if rl >= 8:
-        score += 2
-
-    if abs(rbc - rbf) >= 3 and rb >= 3:
-        score += 3
-
-    if cant >= 5:
-        score += 1
-    if cant >= 8:
-        score += 1
-
-    if abs(hc - hf) >= 25:
-        score += 2
-
-    if abs(chc - chf) >= 5:
-        score += 3
-
-    if xg >= 0.35:
-        score += 2
-    if xg >= 0.55:
-        score += 3
-    if xg >= 1:
-        score += 3
-
-    if xgi >= 1.5:
-        score += 2
-    if xgi >= 2.3:
-        score += 2
-
-    return score
-
-
-def momentum_score(metricas):
-    # Corrigido: usa dados do lado dominante, não soma dos dois times.
-    # Desequilíbrio entre os lados é bônus separado.
-    u5c, u5f = metricas.get("ultimos5", (0, 0))
-    u10c, u10f = metricas.get("ultimos10", (0, 0))
-
-    dom = metricas.get("lado_dominante", "EQUILIBRADO")
-    if not dom or dom == "EQUILIBRADO":
-        dom, _ = lado_dominante(metricas)
-
-    if dom == "CASA":
-        u5, u10 = u5c, u10c
-    elif dom == "FORA":
-        u5, u10 = u5f, u10f
-    else:
-        u5, u10 = u5c + u5f, u10c + u10f
-
-    score = 0
-
-    if u5 >= 3: score += 3
-    if u5 >= 5: score += 4
-    if u5 >= 8: score += 2
-
-    if u10 >= 7:  score += 4
-    if u10 >= 10: score += 3
-    if u10 >= 14: score += 2
-
-    # Bônus de desequilíbrio — lado dominante muito mais ativo que o passivo
-    if abs(u10c - u10f) >= 4: score += 3
-    if abs(u5c - u5f) >= 3:   score += 2
-
-    return score
-
-
-def relogio_score(metricas, estrategia):
-    t = metricas["tempo"]
-
-    if eh_ht(estrategia):
-        if 18 <= t <= 30:
-            return 8
-        if 31 <= t <= 36:
-            return 5
-        if 37 <= t <= 38:
-            return -2
-        if t < 18:
-            return -10
-        return -6
-
-    if eh_ft(estrategia):
-        if 65 <= t <= 77:
-            return 8    # janela operacional principal — sem penalidade
-        if 78 <= t <= 81:
-            return 3    # ainda aceitável
-        if 82 <= t <= 83:
-            return -4   # penalidade começa aqui
-        if 84 <= t <= 86:
-            return -8
-        if t >= 87:
-            return -14
-        if t < 63:
-            return -6
-        return 2
-
-    return 0
-
-
-def ajuste_vermelho_contextual(metricas):
-    liga = metricas.get("_cache_liga") or classificar_liga(metricas.get("competicao", ""))
-    vermelho = lado_com_vermelho(metricas)
-    dom = metricas.get("lado_dominante", "EQUILIBRADO")
-    fav = metricas.get("lado_favorito", "DESCONHECIDO")
-    zebra = lado_zebra(metricas)
-
-    if vermelho in ["NENHUM", "AMBOS"] or dom == "EQUILIBRADO":
-        return 0, "SEM_VERMELHO_RELEVANTE"
-
-    peso = 1.25 if liga == "PREMIUM" else 0.55 if liga == "PERIGOSA" else 1
-
-    if vermelho != dom and pressao_viva(metricas):
-        bonus = int(7 * peso)
-        if dom == zebra:
-            bonus += int(3 * peso)
-        if vermelho == fav:
-            bonus += int(2 * peso)
-        return bonus, "VERMELHO_ABRIU_PRESSAO"
-
-    if vermelho == dom:
-        return -6, "VERMELHO_NO_LADO_PRESSAO"
-
-    return 0, "SEM_AJUSTE_VERMELHO"
-
-
-def ajuste_gol_recente_contextual(metricas, estrategia):
-    tempo = metricas["tempo"]
-    ultimo_gol = metricas["ultimo_gol"]
-    lado = metricas.get("ultimo_gol_lado", "DESCONHECIDO")
-
-    if ultimo_gol <= 0:
-        return 0, "SEM_GOL_RECENTE"
-
-    minutos = tempo - ultimo_gol
-
-    if minutos < 0:
-        return -14, "GOL_INCONSISTENTE"
-
-    dom, _ = lado_dominante(metricas)
-    pressionado = lado_sofrendo_pressao(metricas)
-    fav, _ = lado_favorito(metricas)
-    zebra = lado_zebra(metricas)
-    vivo = pressao_viva(metricas)
-    lado_pressao = lado_pressao_principal(metricas, estrategia)
-
-    # Confirmação com gol recente: regra central.
-    # Se o time que justificava a pressão/necessidade marcou nos últimos 5 min,
-    # a pressão foi premiada e a entrada tardia perde valor.
-    # HT: trava na risca.
-    # FT: exceção somente para gol de empate com tendência real de virada.
-    if eh_confirmacao(estrategia) and minutos <= 5:
-        if lado != "DESCONHECIDO":
-            gol_do_lado_que_pressao = lado in [dom, lado_pressao]
-
-            if gol_do_lado_que_pressao:
-                if eh_ft(estrategia) and gol_empate_ft_com_virada_potencial(metricas, lado, dom=dom, fav=fav):
-                    return 10, "GOL_EMPATE_FT_ABRIU_VIRADA"
-                return -40, "TRAVA_CONFIRMACAO_PRESSAO_PREMIADA_5M"
-
-            if lado == pressionado and dom != "EQUILIBRADO" and vivo:
-                return 14, "GOL_TIME_PRESSIONADO_ABRIU_JOGO"
-            if lado == zebra and dom == fav and vivo:
-                return 16, "GOL_ZEBRA_CONTRA_FLUXO"
-
-        return -22, "TRAVA_CONFIRMACAO_GOL_RECENTE_5M"
-
-    if minutos <= 2:
-        if lado != "DESCONHECIDO":
-            if lado == pressionado and dom != "EQUILIBRADO" and vivo:
-                return 10, "GOL_TIME_PRESSIONADO_ABRIU_JOGO"
-            if lado == zebra and dom == fav and vivo:
-                return 12, "GOL_ZEBRA_CONTRA_FLUXO"
-            if lado == dom:
-                # Só penaliza se o gol colocou o time na frente ou aumentou vantagem.
-                # Se empatou ou ainda está perdendo, o time continua com necessidade de atacar.
-                gc, gf = extrair_gols_placar(metricas.get("placar", ""))
-                if gc is not None:
-                    gols_dom = gc if lado == "CASA" else gf
-                    gols_adv = gf if lado == "CASA" else gc
-                    if gols_dom > gols_adv:
-                        return -16, "PRESSAO_PREMIADA_RECENTE"
-                    else:
-                        return 0, "GOL_EMPATE_OU_AINDA_PERDENDO"
-                return -16, "PRESSAO_PREMIADA_RECENTE"
-        return -8, "GOL_RECENTE_SEM_CONFIRMACAO"
-
-    if minutos <= 5:
-        if lado != "DESCONHECIDO":
-            if lado == pressionado and dom != "EQUILIBRADO" and vivo:
-                return 8, "GOL_TIME_PRESSIONADO_ABRIU_JOGO"
-            if lado == zebra and dom == fav and vivo:
-                return 10, "GOL_ZEBRA_CONTRA_FLUXO"
-            if lado == dom:
-                # Mesma lógica: só penaliza se ficou na frente
-                gc, gf = extrair_gols_placar(metricas.get("placar", ""))
-                if gc is not None:
-                    gols_dom = gc if lado == "CASA" else gf
-                    gols_adv = gf if lado == "CASA" else gc
-                    if gols_dom > gols_adv:
-                        if not vivo:
-                            return -12, "PRESSAO_PREMIADA_MORREU"
-                        return -5, "PRESSAO_PREMIADA_MAS_VIVA"
-                    else:
-                        return 0, "GOL_EMPATE_OU_AINDA_PERDENDO"
-                if not vivo:
-                    return -12, "PRESSAO_PREMIADA_MORREU"
-                return -5, "PRESSAO_PREMIADA_MAS_VIVA"
-        return -4, "GOL_RECENTE_CAUTELA"
-
-    if minutos <= 10:
-        if lado != "DESCONHECIDO":
-            if lado == pressionado and dom != "EQUILIBRADO" and vivo:
-                return 5, "GOL_CONTRA_FLUXO_CONTEXTO_BOM"
-            if lado == zebra and dom == fav and vivo:
-                return 7, "GOL_ZEBRA_ABRIU_JOGO"
-            if lado == fav and dom != lado and vivo:
-                return 3, "FAVORITO_MARCOU_MAS_OPONENTE_PRESSIONA"
-            if lado == dom and not vivo:
-                return -6, "GOL_MATOU_RITMO"
-
-    if minutos > 10 and lado != "DESCONHECIDO" and dom != lado and vivo:
-        return 3, "PRESSAO_POS_GOL_VALIDADA"
-
-    return 0, "GOL_ANTIGO_OK"
-
-def fake_pressure_penalty_gol(metricas):
-    # Corrigido: usa dados do lado dominante em vez de soma dos dois times.
-    # Evita penalizar jogo onde só um lado tem volume real.
-    dom = metricas.get("lado_dominante", "EQUILIBRADO")
-    idx = 0 if dom == "CASA" else 1 if dom == "FORA" else None
-
-    def lado_val(campo, fallback=0):
-        v = metricas.get(campo, (fallback, fallback))
-        if idx is not None and isinstance(v, (tuple, list)) and len(v) > idx:
-            return v[idx]
-        return sum(v) if isinstance(v, (tuple, list)) else fallback
-
-    ap  = lado_val("ataques_perigosos")
-    rb  = lado_val("remates_baliza")
-    rl  = lado_val("remates_lado")
-    rda = lado_val("remates_dentro_area")
-    u5  = lado_val("ultimos5")
-    u10 = lado_val("ultimos10")
-    xg  = lado_val("xg")
-    xgi = lado_val("xgi")
-    cant = lado_val("cantos")
-    hc, hf = metricas.get("heatmap", (0, 0))
-    padrao = metricas.get("padrao_alfa", "")
-
-    pen = 0
-
-    if ap >= 25 and rb <= 1:
-        pen -= 8
-    if ap >= 18 and rb == 0:
-        pen -= 12
-    if ap >= 25 and rl <= 2 and rb <= 1:
-        pen -= 6
-    if u10 <= 3 and u5 <= 1:
-        pen -= 8
-    if ap >= 25 and xg <= 0.20:
-        pen -= 8
-    if ap >= 25 and xg <= 0.35 and xgi <= 0.60 and rb <= 1:
-        pen -= 6
-    if cant >= 4 and rb <= 1 and xg <= 0.35:
-        pen -= 6
-    if rda == 0 and rb <= 1 and ap >= 20:
-        pen -= 5
-
-    # Fake pressure sofisticada: território/heatmap/ataques sem ruptura.
-    if ap >= 35 and rb == 0 and rda == 0 and xg < 0.35:
-        pen -= 12
-    if abs(hc - hf) >= 18 and rb <= 1 and rda == 0 and xg < 0.35:
-        pen -= 6
-    if u5 <= 2 and u10 <= 6 and ap >= 30 and rb <= 1:
-        pen -= 6
-
-    if padrao in ["ALFA_FT_DIAMANTE", "ALFA_HT_DIAMANTE", "ALFA_FT_FORTE", "ALFA_HT_FORTE", "ALFA_FT_BASE", "ALFA_HT_BASE"]:
-        pen = int(pen * 0.55)
-
-    return pen
-
-
-def score_delta_confirmacao(metricas, estrategia, chave_jogo):
-    if not eh_confirmacao(estrategia):
-        return 0, "SEM_DELTA"
-
-    leitura_anterior = ultimas_leituras_por_jogo.get(chave_jogo, {})
-    ant = leitura_anterior.get("metricas", {})
-    if not ant:
-        return 0, "SEM_LEITURA_ANTERIOR"
-
-    idade = time.time() - leitura_anterior.get("recebido_em", 0)
-    if idade > MEMORIA_CONFIRMACAO_SEGUNDOS:
-        return 0, "LEITURA_ANTERIOR_EXPIRADA"
-
-    # Corrigido: compara métricas do lado dominante, não soma dos dois times.
-    # Evita validar confirmação onde só o lado passivo cresceu.
-    dom = metricas.get("lado_dominante", "EQUILIBRADO")
-    idx = 0 if dom == "CASA" else 1 if dom == "FORA" else None
-
-    def lado_val(campo, m, fallback=0):
-        v = m.get(campo, (fallback, fallback))
-        if idx is not None and isinstance(v, (tuple, list)) and len(v) > idx:
-            return v[idx]
-        return sum(v) if isinstance(v, (tuple, list)) else fallback
-
-    u5_atual  = lado_val("ultimos5",  metricas)
-    u10_atual = lado_val("ultimos10", metricas)
-    u5_ant    = lado_val("ultimos5",  ant)
-    u10_ant   = lado_val("ultimos10", ant)
-
-    rb_atual    = lado_val("remates_baliza",      metricas)
-    rb_ant      = lado_val("remates_baliza",      ant)
-    rda_atual   = lado_val("remates_dentro_area", metricas)
-    rda_ant     = lado_val("remates_dentro_area", ant)
-    cantos_atual = lado_val("cantos", metricas)
-    cantos_ant   = lado_val("cantos", ant)
-
-    p = metricas.get("pressao_alfa", {})
-    pa = ant.get("pressao_alfa", {})
-    nivel_atual = pressao_sustentada_nivel(metricas, estrategia)
-    ip_pico_atual = max(p.get("ip_pico_casa", 0), p.get("ip_pico_fora", 0))
-    ip_pico_ant = max(pa.get("ip_pico_casa", 0), pa.get("ip_pico_fora", 0))
-    c18_atual = max(p.get("ip_consec_18_casa", 0), p.get("ip_consec_18_fora", 0))
-    c18_ant = max(pa.get("ip_consec_18_casa", 0), pa.get("ip_consec_18_fora", 0))
-    c22_atual = max(p.get("ip_consec_22_casa", 0), p.get("ip_consec_22_fora", 0))
-    c22_ant = max(pa.get("ip_consec_22_casa", 0), pa.get("ip_consec_22_fora", 0))
-
-    score = 0
-
-    # Confirmação institucional: não basta o acumulado subir.
-    # Precisa existir melhora real no RECENTE ou produção ofensiva nova com pressão ainda viva.
-    recente_melhorou = u5_atual >= u5_ant + 2 or u10_atual >= u10_ant + 3
-    pressao_manteve_forte = nivel_atual in ["FORTE", "ELITE", "COLAPSO"] and u10_atual >= 7
-    pressao_subiu = ip_pico_atual >= ip_pico_ant + 4 or c18_atual > c18_ant or c22_atual > c22_ant
-    producao_subiu = rb_atual > rb_ant or rda_atual > rda_ant or cantos_atual > cantos_ant
-    producao_do_lado_certo = consequencia_ofensiva_lado(metricas, estrategia, lado_pressao_principal(metricas, estrategia))
-
-    if recente_melhorou:
-        score += 5
-    if pressao_subiu:
-        score += 3
-    if pressao_manteve_forte:
-        score += 3
-    if producao_subiu and (u5_atual >= 3 or u10_atual >= 7):
-        score += 4
-    if producao_do_lado_certo:
-        score += 2
-
-    if u5_atual <= max(1, u5_ant - 2):
-        score -= 5
-    if u10_atual <= max(1, u10_ant - 3):
-        score -= 5
-    if not producao_do_lado_certo and not pressao_subiu:
-        score -= 3
-
-    if score >= 8 and (recente_melhorou or pressao_subiu or (producao_subiu and pressao_manteve_forte)):
-        return score, "CONFIRMACAO_MELHOROU"
-
-    if score <= -4:
-        return score, "CONFIRMACAO_PIOROU"
-
-    return score, "CONFIRMACAO_ESTAVEL"
-
-
-# ATENÇÃO: ajuste_confianca_gol() NÃO é chamada no fluxo atual de score_gol().
-# Está preservada para análise/reativação futura (ver Grupo B da auditoria).
-# Para ativar: adicionar chamada em score_gol() e decidir onde aplicar no fluxo.
-def ajuste_confianca_gol(metricas, estrategia, score):
-    rb = sum(metricas["remates_baliza"])
-    rda = sum(metricas.get("remates_dentro_area", (0, 0)))
-    ap = sum(metricas["ataques_perigosos"])
-    u10 = sum(metricas["ultimos10"])
-    u5 = sum(metricas["ultimos5"])
-    xg = sum(metricas.get("xg", (0, 0)))
-    liga = classificar_liga(metricas.get("competicao", ""))
-    padrao = metricas.get("padrao_alfa", "")
-
-    red = 0.55 if padrao in ["ALFA_FT_DIAMANTE", "ALFA_HT_DIAMANTE", "ALFA_FT_FORTE", "ALFA_HT_FORTE", "ALFA_FT_BASE", "ALFA_HT_BASE"] else 1
-
-    if score >= 88 and rb <= 1:
-        score -= int(10 * red)
-    if score >= 85 and rb <= 1 and rda <= 1:
-        score -= int(7 * red)
-
-    if eh_ft(estrategia) and metricas["tempo"] >= 81 and u5 <= 2:
-        score -= 8
-    if eh_ft(estrategia) and rb == 0:
-        score -= int(8 * red)
-
-    if ap < 18:
-        score -= 5
-    if u10 < 5:
-        score -= 5
-    if xg <= 0.15 and rb <= 1:
-        score -= int(8 * red)
-
-    if liga == "UNDER" and score >= 84:
-        score -= 6
-
-    if liga == "PERIGOSA" and score >= 84:
-        score -= 8
-
-    return score
-
-
-def calcular_forca_premium_gol(metricas):
-    apc, apf = metricas["ataques_perigosos"]
-    atc, atf = metricas["ataques"]
-    rbc, rbf = metricas["remates_baliza"]
-    rdac, rdaf = metricas.get("remates_dentro_area", (0, 0))
-    u5c, u5f = metricas["ultimos5"]
-    u10c, u10f = metricas["ultimos10"]
-    chc, chf = metricas.get("chance_golo", (0, 0))
-    hc, hf = metricas.get("heatmap", (0, 0))
-    xgc, xgf = metricas.get("xg", (0, 0))
-    p = metricas.get("pressao_alfa", {})
-
-    pts = 0
-
-    if max(p.get("ip_consec_22_casa", 0), p.get("ip_consec_22_fora", 0)) >= 3:
-        pts += 2
-    if max(p.get("ip_consec_18_casa", 0), p.get("ip_consec_18_fora", 0)) >= 3:
-        pts += 1
-    if abs(apc - apf) >= 14:
-        pts += 1
-    if abs(atc - atf) >= 18:
-        pts += 1
-    if abs(rbc - rbf) >= 3 and rbc + rbf >= 3:
-        pts += 1
-    if rdac + rdaf >= 3:
-        pts += 1
-    if abs(u10c - u10f) >= 6 and u10c + u10f >= 8:
-        pts += 1
-    if abs(u5c - u5f) >= 4:
-        pts += 1
-    if abs(chc - chf) >= 5:
-        pts += 1
-    if xgc + xgf >= 0.55:
-        pts += 1
-    if abs(hc - hf) >= 22:
-        pts += 1
-
-    return pts
-
-
-def modelo_herta_aprovado(metricas, estrategia):
-    p = metricas.get("pressao_alfa", {})
-
-    c15 = max(p.get("ip_consec_15_casa", 0), p.get("ip_consec_15_fora", 0))
-    c18 = max(p.get("ip_consec_18_casa", 0), p.get("ip_consec_18_fora", 0))
-    c22 = max(p.get("ip_consec_22_casa", 0), p.get("ip_consec_22_fora", 0))
-    ip_pico = max(p.get("ip_pico_casa", 0), p.get("ip_pico_fora", 0))
-
-    u5c, u5f = metricas.get("ultimos5", (0, 0))
-    u10c, u10f = metricas.get("ultimos10", (0, 0))
-    u5 = u5c + u5f
-    u10 = u10c + u10f
-
-    apc, apf = metricas.get("ataques_perigosos", (0, 0))
-    rbc, rbf = metricas.get("remates_baliza", (0, 0))
-    rlc, rlf = metricas.get("remates_lado", (0, 0))
-    rdac, rdaf = metricas.get("remates_dentro_area", (0, 0))
-    chc, chf = metricas.get("chance_golo", (0, 0))
-    cc, cf = metricas.get("cantos", (0, 0))
-    xgc, xgf = metricas.get("xg", (0.0, 0.0))
-
-    rb = rbc + rbf
-    rl = rlc + rlf
-    rda = rdac + rdaf
-    chance_max = max(chc, chf)
-    xg = xgc + xgf
-    dif_ap = abs(apc - apf)
-    dif_u5 = abs(u5c - u5f)
-    dif_u10 = abs(u10c - u10f)
-    cant = cc + cf
-
-    dom, _ = lado_dominante(metricas)
-
-    placar_casa, placar_fora = extrair_gols_placar(metricas.get("placar", ""))
-    empate_ou_apertado = True
-    if placar_casa is not None:
-        empate_ou_apertado = abs(placar_casa - placar_fora) <= 1
-
-    pressao_sustentada = c15 >= 5
-    pressao_alta = c18 >= 3 or c22 >= 2 or ip_pico >= 24
-    recente_vivo = (u5 >= 5 and u10 >= 8) or (eh_ht(estrategia) and u5 >= 4 and u10 >= 7)
-    direcional = dif_u5 >= 4 or dif_u10 >= 6 or dif_ap >= 12 or dom in ["CASA", "FORA"]
-    producao = rb >= 3 or chance_max >= 10 or rda >= 3 or rl >= 7 or xg >= 0.50 or cant >= 5
-    contexto = empate_ou_apertado or metricas.get("motivo_gol_contextual") in [
-        "GOL_ZEBRA_CONTRA_FLUXO",
-        "GOL_TIME_PRESSIONADO_ABRIU_JOGO",
-        "GOL_CONTRA_FLUXO_CONTEXTO_BOM",
-        "FAVORITO_MARCOU_MAS_OPONENTE_PRESSIONA",
-    ]
-
-    if eh_ft(estrategia):
-        return pressao_sustentada and recente_vivo and direcional and producao and contexto
-
-    if eh_ht(estrategia):
-        return pressao_sustentada and (recente_vivo or pressao_alta) and (direcional or producao) and producao
-
-    return False
-
-
-# ATENÇÃO: aplicar_travas_herta() NÃO é chamada no fluxo atual de score_gol().
-# Está preservada para análise/reativação futura (ver Grupo B da auditoria).
-# Para ativar: adicionar chamada em score_gol() após aplicar_trava_consequencia_ofensiva().
-def aplicar_travas_herta(metricas, estrategia, score):
-    p = metricas.get("pressao_alfa", {})
-
-    c15 = max(p.get("ip_consec_15_casa", 0), p.get("ip_consec_15_fora", 0))
-    u5 = sum(metricas.get("ultimos5", (0, 0)))
-    u10 = sum(metricas.get("ultimos10", (0, 0)))
-    rb = sum(metricas.get("remates_baliza", (0, 0)))
-    rda = sum(metricas.get("remates_dentro_area", (0, 0)))
-    xg = sum(metricas.get("xg", (0.0, 0.0)))
-    chance_max = max(metricas.get("chance_golo", (0, 0)))
-    motivo = metricas.get("motivo_gol_contextual", "")
-
-    if not modelo_herta_aprovado(metricas, estrategia):
-        score = min(score, 84)
-
-    if c15 < 5:
-        score = min(score, 82)
-
-    if eh_ft(estrategia) and (u5 < 5 or u10 < 8):
-        score = min(score, 83)
-
-    if rb <= 1 and chance_max < 10 and xg < 0.45:
-        score = min(score, 82)
-
-    if rb == 0 and rda <= 1:
-        score = min(score, 78)
-
-    if motivo in ["PRESSAO_PREMIADA_RECENTE", "PRESSAO_PREMIADA_MORREU", "GOL_MATOU_RITMO"]:
-        score = min(score, 78)
-
-    if score >= 92:
-        if not (modelo_herta_aprovado(metricas, estrategia) and (u5 >= 7 or chance_max >= 14 or rb >= 5 or xg >= 0.75)):
-            score = min(score, 91)
-
-    return score
-
-
-def aplicar_travas_ht_elite(metricas, estrategia, score):
-    if not eh_ht(estrategia):
-        return score
-
-    tempo = metricas.get("tempo", 0)
-    p = metricas.get("pressao_alfa", {})
-
-    ip_pico = max(p.get("ip_pico_casa", 0), p.get("ip_pico_fora", 0))
-    c15 = max(p.get("ip_consec_15_casa", 0), p.get("ip_consec_15_fora", 0))
-    c18 = max(p.get("ip_consec_18_casa", 0), p.get("ip_consec_18_fora", 0))
-    c22 = max(p.get("ip_consec_22_casa", 0), p.get("ip_consec_22_fora", 0))
-
-    rb_total = sum(metricas.get("remates_baliza", (0, 0)))
-    rl_total = sum(metricas.get("remates_lado", (0, 0)))
-    remates_total = rb_total + rl_total
-    rda_total = sum(metricas.get("remates_dentro_area", (0, 0)))
-    cantos_total = sum(metricas.get("cantos", (0, 0)))
-    u5_total = sum(metricas.get("ultimos5", (0, 0)))
-    u10_total = sum(metricas.get("ultimos10", (0, 0)))
-    ap_casa, ap_fora = metricas.get("ataques_perigosos", (0, 0))
-    dif_ap = abs(ap_casa - ap_fora)
-    xg_total = sum(metricas.get("xg", (0.0, 0.0)))
-    chance_max = max(metricas.get("chance_golo", (0, 0)))
-
-    odds_validas = [o for o in metricas.get("odds", (0, 0, 0)) if o and o > 0]
-    odd_favorito = min(odds_validas, default=99)
-
-    super_favorito = odd_favorito <= 1.60
-
-    finalizacao_real = (
-        rb_total >= 1
-        or remates_total >= 4
-        or xg_total >= 0.35
-        or rda_total >= 2
-    )
-
-    finalizacao_forte_ht = (
-        rb_total >= 2
-        or remates_total >= 6
-        or xg_total >= 0.50
-        or rda_total >= 3
-    )
-
-    pressao_sustentada = (
-        c15 >= 5
-        or c18 >= 4
-        or c22 >= 2
-    )
-
-    pressao_cruzeiro = (
-        ip_pico >= 30
-        and c18 >= 4
-        and c15 >= 5
-        and u10_total >= 7
-        and (
-            rb_total >= 2
-            or remates_total >= 5
-            or cantos_total >= 4
-            or xg_total >= 0.45
-        )
-    )
-
-    colapso_extremo = (
-        ip_pico >= 35
-        and c22 >= 2
-        and u5_total >= 4
-        and finalizacao_real
-    )
-
-    dominio_real = (
-        dif_ap >= 10
-        or cantos_total >= 4
-        or u10_total >= 8
-        or chance_max >= 8
-    )
-
-    # HT sem ameaça real não pode virar elite.
-    if rb_total == 0 and remates_total <= 2 and xg_total < 0.30:
-        score = min(score, 84)
-
-    # HT com pressão bonita, mas sem finalização suficiente.
-    if score >= 88 and not finalizacao_real:
-        score = min(score, 86)
-
-    # Antes dos 22 minutos, só deixa subir muito se for absurdo.
-    if tempo < 22 and not colapso_extremo:
-        score = min(score, 86)
-
-    # Antes dos 25 minutos, precisa de finalização + pressão sustentada.
-    if tempo < 25 and not (pressao_sustentada and finalizacao_real):
-        score = min(score, 88)
-
-    # HT 90+ só com super favorito dominante ou padrão Cruzeiro/colapso.
-    if score >= 90:
-        libera_90 = (
-            (super_favorito and pressao_sustentada and finalizacao_real and dominio_real)
-            or pressao_cruzeiro
-            or colapso_extremo
-        )
-
-        if not libera_90:
-            score = min(score, 89)
-
-    # HT 92+ só no padrão Cruzeiro/colapso.
-    if score >= 92:
-        libera_92 = (
-            pressao_cruzeiro
-            or colapso_extremo
-            or (super_favorito and pressao_sustentada and finalizacao_forte_ht and dominio_real)
-        )
-
-        if not libera_92:
-            score = min(score, 91)
-
-    # Teto máximo realista para HT.
-    if score >= 96:
-        score = min(score, 96)
-
-    return score
-
-
-def aplicar_trava_consequencia_ofensiva(metricas, estrategia, score):
-    # R1: exceção FT para diamantes borderline — não trava quem quase passou no ALFA puro
-    if eh_ft(estrategia) and eh_quase_alfa_puro(metricas, estrategia):
-        return score
-    # R2: liga premium top vira bônus leve (+3), não bypass da trava
-    if eh_ft(estrategia) and eh_liga_premium_top_ft(metricas):
-        score = score + 3
-
-    nivel = pressao_sustentada_nivel(metricas, estrategia)
-    lado_principal = lado_pressao_principal(metricas, estrategia)
-    tem_consequencia_total = consequencia_ofensiva_total(metricas, estrategia)
-    tem_consequencia_lado = consequencia_ofensiva_lado(metricas, estrategia, lado_principal)
-
-    rb = soma_lados(metricas, "remates_baliza")
-    rl = soma_lados(metricas, "remates_lado")
-    rda = soma_lados(metricas, "remates_dentro_area")
-    cantos = soma_lados(metricas, "cantos")
-    xg = soma_lados(metricas, "xg", (0.0, 0.0))
-
-    metricas["nivel_pressao_sustentada"] = nivel
-    metricas["lado_pressao_principal"] = lado_principal
-    metricas["tem_consequencia_ofensiva"] = tem_consequencia_total
-    metricas["tem_consequencia_lado_certo"] = tem_consequencia_lado
-
-    # Sem consequência em lugar nenhum: trava dura.
-    if not tem_consequencia_total:
-        return min(score, 84 if eh_ht(estrategia) else 82)
-
-    # Consequência existe no jogo, mas não no lado que está pressionando/precisa do gol.
-    # Isso evita misturar IP de um lado com remate do outro.
-    if not tem_consequencia_lado:
-        return min(score, 85 if eh_ht(estrategia) else 81)
-
-    # IP forte com pouca consequência ainda não é elite.
-    if nivel in ["FORTE", "ELITE", "COLAPSO"]:
-        if rb == 0 and rda == 0 and cantos == 0 and xg < 0.35:
-            return min(score, 82 if eh_ft(estrategia) else 84)
-        if score >= 88 and rb == 0 and (rl < 4 or xg < 0.35):
-            return min(score, 86)
-
-    return score
-
-
-def aplicar_trava_liga_under(metricas, estrategia, score):
-    # R1: exceção FT para diamantes borderline
-    if eh_ft(estrategia) and eh_quase_alfa_puro(metricas, estrategia):
-        return score
-    # R2: liga premium top — bônus já aplicado em aplicar_trava_consequencia_ofensiva
-
-    liga = classificar_liga(metricas.get("competicao", ""))
-    if liga not in ["UNDER", "PERIGOSA"]:
-        return score
-
-    nivel = metricas.get("nivel_pressao_sustentada") or pressao_sustentada_nivel(metricas, estrategia)
-    tem_consequencia = metricas.get("tem_consequencia_ofensiva", consequencia_ofensiva_total(metricas, estrategia))
-    u5 = soma_lados(metricas, "ultimos5")
-    u10 = soma_lados(metricas, "ultimos10")
-    rb = soma_lados(metricas, "remates_baliza")
-    rda = soma_lados(metricas, "remates_dentro_area")
-    xg = soma_lados(metricas, "xg", (0.0, 0.0))
-    gc, gf = extrair_gols_placar(metricas.get("placar", ""))
-    aberto = True if gc is None else abs(gc - gf) <= 1
-
-    prova_forte = (
-        nivel in ["FORTE", "ELITE", "COLAPSO"]
-        and tem_consequencia
-        and u5 >= 4
-        and u10 >= 8
-        and (rb >= 2 or rda >= 3 or xg >= 0.55)
-        and aberto
-    )
-
-    if not prova_forte:
-        return min(score, 82 if eh_ft(estrategia) else 84)
-
-    # Mesmo quando passa, liga under não deve virar diamante fácil.
-    return min(score, 88 if eh_ft(estrategia) else 89)
-
-
-def aplicar_trava_ft_jogo_morto(metricas, estrategia, score):
-    if not eh_ft(estrategia):
-        return score
-
-    # R1: exceção FT para diamantes borderline
-    if eh_quase_alfa_puro(metricas, estrategia):
-        return score
-
-    gc, gf = extrair_gols_placar(metricas.get("placar", ""))
-    if gc is None:
-        return score
-
-    dif = abs(gc - gf)
-    perdendo = lado_perdendo(metricas)
-
-    if dif < 2 or perdendo in ["EMPATE", "DESCONHECIDO"]:
-        return score
-
-    # OVER LOGIC: favorito perdendo por qualquer diferença é SEMPRE contexto
-    # favorável para mais gols — caos produtivo.
-    # Quanto mais o favorito está perdendo, mais desespero, mais espaços,
-    # mais transições. O gol pode vir de qualquer lado.
-    # Esta trava foi removida para não penalizar over em contexto de pressão real.
-    #
-    # Única exceção: jogo completamente morto — favorito sem nenhuma
-    # reação nos últimos 10 minutos (u10=0, rb=0, sem pressão).
-    dados_perdendo = dados_lado(metricas, perdendo)
-
-    jogo_realmente_morto = (
-        dados_perdendo["u10"] == 0
-        and dados_perdendo["rb"] == 0
-        and dados_perdendo["u5"] == 0
-        and dados_perdendo["xg"] < 0.10
-    )
-
-    if jogo_realmente_morto:
-        return min(score, 78)
-
-    return score
-
-
-def aplicar_trava_pressao_antiga(metricas, estrategia, score):
-    # R1: exceção FT para diamantes borderline
-    if eh_ft(estrategia) and eh_quase_alfa_puro(metricas, estrategia):
-        return score
-    # R2: liga premium top não bypassa trava de pressão antiga — bônus já foi aplicado antes
-
-    if pressao_recente_caiu(metricas):
-        if eh_ht(estrategia):
-            return min(score, 85)
-        return min(score, 82)
-    return score
-
-
-
-# =========================================================
-# R1 — REGRA 6/7 ALFA COM MARGEM 10% (só FT)
-# =========================================================
-
-_ALFA_THRESHOLDS_FT = {
-    "ip_dom":   17.0,
-    "ip_diff":   7.0,
-    "ap_total": 30.0,
-    "ap_ult5":   4.0,
-    "xg":        0.70,
-}
-
-
-def eh_quase_alfa_puro(metricas, estrategia):
-    if not eh_ft(estrategia):
-        return False
-
-    p = metricas.get("pressao_alfa", {})
-    dom = metricas.get("lado_dominante", "EQUILIBRADO")
-
-    if dom == "CASA":
-        ip_dom = p.get("ip_pico_casa", 0.0)
-        ip_adv = p.get("ip_pico_fora", 0.0)
-        apc_total, apf_total = metricas.get("ataques_perigosos", (0, 0))
-        u5_dom = metricas.get("ultimos5", (0, 0))[0]
-        xg_total = sum(metricas.get("xg", (0.0, 0.0)))
-    elif dom == "FORA":
-        ip_dom = p.get("ip_pico_fora", 0.0)
-        ip_adv = p.get("ip_pico_casa", 0.0)
-        apc_total, apf_total = metricas.get("ataques_perigosos", (0, 0))
-        u5_dom = metricas.get("ultimos5", (0, 0))[1]
-        xg_total = sum(metricas.get("xg", (0.0, 0.0)))
-    else:
-        return False
-
-    ap_total = apc_total + apf_total
-    ip_diff = abs(ip_dom - ip_adv)
-
-    resultados = {
-        "ip_dom":   ip_dom  >= _ALFA_THRESHOLDS_FT["ip_dom"],
-        "ip_diff":  ip_diff >= _ALFA_THRESHOLDS_FT["ip_diff"],
-        "ap_total": ap_total >= _ALFA_THRESHOLDS_FT["ap_total"],
-        "ap_ult5":  u5_dom  >= _ALFA_THRESHOLDS_FT["ap_ult5"],
-        "xg":       xg_total >= _ALFA_THRESHOLDS_FT["xg"],
+        return False, 76, f"FUNIL_CONTEXTO_MORTO_{motivo_emocional}", detalhes
+
+    # HT precisa parecer massacre: pressão + consequência, salvo super favorito
+    # com pressão extrema E consequência mínima. Favorito fraco no HT só passa
+    # com números extremos.
+    if eh_ht(m.estrategia):
+        if not pressao:
+            return False, 76, "FUNIL_HT_SEM_PRESSAO_VIVA", detalhes
+        if m.odd_favorito and m.odd_favorito > 1.50 and not extremo:
+            return False, 80, "FUNIL_HT_FAVORITO_FRACO_SEM_MASSACRE", detalhes
+        if not consequencia and not (super_fav and extremo and consequencia_minima):
+            return False, 78, "FUNIL_HT_SEM_CONSEQUENCIA_MINIMA", detalhes
+        return True, 100, "FUNIL_HT_APROVADO", detalhes
+
+    # FT aceita mais contexto emocional, mas ainda exige pressão viva e pelo
+    # menos consequência mínima nas exceções fortes.
+    if not pressao:
+        return False, 76, "FUNIL_FT_SEM_PRESSAO_VIVA", detalhes
+
+    excecao_contextual_valida = (valor_forte or (super_fav and extremo)) and consequencia_minima
+    if not consequencia and not excecao_contextual_valida:
+        return False, 78, "FUNIL_FT_SEM_CONSEQUENCIA_MINIMA", detalhes
+
+    # Favorito fraco/equilibrado só passa com números extremos ou valor forte
+    # com consequência mínima.
+    if m.odd_favorito and m.odd_favorito > 1.85 and not extremo and not (valor_forte and consequencia_minima):
+        return False, 80, "FUNIL_FAVORITO_FRACO_SEM_NUMEROS_EXTREMOS", detalhes
+
+    return True, 100, "FUNIL_FT_APROVADO", detalhes
+
+def score_python_contextual(m: Metricas, chave: str) -> DecisaoPython:
+    preencher_contexto_calculado(m)
+    valor_classe, valor_motivo, ajuste_evento, proteger_ia = avaliar_valor_pos_evento(m)
+    m.valor_pos_evento_classe = valor_classe
+    m.valor_pos_evento_motivo = valor_motivo
+    m.protecao_ia_ativa = proteger_ia
+
+    passou_funil, teto_funil, motivo_funil, detalhes_funil = funil_obrigatorio_hibrido(m)
+
+    base = 45
+    # O bônus de time elite já é aplicado dentro de score_favoritismo().
+    # Aqui chamamos novamente apenas para registrar o motivo no log/CSV, sem somar de novo.
+    _, elite_motivo = bonus_time_elite_transicao(m)
+    componentes = {
+        "pressao_viva": score_pressao_viva(m),
+        "consequencia": score_consequencia(m),
+        "favoritismo": score_favoritismo(m),
+        "valor_pos_evento": ajuste_evento,
+        "liga": liga_ajuste(m.liga),
+        "relogio": score_relogio(m),
     }
+    conf_score, conf_motivo = score_confirmacao(m, chave)
+    componentes["confirmacao"] = conf_score
 
-    falhas = [k for k, v in resultados.items() if not v]
-    if len(falhas) != 1:
-        return False
+    score_bruto = base + sum(componentes.values())
 
-    criterio_faltante = falhas[0]
-    threshold = _ALFA_THRESHOLDS_FT[criterio_faltante]
-    valores = {
-        "ip_dom":   ip_dom,
-        "ip_diff":  ip_diff,
-        "ap_total": ap_total,
-        "ap_ult5":  u5_dom,
-        "xg":       xg_total,
+    if eh_ht(m.estrategia):
+        if m.lado_pressionante in {"CASA", "FORA"} and pressao_extrema_lado(m, m.lado_pressionante):
+            score_bruto += 4
+        else:
+            score_bruto -= 2
+    else:
+        if favorito_nao_vencendo(m) and m.lado_favorito == m.lado_pressionante:
+            score_bruto += 4
+
+    score = clamp(score_bruto)
+
+    if not passou_funil:
+        score = min(score, teto_funil)
+        detalhes = {
+            "componentes": componentes,
+            "score_bruto": score_bruto,
+            "confirmacao_motivo": conf_motivo,
+            "corte": corte_por_estrategia(m.estrategia),
+            "valor_pos_evento_classe": valor_classe,
+            "valor_pos_evento_motivo": valor_motivo,
+            "funil": motivo_funil,
+            "funil_detalhes": detalhes_funil,
+            "time_elite": elite_motivo,
+        }
+        return DecisaoPython(score=score, aprovado_pre_ia=False, status="REPROVADO", motivo=motivo_funil, detalhes=detalhes)
+
+    score, motivo_trava, bloqueado_trava = aplicar_travas_finais(m, score)
+
+    corte = corte_por_estrategia(m.estrategia)
+    aprovado = score >= corte and not bloqueado_trava
+    status = "APROVADO" if aprovado else "REPROVADO"
+    motivo = motivo_trava if bloqueado_trava else f"score={score} corte={corte} valor={valor_classe}"
+
+    detalhes = {
+        "componentes": componentes,
+        "score_bruto": score_bruto,
+        "confirmacao_motivo": conf_motivo,
+        "corte": corte,
+        "valor_pos_evento_classe": valor_classe,
+        "valor_pos_evento_motivo": valor_motivo,
+        "funil": motivo_funil,
+        "funil_detalhes": detalhes_funil,
+        "trava": motivo_trava,
+        "time_elite": elite_motivo,
     }
-    valor_obs = valores[criterio_faltante]
-
-    if threshold == 0:
-        return False
-    margem = (threshold - valor_obs) / threshold
-    if margem > 0.10:
-        return False
-
-    # Trava de consequência obrigatória: IP/AP bonito sem chegada real = fake pressure
-    # Sem pelo menos 1 remate à baliza OU 2 remates dentro da área OU xG ≥ 0.55,
-    # o jogo não merece exceção mesmo sendo 6/7 ALFA.
-    rb_total = sum(metricas.get("remates_baliza", (0, 0)))
-    rda_total = sum(metricas.get("remates_dentro_area", (0, 0)))
-    xg_total = sum(metricas.get("xg", (0.0, 0.0)))
-    consequencia_real = (
-        rb_total >= 1
-        or rda_total >= 2
-        or xg_total >= 0.55
-    )
-    return consequencia_real
-
-
-# =========================================================
-# R2 — LIGAS PREMIUM TOP FT (só FT)
-# =========================================================
-
-_LIGAS_PREMIUM_TOP_FT = {
-    "cruzeiro", "chapecoense",
-    "fiorentina", "atalanta", "hellas verona", "roma", "torino", "juventus",
-    "club brugge", "anderlecht", "union saint-gilloise", "mechelen", "gent",
-    "rijeka", "hajduk split", "vukovar", "gorica",
-    "al nassr", "damac", "al kuwait", "al fahaheel",
-    "celtic", "dunfermline", "fcsb", "botosani", "ajax", "utrecht", "heerenveen",
-}
-
-
-def eh_liga_premium_top_ft(metricas):
-    jogo = remover_acentos(str(metricas.get("jogo", "") or "")).lower()
-    time_premium = any(t in jogo for t in _LIGAS_PREMIUM_TOP_FT)
-    if not time_premium:
-        return False
-    p = metricas.get("pressao_alfa", {})
-    ip_dom = max(p.get("ip_pico_casa", 0.0), p.get("ip_pico_fora", 0.0))
-    return ip_dom >= 13.0
-
-
-# =========================================================
-# DNA PROJETADO — ALFA/COUTIPS
-# Validado em 383 jogos maio/2026
-# DNA não bloqueia sozinho — funciona como termômetro/multiplicador
-# =========================================================
-
-def calcular_dna_projetado(metricas, estrategia):
-    """Calcula o DNA Projetado do jogo.
-
-    Combina 3 pilares históricos para medir se o jogo está
-    caminhando para o padrão dos greens históricos.
-
-    Retorna (dna_class, dna_score, ajuste_score)
-    Se dados insuficientes, retorna ("DNA_SEM_DADOS", 0, 0)
-    """
-    if not eh_ft(estrategia):
-        return "DNA_SEM_DADOS", 0, 0
-
-    fav, odd_fav = lado_favorito(metricas)
-
-    # XG ao vivo total
-    xg_total = sum(metricas.get("xg", (0.0, 0.0)))
-
-    # L15 do favorito (xgl)
-    xgl = metricas.get("xgl", (0.0, 0.0))
-    if fav == "CASA":
-        l15 = xgl[0] if isinstance(xgl, tuple) else xgl
-    elif fav == "FORA":
-        l15 = xgl[1] if isinstance(xgl, tuple) else xgl
-    else:
-        l15 = max(xgl) if isinstance(xgl, tuple) else xgl
-
-    # Se não tem dados históricos suficientes, não interfere
-    if xg_total == 0.0 and l15 == 0.0:
-        return "DNA_SEM_DADOS", 0, 0
-
-    dna_score = 0.0
-
-    # PILAR 1 — Favoritismo (régua separada HT/FT)
-    if odd_fav and odd_fav > 0:
-        if eh_ht(estrategia):
-            if odd_fav <= 1.40:
-                dna_score += 1.0
-            elif odd_fav <= 1.50:
-                dna_score += 0.7
-        else:  # FT
-            if odd_fav <= 1.55:
-                dna_score += 1.0
-            elif odd_fav <= 2.00:
-                dna_score += 0.5
-            elif odd_fav <= 2.50:
-                dna_score += 0.25
-
-    # PILAR 2 — XG ao vivo
-    if xg_total >= 1.80:
-        dna_score += 1.0
-    elif xg_total >= 1.60:
-        dna_score += 0.7
-    elif xg_total >= 1.40:
-        dna_score += 0.4
-
-    # PILAR 3 — L15
-    if l15 >= 0.65:
-        dna_score += 1.0
-    elif l15 >= 0.55:
-        dna_score += 0.7
-    elif l15 >= 0.45:
-        dna_score += 0.4
-
-    # Classificação
-    if dna_score >= 2.6:
-        dna_class = "DNA_FORTE"
-        ajuste = 4
-    elif dna_score >= 2.1:
-        dna_class = "DNA_ACEITAVEL"
-        ajuste = 2
-    elif dna_score >= 1.6:
-        dna_class = "DNA_PARCIAL"
-        ajuste = -1
-    else:
-        dna_class = "DNA_FRACO"
-        ajuste = -3
-
-    return dna_class, round(dna_score, 2), ajuste
-
-
-def teto_contextual_gol(metricas, estrategia, score):
-    tempo = metricas["tempo"]
-    placar = metricas["placar"]
-
-    apc, apf = metricas["ataques_perigosos"]
-    rbc, rbf = metricas["remates_baliza"]
-    cc, cf = metricas["cantos"]
-    u10c, u10f = metricas["ultimos10"]
-    xgc, xgf = metricas.get("xg", (0, 0))
-    rdac, rdaf = metricas.get("remates_dentro_area", (0, 0))
-
-    rb = rbc + rbf
-    rda = rdac + rdaf
-    u10 = u10c + u10f
-    xg = xgc + xgf
-    dif_ap = abs(apc - apf)
-    dif_rb = abs(rbc - rbf)
-    dif_c = abs(cc - cf)
-
-    gc, gf = extrair_gols_placar(placar)
-    dif_placar = abs(gc - gf) if gc is not None else 0
-
-    ug = metricas["ultimo_gol"]
-    minutos = tempo - ug if ug > 0 else 999
-
-    forca = calcular_forca_premium_gol(metricas)
-    motivo = metricas.get("motivo_gol_contextual", "")
-    liga = classificar_liga(metricas.get("competicao", ""))
-    padrao = metricas.get("padrao_alfa", "")
-    delta = metricas.get("motivo_delta_contextual", "")
-
-    premium = forca >= 5 and minutos > 2
-    bom = u10 >= 8 or dif_ap >= 10 or rb >= 3 or xg >= 0.45 or rda >= 3
-    forte = padrao in ["ALFA_FT_DIAMANTE", "ALFA_HT_DIAMANTE", "ALFA_FT_FORTE", "ALFA_HT_FORTE", "ALFA_FT_BASE", "ALFA_HT_BASE"]
-
-    if minutos < 0:
-        score = min(score, 75)
-
-    elif minutos <= 2:
-        if motivo in ["GOL_ZEBRA_CONTRA_FLUXO", "GOL_TIME_PRESSIONADO_ABRIU_JOGO"]:
-            score = min(score, 92)
-        elif motivo in ["TRAVA_CONFIRMACAO_PRESSAO_PREMIADA_5M", "TRAVA_CONFIRMACAO_GOL_RECENTE_5M", "TRAVA_CONFIRMACAO_PRESSAO_PREMIADA"]:
-            score = min(score, 72)
-        elif motivo == "PRESSAO_PREMIADA_RECENTE":
-            score = min(score, 76)
-        else:
-            score = min(score, 78)
-
-    elif minutos <= 5:
-        if motivo in ["GOL_ZEBRA_CONTRA_FLUXO", "GOL_TIME_PRESSIONADO_ABRIU_JOGO"]:
-            score = min(score, 92)
-        elif motivo in ["TRAVA_CONFIRMACAO_PRESSAO_PREMIADA_5M", "TRAVA_CONFIRMACAO_GOL_RECENTE_5M"]:
-            score = min(score, 72)
-        elif motivo in ["PRESSAO_PREMIADA_MORREU", "PRESSAO_PREMIADA_RECENTE"]:
-            score = min(score, 78)
-        elif motivo == "PRESSAO_PREMIADA_MAS_VIVA":
-            score = min(score, 84)
-        else:
-            score = min(score, 82)
-
-    if rb <= 1:
-        score = min(score, 84 if forte else 82)
-
-    if rb == 0 and rda <= 1:
-        score = min(score, 80 if forte else 78)
-
-    if dif_ap <= 5 and dif_rb <= 1 and dif_c <= 1:
-        score = min(score, 83 if forte else 81)
-
-    if xg <= 0.25 and rb <= 1:
-        score = min(score, 80 if forte else 78)
-
-    if liga == "UNDER":
-        score = min(score, 86 if (premium or forte) else 82)
-
-    if liga == "PERIGOSA":
-        score = min(score, 84 if (premium or forte) else 80)
-
-    if delta == "CONFIRMACAO_PIOROU":
-        score = min(score, 78)
-
-    if eh_confirmacao(estrategia):
-        if premium and delta == "CONFIRMACAO_MELHOROU":
-            score = min(score, 94)
-        elif premium or forte:
-            score = min(score, 90)
-        elif bom:
-            score = min(score, 86)
-        else:
-            score = min(score, 80)
-    else:
-        if premium or forte:
-            score = min(score, 92)
-        elif bom:
-            score = min(score, 87)
-        else:
-            score = min(score, 81)
-
-    if eh_ft(estrategia) and dif_placar >= 3 and not pressao_viva(metricas):
-        score = min(score, 78)
-
-    return score
-
-
-# =========================================================
-# RÉGUA DE ODD POR ESTRATÉGIA — HT vs FT
-# HT = super favorito / favorito forte no 1º tempo
-# FT = favorito contextual no fim do jogo
-# =========================================================
-
-# =========================================================
-# HT MASSACRE — Camada exclusiva para HT
-# HT não converte por desespero de resultado como FT.
-# HT converte quando existe massacre unilateral cedo:
-# super favorito + pressão viva + consequência real + domínio.
-# =========================================================
-
-def calcular_ht_massacre(metricas, estrategia):
-    """Avalia se o HT tem perfil de massacre unilateral.
-
-    Retorna (ht_massacre_class, ht_massacre_score, ht_massacre_ajuste)
-    Só aplica para estratégias HT.
-    """
-    if not eh_ht(estrategia):
-        return "HT_MASSACRE_NAO_APLICA", 0, 0
-
-    lado, _ = lado_alvo_contextual(metricas, estrategia)
-    if lado not in ["CASA", "FORA"]:
-        return "HT_MASSACRE_SEM_LADO", 0, -2
-
-    fav, odd_favorito = lado_favorito(metricas)
-    dados = dados_lado(metricas, lado)
-    ip = valores_pressao_lado(metricas, lado)
-    dom, dif_dom = lado_dominante(metricas)
-
-    score = 0.0
-
-    # Pilar 1: favorito forte
-    if fav == lado and odd_favorito and odd_favorito <= 1.40:
-        score += 1.0
-    elif fav == lado and odd_favorito and odd_favorito <= 1.50:
-        score += 0.7
-
-    # Pilar 2: pressão recente forte
-    if dados["u5"] >= 5 and dados["u10"] >= 10:
-        score += 1.0
-    elif dados["u5"] >= 3 and dados["u10"] >= 6:
-        score += 0.7
-
-    # Pilar 3: IP sustentado
-    if ip["c22"] >= 2 or ip["c18"] >= 3:
-        score += 1.0
-    elif ip["ip_pico"] >= 22:
-        score += 0.6
-
-    # Pilar 4: consequência real
-    if dados["rb"] >= 2 or dados["rda"] >= 2 or dados["xg"] >= 0.45:
-        score += 1.0
-    elif dados["rb"] >= 1 or dados["remates"] >= 4 or dados["xg"] >= 0.30:
-        score += 0.6
-
-    # Pilar 5: unilateralidade
-    if dom == lado and dif_dom >= 15:
-        score += 1.0
-    elif dom == lado and dif_dom >= 8:
-        score += 0.6
-
-    score = round(score, 2)
-
-    if score >= 4.2:
-        return "HT_MASSACRE_ELITE", score, 4
-    if score >= 3.4:
-        return "HT_MASSACRE_FORTE", score, 2
-    if score >= 2.6:
-        return "HT_MASSACRE_MODERADO", score, 0
-    return "HT_MASSACRE_FRACO", score, -3
-
-
-
-# =========================================================
-# HT_MASSACRE — Camada exclusiva para 1º tempo
-# Lógica diferente do DNA FT:
-# HT converte por massacre unilateral, não por desespero
-# =========================================================
-
-
-def pontuar_odd_ht(odd_favorito: float):
-    """Pontuação de odd para HT. Seletivo — super favorito."""
-    if not odd_favorito or odd_favorito <= 0:
-        return 0, "ODD_HT_DESCONHECIDA"
-    if odd_favorito <= 1.40:
-        return 6, "HT_SUPER_FAVORITO"
-    if odd_favorito <= 1.50:
-        return 3, "HT_FAVORITO_FORTE"
-    return -8, "HT_FORA_DA_REGUA"
-
-
-def pontuar_odd_ft(odd_favorito: float):
-    """Pontuação de odd para FT. Aceita favorito contextual até 2.50."""
-    if not odd_favorito or odd_favorito <= 0:
-        return 0, "ODD_FT_DESCONHECIDA"
-    if odd_favorito <= 1.55:
-        return 6, "FT_FAVORITO_FORTE"
-    if odd_favorito <= 2.00:
-        return 3, "FT_FAVORITO_MODERADO"
-    if odd_favorito <= 2.50:
-        return 1, "FT_FAVORITO_CONTEXTUAL"
-    return -8, "FT_FORA_DA_REGUA"
-
-
-def pontuar_odd_por_estrategia(odd_favorito: float, estrategia: str):
-    """Aplica régua correta de odd por estratégia."""
+    return DecisaoPython(score=score, aprovado_pre_ia=aprovado, status=status, motivo=motivo, detalhes=detalhes)
+
+def corte_por_estrategia(estrategia: str) -> int:
+    if estrategia == "ALFA_HT_CONFIRMACAO":
+        return CORTE_CONFIRMACAO_GOL_HT
+    if estrategia == "ALFA_FT_CONFIRMACAO":
+        return CORTE_CONFIRMACAO_GOL_FT
     if eh_ht(estrategia):
-        return pontuar_odd_ht(odd_favorito)
-    if eh_ft(estrategia):
-        return pontuar_odd_ft(odd_favorito)
-    return 0, "ODD_SEM_REGUA"
-
-
-def score_gol(metricas, estrategia, chave_jogo):
-    """Score institucional por funil.
-
-    Ordem oficial:
-    RADAR -> VALIDACAO -> TRAVAS -> CLASSIFICACAO.
-    O score não pode aprovar jogo ruim por soma livre.
-
-    Nota de performance: lado_dominante(), lado_favorito() e classificar_liga()
-    são pré-calculados aqui e armazenados em metricas para evitar recálculo
-    nas dezenas de funções que os consomem durante o processamento deste evento.
-    """
-    # Pré-cálculo único — evita recálculo nas funções filhas
-    _fav, _odd_fav = lado_favorito(metricas)
-    _dom, _dif_dom = lado_dominante(metricas)
-    metricas["_cache_fav"] = (_fav, _odd_fav)
-    metricas["_cache_dom"] = (_dom, _dif_dom)
-    metricas["_cache_liga"] = classificar_liga(metricas.get("competicao", ""))
-
-    metricas["lado_favorito"] = _fav
-    metricas["lado_zebra"] = lado_zebra(metricas)
-    metricas["lado_dominante"] = _dom
-    metricas["lado_vermelho"] = lado_com_vermelho(metricas)
-    metricas["nivel_pressao_sustentada"] = pressao_sustentada_nivel(metricas, estrategia)
-
-    # Determina padrão ALFA para log — baseado nos dados do lado dominante já calculados
-    p = metricas.get("pressao_alfa", {})
-    dom = metricas.get("lado_dominante", "EQUILIBRADO")
-    if dom == "CASA":
-        _c15 = p.get("ip_consec_15_casa", 0)
-        _c18 = p.get("ip_consec_18_casa", 0)
-        _c22 = p.get("ip_consec_22_casa", 0)
-        _chance = metricas.get("chance_golo", (0, 0))[0]
-    elif dom == "FORA":
-        _c15 = p.get("ip_consec_15_fora", 0)
-        _c18 = p.get("ip_consec_18_fora", 0)
-        _c22 = p.get("ip_consec_22_fora", 0)
-        _chance = metricas.get("chance_golo", (0, 0))[1]
-    else:
-        _c15 = max(p.get("ip_consec_15_casa", 0), p.get("ip_consec_15_fora", 0))
-        _c18 = max(p.get("ip_consec_18_casa", 0), p.get("ip_consec_18_fora", 0))
-        _c22 = max(p.get("ip_consec_22_casa", 0), p.get("ip_consec_22_fora", 0))
-        _chance = max(metricas.get("chance_golo", (0, 0)))
-    if _c22 >= 3 and _chance >= 10:
-        padrao = "ALFA_FT_DIAMANTE" if eh_ft(estrategia) else "ALFA_HT_DIAMANTE"
-    elif _c18 >= 3 and _chance >= 6:
-        padrao = "ALFA_FT_FORTE" if eh_ft(estrategia) else "ALFA_HT_FORTE"
-    elif _c15 >= 5:
-        padrao = "ALFA_FT_BASE" if eh_ft(estrategia) else "ALFA_HT_BASE"
-    else:
-        padrao = "SEM_PADRAO_ALFA"
-    metricas["padrao_alfa"] = padrao
-
-    aprovado_funil, teto_funil, motivo_funil = funil_institucional_gol(metricas, estrategia, chave_jogo)
-    metricas["funil_aprovado"] = aprovado_funil
-    metricas["motivo_funil"] = motivo_funil
-
-    # Contextos antigos continuam preenchidos para compatibilidade, mas não comandam aprovação.
-    ag, mg = ajuste_gol_recente_contextual(metricas, estrategia)
-    metricas["motivo_gol_contextual"] = mg
-    av, mv = ajuste_vermelho_contextual(metricas)
-    metricas["motivo_vermelho_contextual"] = mv
-    if "motivo_delta_contextual" not in metricas:
-        d, md = score_delta_confirmacao(metricas, estrategia, chave_jogo)
-        metricas["motivo_delta_contextual"] = md
-
-    # FUNIL-02 corrigido: bônus de confiança ARCE/CHAMA agora é efetivamente aplicado.
-    # Antes era calculado mas zerado aqui, nunca chegando ao score final.
-    bonus_bot = bonus_bot_confianca(estrategia)
-    metricas["bonus_bot_confianca"] = bonus_bot
-
-    metricas["tem_consequencia_ofensiva"] = consequencia_ofensiva_lado(metricas, estrategia, metricas.get("lado_alvo", "DESCONHECIDO"))
-
-    if not aprovado_funil:
-        # Bloqueio institucional:
-        # não importa a estatística bonita, o jogo não provou vida real.
-        #
-        # Importante:
-        # se o motivo for "gol recente do dominante/favorito", a entrada principal
-        # NÃO pode passar só porque o teto ficou acima do corte. O jogo fica salvo
-        # em memória para possível confirmação posterior, mas não vai ao canal principal.
-        motivo_bloqueio = str(motivo_funil or "")
-        if motivo_bloqueio in [
-            "MASSACRE_POS_GOL_AGUARDAR_CONFIRMACAO",
-            "PRESSAO_PREMIADA_BLOQUEIO",
-            "GOL_MUITO_RECENTE_CAUTELA",
-            "GOL_INCONSISTENTE_BLOQUEIO",
-        ]:
-            score = 79
-        elif eh_confirmacao(estrategia):
-            score = min(teto_funil, 81)
-        else:
-            score = min(teto_funil, 79 if perfil_origem_estrategia(estrategia) == "RADAR_ABERTO" else 81)
-
-        if not tempo_operacional_valido(metricas, estrategia):
-            score = min(score, 72)
-
-        return int(max(0, min(score, 99))), metricas
-
-    score = score_classificacao_institucional(metricas, estrategia)
-
-    # DNA PROJETADO — camada de confiança histórica
-    _dna_class, _dna_score, _dna_ajuste = calcular_dna_projetado(metricas, estrategia)
-    metricas["dna_class"] = _dna_class
-    metricas["dna_score"] = _dna_score
-    if _dna_class != "DNA_SEM_DADOS":
-        score = score + _dna_ajuste
-        log(f"🧬 {_dna_class} | score={_dna_score} | ajuste={_dna_ajuste:+d} | {metricas.get('jogo','')}")
-
-    # HT_MASSACRE — camada exclusiva para 1º tempo
-    _ht_massacre_class, _ht_massacre_score, _ht_massacre_ajuste = calcular_ht_massacre(metricas, estrategia)
-    metricas["ht_massacre_class"] = _ht_massacre_class
-    metricas["ht_massacre_score"] = _ht_massacre_score
-    metricas["ht_massacre_ajuste"] = _ht_massacre_ajuste
-    if _ht_massacre_ajuste != 0:
-        score = score + _ht_massacre_ajuste
-        log(f"⚡ {_ht_massacre_class} | score={_ht_massacre_score} | ajuste={_ht_massacre_ajuste:+d} | {metricas.get('jogo','')}")
-
-    # RÉGUA DE ODD — pontuação separada por HT/FT
-    _fav_lado, _odd_fav = lado_favorito(metricas)
-    _odd_bonus, _faixa_odd = pontuar_odd_por_estrategia(_odd_fav, estrategia)
-    metricas["odd_favorito"] = _odd_fav
-    metricas["faixa_odd"] = _faixa_odd
-    metricas["odd_bonus"] = _odd_bonus
-    score = score + _odd_bonus
-    log(f"💰 {_faixa_odd} | odd={_odd_fav} | bonus={_odd_bonus:+d} | {metricas.get('jogo','')}")
-
-    # Travas finais mantidas como proteção extra. Elas só reduzem, nunca aprovam.
-    score = aplicar_trava_consequencia_ofensiva(metricas, estrategia, score)
-    score = aplicar_trava_pressao_antiga(metricas, estrategia, score)
-    score = aplicar_trava_ft_jogo_morto(metricas, estrategia, score)
-    score = aplicar_trava_liga_under(metricas, estrategia, score)
-    score = aplicar_travas_ht_elite(metricas, estrategia, score)
-
-    # FUNIL-02: aplica bônus de confiança ARCE/CHAMA após travas
-    # (bônus não pode reverter uma trava, só somar em cima de score já aprovado)
-    score = score + metricas.get("bonus_bot_confianca", 0)
-
-    # Bônus de time elite de transição — perdendo ou empatando
-    bonus_elite = _bonus_time_elite(metricas)
-    if bonus_elite > 0:
-        metricas["bonus_time_elite"] = bonus_elite
-    score = score + bonus_elite
-
-    if not tempo_operacional_valido(metricas, estrategia):
-        score = min(score, 72)
-
-    # Teto máximo: 95 — nenhum jogo é certeza absoluta
-    return int(max(0, min(score, 95))), metricas
-
-# =========================================================
-# CANTO — DESATIVADO NA FASE ATUAL (somente gols)
-# TODO: reativar score_canto() e montar_mensagem_canto() quando cantos forem reabertos
-# =========================================================
-
-def score_canto(metricas, estrategia, chave_jogo):
-    # DESATIVADO — retorna 0 sempre na fase atual
-    return 0
-
-
-def tipo_pressao(metricas, gol, canto, estrategia=None):
-    corte = corte_gol_estrategia(estrategia or "")
-    if gol >= corte:
-        return "GOL"
-    if pressao_viva(metricas):
-        return "OBSERVACAO"
-    return "BLOQUEIO"
-
-
-def calcular_scores(texto, estrategia, chave_jogo):
-    metricas = extrair_metricas(texto)
-    gol, metricas = score_gol(metricas, estrategia, chave_jogo)
-    canto = score_canto(metricas, estrategia, chave_jogo)
-    tipo = tipo_pressao(metricas, gol, canto, estrategia)
-
-    metricas["score_gol"] = gol
-    metricas["score_canto"] = canto
-    metricas["tipo_pressao"] = tipo
-
-    return gol, canto, tipo, metricas
+        return CORTE_GOL_HT
+    return CORTE_GOL_FT
 
 
 # =========================================================
-# PRIORIDADE / CONFIRMAÇÃO / DECISÃO
+# IA AUDITORA / PROTEÇÃO DA IA
 # =========================================================
 
-def prioridade_estrategia(estrategia):
-    if estrategia in ["ARCE_HT", "CHAMA_FT"]:
-        return 3
-    if estrategia in ["ALFA_HT", "ALFA_FT"]:
-        return 2
-    if estrategia in ["ALFA_HT_CONFIRMACAO", "ALFA_FT_CONFIRMACAO"]:
-        return 1
-    return 0
+def montar_prompt_ia(m: Metricas, decisao_py: DecisaoPython) -> str:
+    return f"""
+Você é a IA Auditora do projeto COUTIPS/ALFA.
+Python é o motor principal. Sua função é auditar fake pressure e incoerências, não destruir contexto institucional forte.
+
+REGRAS IMPORTANTES:
+- Gol recente não é automaticamente negativo.
+- Gol recente só é negativo quando premiou a pressão do lado que gerava o alerta e essa pressão morreu.
+- Se a zebra/adversário marcou contra o fluxo e o favorito/pressionante continua pressionando, isso é positivo para over.
+- Se o favorito marcou mas continuou pressionando, não bloquear automaticamente; avaliar continuidade pós-gol.
+- Favorito forte/super favorito empatando ou perdendo com pressão sustentada é contexto positivo.
+- RDA=0 ou xG baixo não podem matar sozinhos quando há super favorito não vencendo, pressão viva, cantos/chance/IP fortes.
+
+Responda obrigatoriamente em UMA linha no formato:
+DECISAO=APROVAR|BLOQUEAR; CONFIANCA=0-100; MOTIVO=texto curto
+
+DADOS:
+Estratégia: {m.estrategia}
+Jogo: {m.jogo}
+Competição: {m.competicao}
+Minuto: {m.tempo}
+Placar: {m.placar}
+Mercado: {m.mercado}
+Liga: {m.liga}
+Odds: {m.odds}
+Favorito: {m.lado_favorito} odd {m.odd_favorito}
+Dominante: {m.lado_dominante}
+Pressionante: {m.lado_pressionante}
+Último gol: {m.ultimo_gol}' {m.ultimo_gol_lado}
+AP: {m.ataques_perigosos}
+U5: {m.ultimos5}
+U10: {m.ultimos10}
+Cantos: {m.cantos}
+RB: {m.remates_baliza}
+Remates lado: {m.remates_lado}
+RDA: {m.remates_dentro_area}
+Chance gol: {m.chance_golo}
+xG: {m.xg}
+IP: {m.pressao_alfa}
+Valor pós-evento: {m.valor_pos_evento_classe} | {m.valor_pos_evento_motivo}
+Score Python: {decisao_py.score}
+Motivo Python: {decisao_py.motivo}
+""".strip()
 
 
-def alerta_passou_corte(alerta):
-    estrategia = alerta.get("estrategia", "")
-    return alerta.get("score_gol", 0) >= corte_gol_estrategia(estrategia)
+async def consultar_openai(m: Metricas, decisao_py: DecisaoPython) -> Tuple[str, int, str]:
+    if not OPENAI_HABILITADO or not OPENAI_API_KEY:
+        return "APROVAR", decisao_py.score, "OPENAI_DESATIVADA_USANDO_SCORE_PYTHON"
 
-
-def prioridade_alerta(alerta):
-    estrategia = alerta.get("estrategia", "")
-    score = alerta.get("score_gol", 0)
-    corte = corte_gol_estrategia(estrategia)
-
-    # Ordem institucional:
-    # 1) primeiro quem realmente passou o funil/corte;
-    # 2) depois quem ficou mais acima do próprio corte;
-    # 3) depois score bruto;
-    # 4) ARCE/CHAMA entram como desempate/peso de confiança, não como passe livre;
-    # 5) por último o minuto.
-    return (
-        1 if score >= corte else 0,
-        score - corte,
-        score,
-        prioridade_estrategia(estrategia),
-        alerta.get("metricas", {}).get("tempo", 0),
-    )
-
-
-def confirmacao_melhorou_forte(alerta):
-    if not eh_confirmacao(alerta.get("estrategia", "")):
-        return False
-
-    metricas = alerta.get("metricas", {})
-    delta_ctx = metricas.get("motivo_delta_contextual", "")
-    motivo_gol = metricas.get("motivo_gol_contextual", "")
-    motivo_pos_gol = metricas.get("motivo_pos_gol_institucional", "")
-    score_gol = alerta.get("score_gol", 0)
-
-    # Regra oficial:
-    # confirmação forte pode voltar ao CANAL PRINCIPAL quando o jogo que foi
-    # abortado por gol recente continuou amassando depois do gol.
-    corte = corte_gol_estrategia(alerta.get("estrategia", ""))
-
-    if motivo_pos_gol == "CONFIRMACAO_VALIDOU_MASSACRE_POS_GOL" and score_gol >= corte:
-        return True
-
-    # Exceção oficial:
-    # se o time pressionado/zebra marcou contra o fluxo,
-    # o jogo abriu e pode ir ao canal principal.
-    if motivo_gol in [
-        "GOL_TIME_PRESSIONADO_ABRIU_JOGO",
-        "GOL_ZEBRA_CONTRA_FLUXO",
-        "GOL_CONTRA_FLUXO_CONTEXTO_BOM",
-        "GOL_ZEBRA_ABRIU_JOGO",
-        "GOL_EMPATE_FT_ABRIU_VIRADA",
-    ] and score_gol >= corte:
-        return True
-
-    # Confirmação normal só vai ao principal se realmente melhorou.
-    # Não usamos corte fixo de HT aqui para não matar confirmação FT boa.
-    if delta_ctx == "CONFIRMACAO_MELHOROU" and score_gol >= corte:
-        return True
-
-    return False
-
-
-def melhor_alerta(alertas):
-    # Não escolher ARCE/CHAMA cegamente se outro alerta passou melhor pelo funil.
-    # ARCE/CHAMA já recebem bônus no score e ainda servem como desempate.
-    return sorted(alertas, key=prioridade_alerta, reverse=True)[0]
-
-
-def ja_enviado_recentemente(chave_envio):
-    agora = time.time()
-    return chave_envio in ultimos_enviados and agora - ultimos_enviados[chave_envio] <= COOLDOWN_SEGUNDOS
-
-
-def marcar_enviado(chave_envio):
-    ultimos_enviados[chave_envio] = time.time()
-
-
-def salvar_ultima_leitura(chave_jogo, alerta):
-    ultimas_leituras_por_jogo[chave_jogo] = {
-        "estrategia": alerta["estrategia"],
-        "metricas": alerta["metricas"],
-        "score_gol": alerta.get("score_gol", 0),
-        "score_canto": alerta.get("score_canto", 0),
-        "tipo_pressao": alerta.get("tipo_pressao", "BLOQUEIO"),
-        "recebido_em": time.time(),
+    prompt = montar_prompt_ia(m, decisao_py)
+    payload = {
+        "model": OPENAI_MODEL,
+        "messages": [
+            {"role": "system", "content": "Você é uma IA auditora objetiva de futebol ao vivo. Responda somente no formato pedido."},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.1,
+        "max_tokens": 120,
     }
-
-
-# =========================================================
-# MENSAGENS
-# =========================================================
-
-def faixa_publica(score):
-    if score >= 92:
-        return f"💎 ALFA — ENTRADA DIAMANTE ({score}%)"
-    if score >= 85:
-        return f"🔥 ALFA — ENTRADA VALIDADA ({score}%)"
-    if score >= 80:
-        return f"✅ ALFA — ENTRADA APROVADA ({score}%)"
-    return "⚠️ ALFA — OBSERVAÇÃO INTERNA"
-
-
-def nome_publico_bot(estrategia):
-    return {
-        "ALFA_HT": "ALFA HT",
-        "ALFA_HT_CONFIRMACAO": "ALFA HT CONFIRMAÇÃO",
-        "ARCE_HT": "ALFA HT",
-        "ALFA_FT": "ALFA FT",
-        "ALFA_FT_CONFIRMACAO": "ALFA FT CONFIRMAÇÃO",
-        "CHAMA_FT": "ALFA FT",
-    }.get(estrategia, estrategia)
-
-
-def texto_liga_publico(metricas):
-    liga = classificar_liga(metricas.get("competicao", ""))
-    if liga == "PREMIUM":
-        return "🟢 Liga Premium"
-    if liga == "MODERADA":
-        return "🟡 Liga Moderada"
-    if liga == "UNDER":
-        return "🟠 Liga Under"
-    if liga == "PERIGOSA":
-        return "🔴 Liga Perigosa"
-    return "⚪ Liga Neutra"
-
-
-def texto_contexto_gol(metricas):
-    motivo = metricas.get("motivo_gol_contextual", "")
-    verm = metricas.get("motivo_vermelho_contextual", "")
-    delta = metricas.get("motivo_delta_contextual", "")
-    padrao = metricas.get("padrao_alfa", "")
-
-    textos = []
-
-    if padrao in ["ALFA_FT_DIAMANTE", "ALFA_HT_DIAMANTE", "ALFA_FT_FORTE", "ALFA_HT_FORTE"]:
-        textos.append("🧠 Padrão ALFA: IP sustentado + Chance de Gol dentro da base histórica.")
-    elif padrao in ["ALFA_FT_BASE", "ALFA_HT_BASE", "ALFA_FT_PRESSAO_SEM_CHANCE", "ALFA_HT_PRESSAO_SEM_CHANCE", "ALFA_OBSERVACAO_SEM_CONTINUIDADE"]:
-        textos.append("⚠️ Padrão ALFA: contexto forte, mas com ressalva em algum ponto da régua.")
-
-    if motivo in ["GOL_ZEBRA_CONTRA_FLUXO", "GOL_TIME_PRESSIONADO_ABRIU_JOGO"]:
-        textos.append("🔥 Contexto extra: gol contra o fluxo aumentou a urgência ofensiva.")
-    elif motivo == "GOL_CONTRA_FLUXO_CONTEXTO_BOM":
-        textos.append("🔥 Contexto extra: time pressionado marcou, mas o jogo segue aberto.")
-    elif motivo == "PRESSAO_PREMIADA_MAS_VIVA":
-        textos.append("⚠️ Contexto: pressão já foi premiada, mas segue viva.")
-    elif motivo == "FAVORITO_MARCOU_MAS_OPONENTE_PRESSIONA":
-        textos.append("🔥 Contexto extra: gol anterior não matou o jogo; adversário segue pressionando.")
-    elif motivo == "GOL_EMPATE_FT_ABRIU_VIRADA":
-        textos.append("🔥 Contexto extra: empate tardio com pressão viva manteve cenário de virada.")
-    elif motivo in ["TRAVA_CONFIRMACAO_PRESSAO_PREMIADA_5M", "TRAVA_CONFIRMACAO_GOL_RECENTE_5M"]:
-        textos.append("⛔ Confirmação travada/rebaixada por gol recente.")
-
-    if delta == "CONFIRMACAO_MELHOROU":
-        textos.append("📈 Confirmação: pressão aumentou em relação ao primeiro gatilho.")
-    elif delta == "CONFIRMACAO_PIOROU":
-        textos.append("⚠️ Confirmação: pressão caiu em relação ao primeiro gatilho.")
-
-    if verm == "VERMELHO_ABRIU_PRESSAO":
-        textos.append("🟥 Contexto extra: superioridade numérica reforça a pressão ofensiva.")
-
-    if metricas.get("bonus_bot_confianca", 0) > 0:
-        textos.append("⭐ Bot de confiança: ARCE/CHAMA reforçou a leitura do sinal.")
-
-    return "\n" + "\n".join(textos) if textos else ""
-
-
-def montar_mensagem_gol(jogo, estrategia, score, metricas):
-    ctx = texto_contexto_gol(metricas)
-    link = f"\n🔗 Bet365: {html.escape(metricas['bet365'])}" if metricas.get("bet365") else ""
-
-    nome_bot = html.escape(nome_publico_bot(estrategia))
-    titulo = "🔁 ENTRADA CONFIRMADA" if eh_confirmacao(estrategia) else "🔥 ENTRADA VALIDADA"
-    motivo_pos_gol = metricas.get("motivo_pos_gol_institucional", "")
-    if motivo_pos_gol == "CONFIRMACAO_VALIDOU_MASSACRE_POS_GOL":
-        titulo = "🔁 ENTRADA CONFIRMADA"
-
-    leitura_base = "Pressão viva, domínio ofensivo e contexto aberto."
-    if motivo_pos_gol == "CONFIRMACAO_VALIDOU_MASSACRE_POS_GOL":
-        leitura_base = "Gol recente já foi absorvido. O favorito/dominante continuou pressionando forte."
-    elif metricas.get("motivo_funil") == "FUNIL_APROVADO":
-        leitura_base = "Jogo passou pelo funil ALFA: pressão, validação, travas e classificação."
-
-    return f"""{titulo}
-
-⚽ <b>COUTIPS {nome_bot}</b>
-
-🏟 <b>Jogo:</b> {html.escape(str(jogo))}
-⏱ <b>Minuto:</b> {metricas['tempo']}'
-⚽ <b>Placar:</b> {html.escape(str(metricas['placar']))}
-
-📊 <b>Chance ALFA:</b> {score}%
-🎯 <b>Entrada:</b> {html.escape(str(metricas['mercado']))}
-💰 <b>Odd mínima:</b> 1.60
-
-🧠 <b>Leitura:</b>
-{html.escape(leitura_base)}{ctx}
-
-📌 <b>Gestão:</b>
-Entrada padrão — 1% da banca.
-Evitar entrada se sair gol antes de apostar.{link}
-
-COUTIPS — leitura ao vivo com pressão, contexto e disciplina."""
-
-
-def montar_mensagem_gol_nova(jogo, estrategia, score_alfa, score_media, metricas, link_bet365=""):
-    """Mensagem enxuta com cabeçalho dinâmico baseado no score médio."""
-    eh_conf = eh_confirmacao(estrategia)
-    eh_ht_flag = "HT" in estrategia or "ht" in estrategia.lower()
-
-    # Cabeçalho por score e tipo
-    if score_media >= 90:
-        emoji = "💎"
-    else:
-        emoji = "🎯"
-
-    periodo = "PRIMEIRO TEMPO" if eh_ht_flag else "SEGUNDO TEMPO"
-    if eh_conf:
-        cabecalho = f"{emoji} ALFA - CONFIRMADO | {periodo}"
-    else:
-        cabecalho = f"{emoji} ALFA - AO VIVO | {periodo}"
-
-    # Classificação da liga
-    liga = classificar_liga(metricas.get("competicao", ""))
-    emojis_liga = {
-        "PREMIUM":  "🏆 Liga: PREMIUM",
-        "MODERADA": "📊 Liga: MODERADA",
-        "NEUTRA":   "⚪ Liga: NEUTRA",
-        "UNDER":    "⚠️ Liga: UNDER",
-        "PERIGOSA": "🚨 Liga: PERIGOSA",
-    }
-    linha_liga = emojis_liga.get(liga, f"⚪ Liga: {liga}")
-
-    link = f"\n🔗 {html.escape(link_bet365)}" if link_bet365 else ""
-
-    return f"""{cabecalho}
-
-🏟 {html.escape(str(jogo))}
-⏱ {metricas.get('tempo', '?')}' | {html.escape(str(metricas.get('placar', '?')))}
-🎯 {html.escape(str(metricas.get('mercado', '?')))}
-📊 COUTIPS: {score_media}%
-{linha_liga}
-💰 Odd mínima de entrada: 1.65
-📝 SIGA SUA GESTÃO DE BANCA
-⛔ APOSTE COM RESPONSABILIDADE ⛔{link}"""
-
-
-def montar_mensagem_canto(jogo, estrategia, score, metricas):
-    # DESATIVADO — cantos não são enviados na fase atual
-    # TODO: reimplementar quando cantos forem reabertos
-    return ""
-
-
-# =========================================================
-# OPENAI — ANÁLISE CONTEXTUAL
-# =========================================================
-
-_PROMPT_NORMAL = """Você é um auditor de futebol ao vivo do sistema ALFA.
-
-Sua função: verificar 6 critérios objetivos e informar se o contexto confirma ou enfraquece a leitura do Python.
-Você NÃO recalcula o score. NÃO cria regras. NÃO interpreta livremente.
-
-Para cada critério, classifique como POSITIVO, NEUTRO ou NEGATIVO.
-Depois some os positivos e responda conforme a tabela de decisão.
-
-═══════════════════════════════════════════════
-CRITÉRIO 1 — PRESSÃO VIVA
-═══════════════════════════════════════════════
-Verifique U5 e U10 do lado dominante/favorito.
-→ U5 ≥ 3 E U10 ≥ 6 = POSITIVO
-→ U5 ≤ 1 OU U10 ≤ 3 = NEGATIVO
-→ Caso contrário = NEUTRO
-
-═══════════════════════════════════════════════
-CRITÉRIO 2 — PRESSÃO PREMIADA
-═══════════════════════════════════════════════
-O lado que pressionava já foi premiado com gol?
-→ Não foi premiado = POSITIVO
-→ Foi premiado e continua pressionando = NEUTRO
-→ Foi premiado e intensidade caiu = NEGATIVO
-
-═══════════════════════════════════════════════
-CRITÉRIO 3 — GOL RECENTE (últimos 10 minutos)
-═══════════════════════════════════════════════
-Houve gol nos últimos 10 minutos?
-→ Não houve = POSITIVO
-→ Gol do dominante + pressão continua = NEUTRO
-→ Gol do dominante + pressão morreu = NEGATIVO
-→ Gol do adversário + pressão continua = POSITIVO
-→ Gol do adversário + pressão morreu = NEUTRO
-
-═══════════════════════════════════════════════
-CRITÉRIO 4 — FOME DO FAVORITO
-═══════════════════════════════════════════════
-Verifique situação do favorito no placar.
-→ Favorito perdendo = POSITIVO
-→ Favorito empatando = POSITIVO
-→ Favorito ganhando por 1 = NEUTRO
-→ Favorito ganhando por 2+ = NEGATIVO LEVE (conta como 0, não como negativo)
-
-═══════════════════════════════════════════════
-CRITÉRIO 5 — CONSEQUÊNCIA REAL
-═══════════════════════════════════════════════
-Verifique RDA, remates à baliza e XG.
-→ (RDA ≥ 2 OU RB ≥ 2) E XG ≥ 0.50 = POSITIVO
-→ Não bate = NEGATIVO
-AP alto sem remates e sem XG = fake pressure = NEGATIVO
-
-═══════════════════════════════════════════════
-CRITÉRIO 6 — DNA PROJETADO
-═══════════════════════════════════════════════
-Calcule internamente:
-
-PILAR 1 - FAVORITISMO:
-odd ≤ 1.55 = 1.0 | odd 1.56-2.00 = 0.5 | acima 2.00 = 0
-
-PILAR 2 - XG:
-xg ≥ 1.80 = 1.0 | xg ≥ 1.60 = 0.7 | xg ≥ 1.40 = 0.4 | abaixo = 0
-
-PILAR 3 - L15:
-l15 ≥ 0.65 = 1.0 | l15 ≥ 0.55 = 0.7 | l15 ≥ 0.45 = 0.4 | abaixo = 0
-
-Some os três pilares:
-≥ 2.6 = DNA_FORTE → POSITIVO
-≥ 2.1 = DNA_ACEITAVEL → POSITIVO
-≥ 1.6 = DNA_PARCIAL → NEUTRO
-< 1.6 = DNA_FRACO → NEGATIVO
-
-═══════════════════════════════════════════════
-CRITÉRIO 6 — CONTINUIDADE OFENSIVA
-═══════════════════════════════════════════════
-Verifique tendência de U5 e U10 nos dados.
-→ U5 crescendo OU U10 crescendo = POSITIVO
-→ Queda clara de intensidade recente = NEGATIVO
-→ Estável = NEUTRO
-
-═══════════════════════════════════════════════
-DECISÃO FINAL
-═══════════════════════════════════════════════
-Some apenas os POSITIVOS (NEUTRO = 0, NEGATIVO = -1):
-
-6 positivos → APROVADO, confianca: 95
-5 positivos → APROVADO, confianca: 88
-4 positivos → APROVADO, confianca: 80
-3 positivos → APROVADO, confianca: 70
-2 ou menos → BLOQUEADO, confianca: 50
-
-REGRAS ABSOLUTAS:
-→ Placar adverso para o favorito é FAVORÁVEL para over — não bloqueia
-→ Volume sem consequência (AP alto, XG baixo, RDA=0) = fake pressure = BLOQUEADO
-→ Dados ao vivo prevalecem sobre histórico
-→ Liga, copa, prestígio: irrelevante
-
-Responda APENAS com JSON puro, sem markdown:
-{"decisao": "APROVADO" ou "BLOQUEADO", "confianca": numero 0-100}"""
-
-_PROMPT_CONFIRMACAO = """Você é um auditor de futebol ao vivo do sistema ALFA. O lado dominante marcou um gol.
-
-Sua função: verificar se a pressão continua válida para mais um gol.
-Você NÃO recalcula o score. NÃO cria regras. NÃO interpreta livremente.
-
-Para cada critério, classifique como POSITIVO, NEUTRO ou NEGATIVO.
-
-═══════════════════════════════════════════════
-CRITÉRIO 1 — PRESSÃO CONTINUA VIVA
-═══════════════════════════════════════════════
-Verifique U5 e U10 do lado dominante após o gol.
-→ U5 ≥ 3 E U10 ≥ 6 = POSITIVO
-→ U5 ≤ 1 OU U10 ≤ 3 = NEGATIVO
-→ Caso contrário = NEUTRO
-
-═══════════════════════════════════════════════
-CRITÉRIO 2 — TIPO DE GOL
-═══════════════════════════════════════════════
-→ Gol do dominante que empatou ou ainda está perdendo = POSITIVO
-→ Gol do adversário em transição = POSITIVO (dominante vai apertar mais)
-→ Gol do dominante que colocou na frente ou ampliou = NEUTRO
-
-═══════════════════════════════════════════════
-CRITÉRIO 3 — CONSEQUÊNCIA MANTIDA
-═══════════════════════════════════════════════
-Verifique RDA e remates à baliza recentes.
-→ RDA ≥ 1 OU RB ≥ 1 nos últimos minutos = POSITIVO
-→ Zero finalização desde o gol = NEGATIVO
-
-═══════════════════════════════════════════════
-CRITÉRIO 4 — DNA PROJETADO
-═══════════════════════════════════════════════
-Calcule internamente (mesmo cálculo do prompt normal):
-≥ 2.6 = DNA_FORTE → POSITIVO
-≥ 2.1 = DNA_ACEITAVEL → POSITIVO
-≥ 1.6 = DNA_PARCIAL → NEUTRO
-< 1.6 = DNA_FRACO → NEGATIVO
-
-═══════════════════════════════════════════════
-DECISÃO FINAL
-═══════════════════════════════════════════════
-4 positivos → APROVADO, confianca: 92
-3 positivos → APROVADO, confianca: 80
-2 positivos → APROVADO, confianca: 68
-1 ou menos → BLOQUEADO, confianca: 50
-
-REGRAS ABSOLUTAS:
-→ Gol sofrido em transição = dominante vai apertar mais = FAVORÁVEL
-→ AP alto após gol mas zero remates e zero RDA = BLOQUEADO
-→ Copa, liga, prestígio: irrelevante
-
-Responda APENAS com JSON puro, sem markdown:
-{"decisao": "APROVADO" ou "BLOQUEADO", "confianca": numero 0-100}"""
-
-
-async def consultar_openai(texto_alerta: str, score_alfa: int, jogo: str,
-                           estrategia: str, eh_conf: bool = False) -> dict:
-    """Consulta OpenAI e retorna decisão + confiança."""
-    if not OPENAI_API_KEY:
-        return {"decisao": "APROVADO", "confianca": score_alfa}
-
-    prompt_sistema = _PROMPT_CONFIRMACAO if eh_conf else _PROMPT_NORMAL
-    prompt_usuario = f"Jogo: {jogo}\nEstratégia: {estrategia}\n\n{texto_alerta}"
-
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
     try:
-        async with httpx.AsyncClient(timeout=15.0) as cli:
-            resp = await cli.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers={"Authorization": f"Bearer {OPENAI_API_KEY}",
-                         "Content-Type": "application/json"},
-                json={"model": OPENAI_MODEL, "max_tokens": 80, "temperature": 0.1,
-                      "messages": [{"role": "system", "content": prompt_sistema},
-                                   {"role": "user",   "content": prompt_usuario}]},
-            )
-            resp.raise_for_status()
-            texto = resp.json()["choices"][0]["message"]["content"].strip()
-            texto = texto.replace("```json", "").replace("```", "").strip()
-            import json as _json
-            resultado = _json.loads(texto)
-            decisao = str(resultado.get("decisao", "APROVADO")).upper()
-            if decisao not in ("APROVADO", "BLOQUEADO"):
-                decisao = "APROVADO"
-            confianca = int(resultado.get("confianca", score_alfa))
-            log(f"🤖 OpenAI | {jogo} | {decisao} | confiança={confianca}%")
-            return {"decisao": decisao, "confianca": confianca}
-
-    except httpx.TimeoutException:
-        log(f"⚠️ OpenAI timeout — aprovando por fallback: {jogo}")
-        return {"decisao": "APROVADO", "confianca": score_alfa}
+        async with httpx.AsyncClient(timeout=OPENAI_TIMEOUT) as http:
+            r = await http.post("https://api.openai.com/v1/chat/completions", json=payload, headers=headers)
+            r.raise_for_status()
+            content = r.json()["choices"][0]["message"]["content"].strip()
+        decisao = "APROVAR" if "APROVAR" in content.upper() else "BLOQUEAR" if "BLOQUEAR" in content.upper() else "APROVAR"
+        conf = pegar_numero(r"CONFIANCA\s*=\s*(\d+)", content, decisao_py.score)
+        if conf == decisao_py.score:
+            conf = pegar_numero(r"CONFIANÇA\s*=\s*(\d+)", content, decisao_py.score)
+        motivo = content[:250]
+        log(f"🤖 OpenAI | {m.jogo} | {decisao} | confiança={conf}")
+        return decisao, clamp(conf), motivo
     except Exception as e:
-        log(f"⚠️ OpenAI erro — aprovando por fallback: {e}")
-        return {"decisao": "APROVADO", "confianca": score_alfa}
+        log(f"⚠️ OpenAI falhou | usando score Python | {type(e).__name__}: {e}")
+        return "APROVAR", decisao_py.score, "OPENAI_FALHOU_USANDO_SCORE_PYTHON"
 
 
-LOG_CSV_PATH = os.getenv("LOG_CSV_PATH", "alertas_enviados.csv")
-_CSV_CABECALHO = [
-    "data_hora", "jogo", "estrategia", "minuto", "placar",
-    "score_python", "score_medio", "mercado", "liga", "lado_dominante",
-    "odd_favorito", "faixa_odd", "odd_bonus",
-    "dna_class", "dna_score", "dna_ajuste",
-    "ht_massacre_class", "ht_massacre_score", "ht_massacre_ajuste",
-        "decisao_ia", "confianca_ia",
-    "motivo_gol", "motivo_pos_gol", "pressao_viva",
-    "resultado",
+def calcular_protecao_ia(m: Metricas, decisao_py: DecisaoPython, decisao_ia: str, confianca_ia: int) -> DecisaoIA:
+    original = confianca_ia
+    proteger = False
+    motivo = "SEM_PROTECAO"
+    piso = 0
+
+    lado = m.lado_pressionante
+    if lado in {"CASA", "FORA"} and decisao_py.score >= 82 and not vermelho_contra_pressionante(m):
+        if m.valor_pos_evento_classe in {"GOL_CONTRA_FLUXO_VALORIZA", "PRESSAO_PREMIADA_MAS_CONTINUA", "FAVORITO_NAO_VENCE_PRESSAO_SUSTENTADA"}:
+            proteger = True
+            motivo = m.valor_pos_evento_classe
+        elif eh_confirmacao(m.estrategia) and decisao_py.detalhes.get("componentes", {}).get("confirmacao", 0) >= 6:
+            proteger = True
+            motivo = "CONFIRMACAO_MELHOROU_CLARAMENTE"
+        elif m.lado_favorito == lado and favorito_nao_vencendo(m) and pressao_viva_lado(m, lado):
+            proteger = True
+            motivo = "FAVORITO_NAO_VENCE_COM_PRESSAO_VIVA"
+
+    # Impedimentos de proteção.
+    impedimentos = []
+    if m.liga == "PERIGOSA":
+        impedimentos.append("LIGA_PERIGOSA")
+    if lado not in {"CASA", "FORA"}:
+        impedimentos.append("SEM_LADO_PRESSIONANTE")
+    elif pressao_morta_lado(m, lado):
+        impedimentos.append("PRESSAO_MORTA")
+    if decisao_py.score < 82:
+        impedimentos.append("SCORE_PYTHON_BAIXO")
+    if vermelho_contra_pressionante(m):
+        impedimentos.append("VERMELHO_CONTRA_PRESSIONANTE")
+
+    if impedimentos:
+        proteger = False
+        motivo = "NAO_PROTEGER_" + "+".join(impedimentos)
+
+    if proteger:
+        if eh_ft(m.estrategia):
+            piso = 78
+            if m.odd_favorito and m.odd_favorito <= 1.30 and favorito_nao_vencendo(m):
+                piso = 82
+            if eh_confirmacao(m.estrategia):
+                piso = max(piso, 84)
+        else:
+            piso = 80
+            if (m.odd_favorito and m.odd_favorito <= 1.30) or pressao_extrema_lado(m, lado):
+                piso = 84
+        corrigida = max(confianca_ia, piso)
+        log(f"🛡️ PROTECAO_IA_CONTEXTUAL_ATIVA | ia_original={original} | ia_corrigida={corrigida} | motivo={motivo} | score_python={decisao_py.score}")
+        m.protecao_ia_ativa = True
+        return DecisaoIA(decisao_ia, original, corrigida, "IA_PROTEGIDA", True, motivo)
+
+    log(f"🧪 PROTECAO_IA_NAO_ATIVADA | motivo={motivo} | ia={original} | score_python={decisao_py.score}")
+    m.protecao_ia_ativa = False
+    return DecisaoIA(decisao_ia, original, confianca_ia, "SEM_PROTECAO", False, motivo)
+
+
+# =========================================================
+# MENSAGEM TELEGRAM / CSV
+# =========================================================
+
+def emoji_liga(liga: str) -> str:
+    return {"PREMIUM": "🏆", "MODERADA": "📊", "NEUTRA": "⚪", "UNDER": "🟡", "PERIGOSA": "🔴"}.get(liga, "⚪")
+
+
+def emoji_score(score: int) -> str:
+    return "💎" if score >= 90 else "🎯"
+
+
+def titulo_periodo(estrategia: str) -> str:
+    if estrategia == "ALFA_HT_CONFIRMACAO":
+        return "ALFA - CONFIRMADO | PRIMEIRO TEMPO"
+    if estrategia == "ALFA_FT_CONFIRMACAO":
+        return "ALFA - CONFIRMADO | SEGUNDO TEMPO"
+    if eh_ht(estrategia):
+        return "ALFA - AO VIVO | PRIMEIRO TEMPO"
+    return "ALFA - AO VIVO | SEGUNDO TEMPO"
+
+
+def formatar_alerta_cliente(m: Metricas, score: int) -> str:
+    link = m.bet365 or ""
+    linhas = [
+        f"{emoji_score(score)} {titulo_periodo(m.estrategia)}",
+        "",
+        f"🏟 {html.escape(m.jogo)}",
+        f"⏱ {m.tempo}' | {m.placar}",
+        f"🎯 {m.mercado}",
+        f"📊 COUTIPS: {score}%",
+        f"{emoji_liga(m.liga)} Liga: {m.liga}",
+        f"💰 Odd mínima de entrada: {ODD_MINIMA_CLIENTE}",
+        "📝 SIGA SUA GESTÃO DE BANCA",
+        "⛔ APOSTE COM RESPONSABILIDADE ⛔",
+    ]
+    if link:
+        linhas.append(f"🔗 {link}")
+    return "\n".join(linhas)
+
+
+def canal_auditoria(m: Metricas, aprovado: bool) -> str:
+    if eh_ht(m.estrategia):
+        return AUDIT_HT_OK if aprovado else AUDIT_HT_NO
+    return AUDIT_FT_OK if aprovado else AUDIT_FT_NO
+
+
+async def enviar_auditoria(m: Metricas, score_py: int, score_ia: int, score_medio: int, aprovado: bool, motivo: str) -> None:
+    canal = canal_auditoria(m, aprovado)
+    if not canal:
+        return
+    status = "APROVADO" if aprovado else "REPROVADO"
+    emoji = "✅" if aprovado else "❌"
+    texto = (
+        f"{emoji} {status} | {m.estrategia}\n"
+        f"🏟 {m.jogo}\n"
+        f"⏱ {m.tempo}' | {m.placar}\n"
+        f"📊 PY={score_py}% | IA={score_ia}% | MÉDIA={score_medio}%\n"
+        f"🏆 Liga: {m.liga}\n"
+        f"🧠 Valor: {m.valor_pos_evento_classe}\n"
+        f"📝 {motivo}"
+    )
+    await send_resiliente(canal, texto)
+
+
+def garantir_csv() -> None:
+    if CSV_PATH.exists():
+        return
+    with CSV_PATH.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
+        writer.writeheader()
+
+
+CSV_FIELDS = [
+    "data_hora", "jogo", "estrategia", "minuto", "placar", "mercado",
+    "score_python", "decisao_ia", "ia_original", "ia_corrigida", "score_medio",
+    "lado_favorito", "odd_favorito", "lado_pressionante", "ultimo_gol_lado",
+    "valor_pos_evento_classe", "valor_pos_evento_motivo", "protecao_ia_ativa",
+    "liga", "decisao_final", "motivo_bloqueio", "resultado_manual", "cornerpro", "bet365",
 ]
 
 
-def registrar_alerta_csv(alerta: dict):
-    """Registra alerta enviado em CSV para análise futura de resultados.
-
-    A coluna 'resultado' fica em branco — você preenche manualmente
-    após o jogo com: GOL, NAO_GOL ou INCONCLUSIVO.
-    """
-    m = alerta.get("metricas", {})
-    u5 = sum(m.get("ultimos5", (0, 0)))
-    u10 = sum(m.get("ultimos10", (0, 0)))
-    pressao_viva_flag = "SIM" if u5 >= 3 and u10 >= 6 else "NÃO"
-    linha = {
-        "data_hora":      datetime.now().strftime("%d/%m/%Y %H:%M"),
-        "jogo":           alerta.get("jogo", ""),
-        "estrategia":     alerta.get("estrategia", ""),
-        "minuto":         m.get("tempo", ""),
-        "placar":         m.get("placar", ""),
-        "score_python":   alerta.get("score_gol", ""),
-        "score_medio":    alerta.get("score_medio", ""),
-        "mercado":        m.get("mercado", ""),
-        "liga":           m.get("competicao", ""),
-        "lado_dominante": m.get("lado_dominante", ""),
-        "odd_favorito":   m.get("odd_favorito", ""),
-        "faixa_odd":      m.get("faixa_odd", ""),
-        "odd_bonus":      m.get("odd_bonus", ""),
-        "dna_class":      m.get("dna_class", ""),
-        "ht_massacre_class":  m.get("ht_massacre_class", ""),
-        "ht_massacre_score":  m.get("ht_massacre_score", ""),
-        "ht_massacre_ajuste": m.get("ht_massacre_ajuste", ""),
-        "dna_score":      m.get("dna_score", ""),
-        "dna_ajuste":     m.get("dna_ajuste", ""),
-        "ht_massacre_class":  m.get("ht_massacre_class", ""),
-        "ht_massacre_score":  m.get("ht_massacre_score", ""),
-        "ht_massacre_ajuste": m.get("ht_massacre_ajuste", ""),
-        "decisao_ia":     alerta.get("decisao_ia", ""),
-        "confianca_ia":   alerta.get("confianca_ia", ""),
-        "motivo_gol":     m.get("motivo_gol_contextual", ""),
-        "motivo_pos_gol": m.get("motivo_pos_gol_institucional", ""),
-        "pressao_viva":   pressao_viva_flag,
-        "resultado":      "",  # preencher manualmente após o jogo
+def registrar_csv(m: Metricas, decisao_py: DecisaoPython, decisao_ia: DecisaoIA, score_medio: int, decisao_final: str, motivo: str) -> None:
+    garantir_csv()
+    row = {
+        "data_hora": now_iso(),
+        "jogo": m.jogo,
+        "estrategia": m.estrategia,
+        "minuto": m.tempo,
+        "placar": m.placar,
+        "mercado": m.mercado,
+        "score_python": decisao_py.score,
+        "decisao_ia": decisao_ia.decisao,
+        "ia_original": decisao_ia.confianca_original,
+        "ia_corrigida": decisao_ia.confianca_corrigida,
+        "score_medio": score_medio,
+        "lado_favorito": m.lado_favorito,
+        "odd_favorito": m.odd_favorito,
+        "lado_pressionante": m.lado_pressionante,
+        "ultimo_gol_lado": m.ultimo_gol_lado,
+        "valor_pos_evento_classe": m.valor_pos_evento_classe,
+        "valor_pos_evento_motivo": m.valor_pos_evento_motivo,
+        "protecao_ia_ativa": m.protecao_ia_ativa,
+        "liga": m.liga,
+        "decisao_final": decisao_final,
+        "motivo_bloqueio": motivo,
+        "resultado_manual": "",
+        "cornerpro": m.cornerpro,
+        "bet365": m.bet365,
     }
-    try:
-        arquivo_existe = os.path.isfile(LOG_CSV_PATH)
-        with open(LOG_CSV_PATH, "a", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=_CSV_CABECALHO)
-            if not arquivo_existe:
-                writer.writeheader()
-            writer.writerow(linha)
-        log(f"📋 Alerta registrado no CSV: {alerta.get('jogo')} | {alerta.get('score_gol')}%")
-    except Exception as e:
-        log(f"⚠️ Erro ao salvar CSV: {e}")
+    with CSV_PATH.open("a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
+        writer.writerow(row)
 
 
 # =========================================================
-# FILA / ENVIO
+# ENVIO RESILIENTE / FILA
 # =========================================================
 
-async def trabalhador_envio():
-    log("📤 Fila de envio iniciada.")
-    log(f"📡 Canais ativos: principal={TARGET_CHANNEL} | confirmação={CONFIRMATION_CHANNEL}")
-    if MODO_TESTE:
-        log(f"🧪 MODO TESTE ATIVO — envios apenas para {CONFIRMATION_CHANNEL}")
-    if OPENAI_HABILITADO and OPENAI_API_KEY:
-        log(f"🤖 OpenAI ATIVA ({OPENAI_MODEL})")
+async def send_resiliente(canal: str, mensagem: str, parse_mode: Optional[str] = None, max_tentativas: int = 3) -> bool:
+    for tentativa in range(1, max_tentativas + 1):
+        try:
+            if parse_mode:
+                await client.send_message(canal, mensagem, parse_mode=parse_mode)
+            else:
+                await client.send_message(canal, mensagem)
+            return True
+        except FloodWaitError as e:
+            espera = int(getattr(e, "seconds", 10)) + 1
+            log(f"⚠️ FloodWait {espera}s | canal={canal}")
+            await asyncio.sleep(espera)
+        except TypeNotFoundError:
+            log(f"⚠️ TypeNotFoundError envio tent={tentativa}/{max_tentativas} | reconectando")
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+            await asyncio.sleep(2)
+            await client.connect()
+        except Exception as e:
+            log(f"⚠️ Erro envio tent={tentativa}/{max_tentativas} | {type(e).__name__}: {e}")
+            await asyncio.sleep(1)
+    log(f"❌ ALERTA NÃO ENVIADO | canal={canal}")
+    return False
 
+
+async def trabalhador_fila_envio() -> None:
+    log("✅ Fila de envio iniciada.")
     while True:
         item = await fila_envio.get()
         try:
-            idade = time.time() - item.get("gerado_em", time.time())
-            if idade > 120:
-                log(f"🗑️ ALERTA EXPIRADO | {item.get('alerta',{}).get('jogo','?')}")
-                continue
-
-            alerta   = item["alerta"]
-            mercado  = item["mercado"]
-            texto_raw = item.get("texto_original", "")
-
-            if mercado != "GOL":
-                log(f"⚠️ Mercado ignorado: {mercado}")
-                continue
-
-            score_alfa  = alerta["score_gol"]
-            jogo        = alerta["jogo"]
-            estrategia  = alerta["estrategia"]
-            eh_conf     = eh_confirmacao(estrategia)
-
-            # ── OpenAI decide ────────────────────────────────────────────────
-            score_ia = score_alfa  # fallback se OpenAI desligada
-            if OPENAI_HABILITADO and OPENAI_API_KEY and texto_raw:
-                resultado_ia = await consultar_openai(
-                    texto_alerta=texto_raw,
-                    score_alfa=score_alfa,
-                    jogo=jogo,
-                    estrategia=estrategia,
-                    eh_conf=eh_conf,
-                )
-                score_ia = resultado_ia["confianca"]
-                if resultado_ia["decisao"] == "BLOQUEADO":
-                    log(f"🤖 OpenAI REBAIXOU | confiança={score_ia}% | {jogo}")
-                    if score_ia <= 45:
-                        # Bloqueio crítico — confiança muito baixa, não segue adiante
-                        log(f"🤖 OpenAI BLOQUEIO CRÍTICO | confiança={score_ia}% | {jogo}")
-                        liga_audit = classificar_liga(alerta["metricas"].get("competicao", ""))
-                        await enviar_auditoria(
-                            client, estrategia, jogo, score_alfa,
-                            score_ia, score_alfa, liga_audit,
-                            aprovado=False,
-                            motivo=f"OpenAI bloqueio crítico (confiança {score_ia}%)"
-                        )
-                        continue
-                    # Confiança > 45: não bloqueia direto — deixa a média decidir
-                    log(f"🤖 OpenAI rebaixou mas não bloqueou — média vai decidir | confiança={score_ia}%")
-
-            # ── Média ALFA + IA ───────────────────────────────────────────────
-            score_medio = round((score_alfa + score_ia) / 2)
-
-            # ── Monta mensagem nova ───────────────────────────────────────────
-            mensagem = montar_mensagem_gol_nova(
-                jogo=jogo,
-                estrategia=estrategia,
-                score_alfa=score_alfa,
-                score_media=score_medio,
-                metricas=alerta["metricas"],
-                link_bet365=alerta["metricas"].get("bet365", ""),
-            )
-            # Mensagem nova é texto puro (sem HTML) — não usar parse_mode html
-            parse_mode_envio = None
-
-            # ── Destino por liga e tipo ───────────────────────────────────────
-            liga = classificar_liga(alerta["metricas"].get("competicao", ""))
-
-            # Salva campos de auditoria no alerta antes de registrar CSV
-            alerta["score_medio"] = score_medio
-            alerta["decisao_ia"] = resultado_ia.get("decisao", "") if OPENAI_HABILITADO and OPENAI_API_KEY and texto_raw else ""
-            alerta["confianca_ia"] = score_ia
-            if "dna_ajuste" not in alerta.get("metricas", {}):
-                alerta["metricas"]["dna_ajuste"] = alerta["metricas"].get("dna_score", "")
-
-            if MODO_TESTE:
-                destino = CONFIRMATION_CHANNEL
-                await send_resiliente(destino, mensagem, parse_mode=parse_mode_envio)
-                marcar_enviado(item["chave_envio"])
-                registrar_alerta_csv(alerta)
-                log(f"✅ ENVIADO | {estrategia} | ALFA={score_alfa}% IA={score_ia}% MÉDIA={score_medio}% | {jogo} | {destino}")
-            elif eh_conf:
-                if score_medio >= 92:
-                    await send_resiliente(TARGET_CHANNEL, mensagem, parse_mode=parse_mode_envio)
-                    await send_resiliente(CONFIRMATION_CHANNEL, mensagem, parse_mode=parse_mode_envio)
-                    marcar_enviado(item["chave_envio"])
-                    registrar_alerta_csv(alerta)
-                    log(f"✅ ENVIADO | {estrategia} | ALFA={score_alfa}% IA={score_ia}% MÉDIA={score_medio}% | Liga={liga} | {jogo} | AMBOS CANAIS")
-                elif score_medio >= 87:
-                    await send_resiliente(CONFIRMATION_CHANNEL, mensagem, parse_mode=parse_mode_envio)
-                    marcar_enviado(item["chave_envio"])
-                    registrar_alerta_csv(alerta)
-                    log(f"✅ ENVIADO | {estrategia} | ALFA={score_alfa}% IA={score_ia}% MÉDIA={score_medio}% | Liga={liga} | {jogo} | {CONFIRMATION_CHANNEL}")
-                    await enviar_auditoria(client, estrategia, jogo, score_alfa, score_ia, score_medio, liga, aprovado=True, motivo="Confirmação")
-                else:
-                    log(f"⛔ CONFIRMAÇÃO ABAIXO DO MÍNIMO | Média={score_medio}% < 87% | Liga={liga} | {jogo}")
-                    await enviar_auditoria(client, estrategia, jogo, score_alfa, score_ia, score_medio, liga, aprovado=False, motivo=f"Confirmação abaixo de 87%")
-            else:
-                if liga == "PREMIUM":
-                    corte_liga = int(os.getenv("CORTE_MEDIA_PREMIUM", "85"))
-                elif liga in ["NEUTRA", "MODERADA"]:
-                    corte_liga = int(os.getenv("CORTE_MEDIA_NEUTRA", "83"))
-                elif liga == "UNDER":
-                    corte_liga = int(os.getenv("CORTE_MEDIA_UNDER", "91"))
-                elif liga == "PERIGOSA":
-                    corte_liga = int(os.getenv("CORTE_MEDIA_PERIGOSA", "95"))
-                else:
-                    corte_liga = int(os.getenv("CORTE_MEDIA_NEUTRA", "83"))
-
-                if score_medio < corte_liga:
-                    log(f"⛔ BLOQUEADO MÉDIA FINAL | Liga={liga} | Média={score_medio}% < {corte_liga}% | {jogo}")
-                    await enviar_auditoria(client, estrategia, jogo, score_alfa, score_ia, score_medio, liga, aprovado=False, motivo=f"Média {score_medio}% < corte {corte_liga}%")
-                else:
-                    await send_resiliente(TARGET_CHANNEL, mensagem, parse_mode=parse_mode_envio)
-                    marcar_enviado(item["chave_envio"])
-                    registrar_alerta_csv(alerta)
-                    log(f"✅ ENVIADO | {estrategia} | ALFA={score_alfa}% IA={score_ia}% MÉDIA={score_medio}% | Liga={liga} | {jogo} | {TARGET_CHANNEL}")
-                    await enviar_auditoria(client, estrategia, jogo, score_alfa, score_ia, score_medio, liga, aprovado=True)
+            canal, mensagem, parse_mode = item
+            await send_resiliente(canal, mensagem, parse_mode=parse_mode)
             await asyncio.sleep(INTERVALO_ENVIO_SEGUNDOS)
-
-        except FloodWaitError as e:
-            log(f"⛔ FLOOD WAIT: {e.seconds}s")
-            await asyncio.sleep(e.seconds + 1)
         except Exception as e:
-            log(f"❌ ERRO AO ENVIAR: {e}")
+            log(f"❌ Erro trabalhador_fila_envio: {type(e).__name__}: {e}")
             log(traceback.format_exc())
         finally:
             fila_envio.task_done()
 
 
-
-async def decidir_e_enviar(chave_jogo):
+async def enfileirar_envio(canal: str, mensagem: str, parse_mode: Optional[str] = None) -> None:
     try:
-        await asyncio.sleep(JANELA_DECISAO_SEGUNDOS)
+        await fila_envio.put((canal, mensagem, parse_mode))
+    except asyncio.QueueFull:
+        log("❌ FILA CHEIA — alerta descartado por segurança")
 
-        # Lock ao fazer pop — garante que nenhuma mensagem nova
-        # adicione alertas enquanto a decisão está sendo tomada.
-        async with _lock_jogo(chave_jogo):
-            alertas = pendentes_por_jogo.pop(chave_jogo, [])
-            tarefas_decisao.pop(chave_jogo, None)
 
-        # Lock liberado — o resto do processamento é local e seguro.
-        if not alertas:
-            log(f"ℹ️ Nenhum alerta pendente para {chave_jogo}")
+# =========================================================
+# DECISÃO / PROCESSAMENTO
+# =========================================================
+
+def chave_alerta_unica(texto: str) -> str:
+    limpo = remover_acentos(texto)
+    jogo = extrair_jogo(limpo)
+    tempo = extrair_tempo(limpo)
+    resultado = extrair_resultado(limpo)
+    estrategia = detectar_estrategia(limpo)
+    return f"{normalizar_chave_jogo(jogo)}|{estrategia}|{tempo}|{resultado}"
+
+
+def pode_enviar(chave: str) -> bool:
+    agora = time.time()
+    ultimo = ultimos_enviados.get(chave)
+    if not ultimo:
+        return True
+    return agora - float(ultimo.get("recebido_em", 0)) >= COOLDOWN_SEGUNDOS
+
+
+def marcar_enviado(chave: str, m: Metricas, score: int) -> None:
+    ultimos_enviados[chave] = {"recebido_em": time.time(), "jogo": m.jogo, "score": score}
+
+
+def destino_principal(m: Metricas, score_medio: int) -> str:
+    if MODO_TESTE:
+        return CONFIRMATION_CHANNEL
+    if eh_confirmacao(m.estrategia):
+        # confirmação forte 92+ pode ir no principal; abaixo fica no canal técnico.
+        return TARGET_CHANNEL if score_medio >= 92 else CONFIRMATION_CHANNEL
+    return TARGET_CHANNEL
+
+
+async def processar_alerta(alerta: Alerta) -> None:
+    m = alerta.metricas
+    chave = alerta.chave_jogo
+
+    decisao_py = score_python_contextual(m, chave)
+    log(
+        f"📊 PY_PROCESSADO | {m.estrategia} | Gol={decisao_py.score}% | {m.jogo} | "
+        f"Liga={m.liga} | Fav={m.lado_favorito}/{m.odd_favorito} | Press={m.lado_pressionante} | Valor={m.valor_pos_evento_classe}"
+    )
+
+    decisao_ia_txt, confianca_ia, motivo_ia = await consultar_openai(m, decisao_py)
+    decisao_ia = calcular_protecao_ia(m, decisao_py, decisao_ia_txt, confianca_ia)
+
+    # Bloqueio crítico só depois da proteção contextual.
+    if decisao_ia.confianca_corrigida <= 45 and not decisao_ia.protecao_ativa:
+        score_medio = round((decisao_py.score + decisao_ia.confianca_corrigida) / 2)
+        motivo = f"IA_BLOQUEIO_CRITICO | {motivo_ia}"
+        log(f"⛔ BLOQUEADO IA CRITICA | IA={decisao_ia.confianca_corrigida}% | {m.jogo}")
+        registrar_csv(m, decisao_py, decisao_ia, score_medio, "REPROVADO", motivo)
+        await enviar_auditoria(m, decisao_py.score, decisao_ia.confianca_corrigida, score_medio, False, motivo)
+        ultimas_leituras_por_jogo[chave] = {"metricas": m, "score": decisao_py.score, "recebido_em": time.time()}
+        return
+
+    score_medio = clamp((decisao_py.score + decisao_ia.confianca_corrigida) / 2)
+    corte = corte_por_estrategia(m.estrategia)
+    aprovado = score_medio >= corte and decisao_py.status != "REPROVADO"
+
+    # Confirmação especial: se confirmou 92+, passa canal principal mesmo quando corte técnico menor.
+    if eh_confirmacao(m.estrategia) and score_medio >= 92:
+        aprovado = True
+
+    motivo_final = "APROVADO" if aprovado else f"MÉDIA={score_medio}% < {corte}% OU trava_py={decisao_py.motivo}"
+    registrar_csv(m, decisao_py, decisao_ia, score_medio, "APROVADO" if aprovado else "REPROVADO", motivo_final)
+    await enviar_auditoria(m, decisao_py.score, decisao_ia.confianca_corrigida, score_medio, aprovado, motivo_final)
+
+    ultimas_leituras_por_jogo[chave] = {"metricas": m, "score": decisao_py.score, "recebido_em": time.time()}
+
+    if not aprovado:
+        log(f"⛔ BLOQUEADO FINAL | score_medio={score_medio}% | corte={corte}% | {m.jogo}")
+        return
+
+    if not pode_enviar(chave):
+        log(f"⏳ COOLDOWN | {m.jogo}")
+        return
+
+    mensagem = formatar_alerta_cliente(m, score_medio)
+    canal = destino_principal(m, score_medio)
+    await enfileirar_envio(canal, mensagem)
+    marcar_enviado(chave, m, score_medio)
+    log(f"✅ ENVIADO/ENFILEIRADO | {m.estrategia} | score={score_medio}% | canal={canal} | {m.jogo}")
+
+
+async def janela_decisao(chave: str) -> None:
+    await asyncio.sleep(JANELA_DECISAO_SEGUNDOS)
+    async with lock_jogo(chave):
+        alertas = pendentes_por_jogo.pop(chave, [])
+        tarefas_decisao.pop(chave, None)
+    if not alertas:
+        return
+    # Usa o alerta mais recente da janela.
+    alerta = sorted(alertas, key=lambda a: a["recebido_em"])[-1]
+    await processar_alerta(alerta["alerta"])
+
+
+async def receber_mensagem(event: events.NewMessage.Event) -> None:
+    try:
+        texto = event.raw_text or ""
+        if not mensagem_valida(texto):
             return
 
-        escolhido = melhor_alerta(alertas)
-        confirmacoes = [a for a in alertas if eh_confirmacao(a.get("estrategia", ""))]
+        msg_id = str(getattr(event.message, "id", ""))
+        unique = f"{getattr(event, 'chat_id', '')}:{msg_id}:{hash(texto)}"
+        if unique in mensagens_processadas:
+            return
+        mensagens_processadas[unique] = time.time()
 
-        mercados = []
+        m = extrair_metricas(texto)
+        chave = normalizar_chave_jogo(m.jogo)
+        alerta = Alerta(texto=texto, metricas=m, chave_jogo=chave, recebido_em=time.time())
 
-        # FASE ATUAL: SOMENTE GOL
-        corte_escolhido = corte_gol_estrategia(escolhido["estrategia"])
-        if escolhido["score_gol"] >= corte_escolhido:
-            mercados.append("GOL")
+        log(f"📩 EVENTO RECEBIDO | {m.estrategia} | {m.jogo} | {m.tempo}' | {m.placar}")
 
-        if len(alertas) > 1:
-            log(
-                f"🏆 PRIORIDADE APLICADA | Escolhido: {escolhido['estrategia']} | "
-                f"Recebidos: {', '.join(a['estrategia'] for a in alertas)} | Jogo: {escolhido['jogo']}"
-            )
-
-        if mercados:
-            if eh_confirmacao(escolhido["estrategia"]) and not confirmacao_melhorou_forte(escolhido):
-                log(
-                    f"🟡 CONFIRMAÇÃO SEM MELHORA FORTE | Não vai ao canal principal | "
-                    f"{escolhido['estrategia']} | Gol={escolhido['score_gol']}% | {escolhido['jogo']}"
-                )
-            else:
-                for mercado in mercados:
-                    chave_envio = f"{chave_jogo}_{mercado}_MAIN"
-
-                    if ja_enviado_recentemente(chave_envio):
-                        log(f"⛔ BLOQUEADO POR COOLDOWN {mercado} | {escolhido['jogo']}")
-                        continue
-
-                    try:
-                        fila_envio.put_nowait({
-                            "alerta": escolhido,
-                            "mercado": mercado,
-                            "chave_envio": chave_envio,
-                            "texto_original": escolhido.get("texto_original", ""),
-                            "gerado_em": time.time(),
-                        })
-                    except asyncio.QueueFull:
-                        log(f"⚠️ FILA CHEIA — alerta descartado: {escolhido['jogo']} | {mercado}")
-        else:
-            log(f"⛔ BLOQUEADO FINAL | Gol={escolhido['score_gol']}% | {escolhido['jogo']}")
-            liga_bf = classificar_liga(escolhido["metricas"].get("competicao", ""))
-            await enviar_auditoria(
-                client,
-                escolhido["estrategia"],
-                escolhido["jogo"],
-                escolhido["score_gol"],
-                0,
-                escolhido["score_gol"],
-                liga_bf,
-                aprovado=False,
-                motivo=f"Score {escolhido['score_gol']}% abaixo do corte {corte_escolhido}%",
-            )
-
-        # Confirmações: somente GOL.
-        # Se melhorou forte ou gol contra fluxo, vai ao principal.
-        # Caso contrário, se passar corte técnico, vai para canal técnico.
-        for conf in confirmacoes:
-            if conf is escolhido and eh_confirmacao(escolhido["estrategia"]) and confirmacao_melhorou_forte(conf):
-                continue
-
-            conf_mercados = []
-
-            corte_conf = corte_gol_estrategia(conf["estrategia"])
-            if conf["score_gol"] >= corte_conf:
-                conf_mercados.append("GOL")
-
-            if not conf_mercados:
-                continue
-
-            destino = TARGET_CHANNEL if confirmacao_melhorou_forte(conf) else CONFIRMATION_CHANNEL
-            tipo_destino = "PRINCIPAL" if destino == TARGET_CHANNEL else "TÉCNICO"
-
-            for mercado in conf_mercados:
-                chave_envio = f"{chave_jogo}_{mercado}_{conf['estrategia']}_{tipo_destino}"
-
-                if ja_enviado_recentemente(chave_envio):
-                    continue
-
-                try:
-                    fila_envio.put_nowait({
-                        "alerta": conf,
-                        "mercado": mercado,
-                        "chave_envio": chave_envio,
-                        "destino": destino,
-                        "texto_original": conf.get("texto_original", ""),
-                        "gerado_em": time.time(),
-                    })
-                except asyncio.QueueFull:
-                    log(f"⚠️ FILA CHEIA — confirmação descartada: {conf['jogo']} | {mercado}")
-
-                log(
-                    f"📌 CONFIRMAÇÃO PARA CANAL {tipo_destino} | {conf['estrategia']} | "
-                    f"{mercado} | Gol={conf['score_gol']}% | {conf['jogo']}"
-                )
-
+        async with lock_jogo(chave):
+            pendentes_por_jogo.setdefault(chave, []).append({"alerta": alerta, "recebido_em": alerta.recebido_em})
+            if chave not in tarefas_decisao or tarefas_decisao[chave].done():
+                tarefas_decisao[chave] = asyncio.create_task(janela_decisao(chave))
+                log(f"⏳ ALERTA EM JANELA DE DECISÃO | {m.estrategia} | aguardando {JANELA_DECISAO_SEGUNDOS}s | {m.jogo}")
     except Exception as e:
-        log(f"❌ ERRO NA JANELA DE DECISÃO: {e}")
+        log(f"❌ Erro receber_mensagem: {type(e).__name__}: {e}")
         log(traceback.format_exc())
 
 
-async def watchdog_envio():
-    global tarefa_envio
+# =========================================================
+# WATCHDOG / MAIN
+# =========================================================
 
+async def watchdog() -> None:
     while True:
-        await asyncio.sleep(WATCHDOG_SEGUNDOS)
-
         try:
             limpar_memoria_interna()
-
-            if tarefa_envio is None or tarefa_envio.done() or tarefa_envio.cancelled():
-                log("⚠️ Watchdog: fila de envio parada. Reiniciando trabalhador.")
-                tarefa_envio = asyncio.create_task(trabalhador_envio())
-
             log(
-                f"🩺 WATCHDOG OK | fila={fila_envio.qsize()} | "
-                f"pendentes={len(pendentes_por_jogo)} | cache={len(ultimos_enviados)} | "
-                f"leituras={len(ultimas_leituras_por_jogo)}"
+                f"🐕 WATCHDOG OK | fila={fila_envio.qsize()} | pendentes={len(pendentes_por_jogo)} | "
+                f"cache={len(ultimos_enviados)} | leituras={len(ultimas_leituras_por_jogo)}"
             )
-
         except Exception as e:
-            log(f"❌ ERRO NO WATCHDOG: {e}")
-            log(traceback.format_exc())
+            log(f"⚠️ Watchdog erro: {e}")
+        await asyncio.sleep(WATCHDOG_SEGUNDOS)
 
 
-# =========================================================
-# EVENTOS
-# =========================================================
-
-async def processar_evento(event, origem="nova"):
-    # Ignora apenas mensagens enviadas pelo próprio número (outgoing)
-    # Mensagens de bots como CornerProBot não são outgoing — são incoming
-    if event.out:
-        return
-
-    texto = event.raw_text or ""
-
-    # Log detalhado para diagnóstico
-    sender = getattr(event, 'sender_id', 'desconhecido')
-    log(f"📥 EVENTO RECEBIDO DO TELEGRAM | origem={origem} | sender={sender}")
-
-    if not texto.strip():
-        log("ℹ️ Evento ignorado: texto vazio.")
-        return
-
-    if not mensagem_valida(texto):
-        log("ℹ️ Mensagem ignorada: não parece alerta CornerPro.")
-        return
-
-    if bloquear_categoria_base(texto):
-        log("⛔ BLOQUEADO CATEGORIA BASE | Sub-19/Sub-20 não permitido")
-        return
-
-    try:
-        msg_id = getattr(event.message, "id", None)
-        chat_id = getattr(event.message, "chat_id", None)
-        chave_msg = f"{chat_id}_{msg_id}_{origem}"
-
-        if chave_msg in mensagens_processadas:
-            log(f"ℹ️ Evento duplicado ignorado | msg={chave_msg}")
-            return
-
-        mensagens_processadas[chave_msg] = time.time()
-
-        estrategia = detectar_estrategia(texto)
-        jogo = extrair_jogo(texto)
-        chave_jogo = normalizar_chave_jogo(jogo)
-
-        sg, sc, tipo, metricas = calcular_scores(texto, estrategia, chave_jogo)
-
-        log(
-            f"📊 PROCESSADO | {estrategia} | Gol={sg}% | Canto={sc}% | Tipo={tipo} | "
-            f"{jogo} | {metricas['tempo']}' | {metricas['placar']} | {metricas['mercado']} | "
-            f"Liga={classificar_liga(metricas.get('competicao', ''))} | "
-            f"PadraoALFA={metricas.get('padrao_alfa', '')} | "
-            f"IP={metricas.get('pressao_alfa', {})} | "
-            f"Fav={metricas.get('lado_favorito')} | Dom={metricas.get('lado_dominante')} | "
-            f"Gol={metricas.get('ultimo_gol')} {metricas.get('ultimo_gol_lado')} | "
-            f"GolCtx={metricas.get('motivo_gol_contextual', '')} | "
-            f"Delta={metricas.get('motivo_delta_contextual', '')} | "
-            f"Vermelho={metricas.get('lado_vermelho')} | "
-            f"VermCtx={metricas.get('motivo_vermelho_contextual', '')} | "
-            f"NivelPressao={metricas.get('nivel_pressao_sustentada', '')} | "
-            f"Consequencia={metricas.get('tem_consequencia_ofensiva', '')}"
-        )
-
-        alerta = {
-            "jogo": jogo,
-            "chave_jogo": chave_jogo,
-            "estrategia": estrategia,
-            "score_gol": sg,
-            "score_canto": sc,
-            "tipo_pressao": tipo,
-            "metricas": metricas,
-            "texto_original": texto,
-            "recebido_em": time.time(),
-        }
-
-        salvar_ultima_leitura(chave_jogo, alerta)
-
-        corte_evento = corte_gol_estrategia(estrategia)
-        if sg < CORTE_OBSERVACAO_JANELA:
-            liga_audit = classificar_liga(metricas.get("competicao", ""))
-            log(
-                f"⛔ BLOQUEADO POR SCORE | {estrategia} | "
-                f"Gol={sg}% < observação {CORTE_OBSERVACAO_JANELA}% | {jogo}"
-            )
-            await enviar_auditoria(
-                client, estrategia, jogo, sg, 0, sg, liga_audit,
-                aprovado=False,
-                motivo=f"Score {sg}% abaixo do corte de observação {CORTE_OBSERVACAO_JANELA}%"
-            )
-            return
-
-        if eh_confirmacao(estrategia):
-            liga = classificar_liga(metricas.get("competicao", ""))
-            # UNDER e PERIGOSA não são bloqueadas aqui — têm corte mais alto na média final
-            # UNDER → ≥91%, PERIGOSA → ≥95% (aplicado no trabalhador_envio)
-
-        if sg < corte_evento:
-            log(
-                f"🟡 OBSERVAÇÃO EM JANELA | {estrategia} | "
-                f"Gol={sg}% abaixo do corte real {corte_evento}% | {jogo}"
-            )
-
-        # Lock por jogo: garante que nova mensagem e edição simultânea
-        # do mesmo jogo não sobrescrevam pendentes_por_jogo uma da outra.
-        async with _lock_jogo(chave_jogo):
-            pendentes_por_jogo.setdefault(chave_jogo, []).append(alerta)
-
-            log(
-                f"⏳ ALERTA EM JANELA DE DECISÃO | {estrategia} | "
-                f"Gol={sg}% | aguardando {JANELA_DECISAO_SEGUNDOS}s | {jogo}"
-            )
-
-            if chave_jogo not in tarefas_decisao:
-                tarefas_decisao[chave_jogo] = asyncio.create_task(decidir_e_enviar(chave_jogo))
-
-    except Exception as e:
-        log(f"❌ ERRO NO PROCESSAMENTO DO ALERTA: {e}")
-        log(traceback.format_exc())
-
-
-@client.on(events.NewMessage(incoming=True, from_users=None))
-async def handler_nova_mensagem(event):
-    try:
-        # Filtra antes de processar — aceita só mensagens do CornerProBot
-        texto = event.raw_text or ""
-        if not mensagem_valida(texto):
-            return
-        await processar_evento(event, origem="nova")
-    except Exception as e:
-        # Ignora silenciosamente objetos de sistema que o Telethon não reconhece
-        # (ex: notificações de export de dados, mensagens de serviço do Telegram)
-        log(f"⚠️ Mensagem de sistema ignorada: {type(e).__name__}")
-
-
-@client.on(events.MessageEdited(incoming=True, from_users=None))
-async def handler_mensagem_editada(event):
-    try:
-        texto = event.raw_text or ""
-        if not mensagem_valida(texto):
-            return
-        await processar_evento(event, origem="editada")
-    except Exception as e:
-        log(f"⚠️ Mensagem de sistema ignorada: {type(e).__name__}")
-
-
-# =========================================================
-# PROTEÇÃO CONTRA INSTÂNCIA DUPLICADA
-# =========================================================
-
-import fcntl
-import socket
-
-def verificar_instancia_unica():
-    """Garante que apenas uma instância do bot está rodando.
-
-    Usa dois mecanismos combinados:
-    1. Arquivo de lock — bloqueia segunda instância no mesmo servidor
-    2. Socket exclusivo — detecta processo duplicado no mesmo host
-    """
-    lock_path = "/tmp/alfa_bot.lock"
-    try:
-        lock_file = open(lock_path, "w")
-        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        lock_file.write(str(os.getpid()))
-        lock_file.flush()
-        log(f"✅ Instância única confirmada (PID {os.getpid()})")
-        return lock_file  # mantém o arquivo aberto para manter o lock
-    except IOError:
-        log("❌ OUTRA INSTÂNCIA JÁ ESTÁ RODANDO — encerrando este processo.")
-        log("   Verifique no Railway se há mais de 1 réplica ativa em Settings.")
-        raise SystemExit(1)
-
-
-# =========================================================
-# START
-# =========================================================
-
-async def main():
+async def main() -> None:
     global tarefa_envio
-
     logar_versao_inicial()
-    log("🚀 COUTIPS / ALFA ONLINE - SOMENTE GOLS ATIVO")
-    log("📊 Estratégias ativas: ALFA_HT | ALFA_HT CONFIRMAÇÃO | ALFA_FT | ALFA_FT CONFIRMAÇÃO | ARCE_HT | CHAMA_FT")
-    log(f"⚽ Canal gols: {TARGET_CHANNEL}")
-    log(f"🧪 Canal técnico de confirmação: {CONFIRMATION_CHANNEL}")
-    if MODO_TESTE:
-        log(f"🧪 MODO TESTE ATIVO — todos os alertas vão para {CONFIRMATION_CHANNEL}")
-    log(f"🎯 Cortes gol: HT={CORTE_GOL_HT}% | FT={CORTE_GOL_FT}% | Conf HT={CORTE_CONFIRMACAO_GOL_HT}% | Conf FT={CORTE_CONFIRMACAO_GOL_FT}% | Cantos desativados")
-    log(f"⏳ Janela de decisão por jogo: {JANELA_DECISAO_SEGUNDOS}s")
-    log(f"📤 Intervalo entre envios: {INTERVALO_ENVIO_SEGUNDOS}s")
+    garantir_csv()
 
-    # Retry para AuthKeyDuplicatedError — aguarda deploy antigo encerrar
-    import time as _time
-    for tentativa in range(1, 6):
-        try:
-            await client.start()
-            await client.catch_up()
-            break
-        except Exception as e:
-            if "AuthKeyDuplicated" in str(e) or "two different IP" in str(e):
-                log(f"⚠️ Deploy antigo ainda ativo (tentativa {tentativa}/5). Aguardando 30s...")
-                _time.sleep(30)
-                if tentativa == 5:
-                    raise
-            else:
-                raise
+    tarefa_envio = asyncio.create_task(trabalhador_fila_envio())
+    asyncio.create_task(watchdog())
 
+    @client.on(events.NewMessage(incoming=True))
+    async def handler(event):
+        await receber_mensagem(event)
+
+    @client.on(events.MessageEdited(incoming=True))
+    async def handler_edit(event):
+        await receber_mensagem(event)
+
+    log("🚀 INICIANDO BOT")
+    await client.start()
     log("✅ TELEGRAM CONECTADO COM SUCESSO")
-
-    tarefa_envio = asyncio.create_task(trabalhador_envio())
-    asyncio.create_task(watchdog_envio())
-
+    log(f"🤖 OpenAI {'ATIVA' if OPENAI_HABILITADO and OPENAI_API_KEY else 'DESATIVADA'} ({OPENAI_MODEL})")
+    log(f"📡 Canais ativos: principal={TARGET_CHANNEL} | confirmação={CONFIRMATION_CHANNEL}")
     await client.run_until_disconnected()
 
 
-async def _notificar_crash_telegram(motivo: str, detalhe: str = ""):
-    """Envia mensagem ao canal técnico avisando que o bot caiu.
-    Tenta uma vez só, sem bloquear o restart se falhar.
-    """
-    try:
-        canal = CONFIRMATION_CHANNEL or TARGET_CHANNEL
-        if not canal:
-            return
-        agora = time.strftime("%H:%M:%S")
-        det = (detalhe[:200] + "...") if len(detalhe) > 200 else detalhe
-        msg = (
-            f"🚨 <b>ALERTA OPERACIONAL</b>\n"
-            f"⚠️ Bot caiu e está reiniciando\n"
-            f"🕐 {agora}\n"
-            f"📋 Motivo: {motivo}"
-            + (f"\n💬 {det}" if det else "")
-        )
-        cli_tmp = TelegramClient("coutips_v2_session", API_ID, API_HASH)
-        await cli_tmp.connect()
-        await cli_tmp.send_message(canal, msg, parse_mode="html")
-        await cli_tmp.disconnect()
-    except Exception as e:
-        log(f"⚠️ Não consegui notificar crash no Telegram: {e}")
-
-
 if __name__ == "__main__":
-    _lock = verificar_instancia_unica()
-    import time as _time
-    MAX_TENTATIVAS = 99999  # praticamente infinito — nunca desistir
-    tentativa = 0
-    while True:
-        tentativa += 1
-        try:
-            log(f"🚀 INICIANDO BOT | tentativa #{tentativa}")
-            asyncio.run(main())
-            log("ℹ️ main() retornou normalmente. Reiniciando em 5s...")
-            _time.sleep(5)
-        except KeyboardInterrupt:
-            log("🛑 Bot encerrado manualmente.")
-            break
-        except TypeNotFoundError as e:
-            log(f"⚠️ TypeNotFoundError (Telegram protocolo incompatível): {e}")
-            log("🔁 Reiniciando em 10s — esse erro é da Telethon, não do nosso código.")
-            try:
-                asyncio.run(_notificar_crash_telegram(
-                    "TypeNotFoundError (protocolo Telegram)",
-                    str(e)
-                ))
-            except Exception:
-                pass
-            _time.sleep(10)
-        except Exception as e:
-            erro_str = str(e)
-            if "AuthKeyDuplicated" in erro_str or "two different IP" in erro_str:
-                log(f"⚠️ Sessão duplicada detectada (tentativa #{tentativa}). Aguardando 30s para deploy antigo encerrar...")
-                _time.sleep(30)
-            elif "event loop" in erro_str:
-                log(f"⚠️ Erro de event loop: {e}. Aguardando 5s e reiniciando...")
-                _time.sleep(5)
-            else:
-                log(f"❌ ERRO FATAL NO BOT: {type(e).__name__}: {e}")
-                log(traceback.format_exc())
-                try:
-                    asyncio.run(_notificar_crash_telegram(
-                        f"{type(e).__name__}",
-                        erro_str
-                    ))
-                except Exception:
-                    pass
-                log("🔁 Reiniciando em 15s...")
-                _time.sleep(15)
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        log("🛑 Encerrado manualmente")
+    except Exception as exc:
+        log(f"❌ FALHA FATAL: {type(exc).__name__}: {exc}")
+        log(traceback.format_exc())
+        raise
