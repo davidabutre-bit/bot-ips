@@ -1467,10 +1467,12 @@ def trava_pos_gol_institucional(metricas, estrategia, lado):
     # Só mantém se a pressão continuou forte após o gol.
     if lado_gol == lado and 5 < minutos <= 12:
         if q["dados"]["u5"] >= 4 and q["dados"]["u10"] >= 8:
-            # Pressão continuou — limita mas não bloqueia
+            # FT: pressão continuou forte após gol — não bloqueia, apenas aplica teto leve no score
+            if eh_ft(estrategia):
+                return False, 0, "GOL_A_FAVOR_PRESSAO_CONTINUOU_FT"
             return True, 84, "GOL_A_FAVOR_PRESSAO_CONTINUOU"
         else:
-            # Pressão esfriou após gol — cai forte
+            # Pressão esfriou após gol — penaliza
             return True, 72, "GOL_A_FAVOR_PRESSAO_ESFRIOU"
 
     # Zebra/time pressionado marcando contra o fluxo abre o jogo.
@@ -2014,16 +2016,16 @@ def relogio_score(metricas, estrategia):
         return -6
 
     if eh_ft(estrategia):
-        if 65 <= t <= 75:
-            return 8
-        if 76 <= t <= 81:
-            return 5
+        if 65 <= t <= 77:
+            return 8    # janela operacional principal — sem penalidade
+        if 78 <= t <= 81:
+            return 3    # ainda aceitável
         if 82 <= t <= 83:
-            return -4
+            return -4   # penalidade começa aqui
         if 84 <= t <= 86:
-            return -8   # suavizado — antes era -14 direto
+            return -8
         if t >= 87:
-            return -14  # penalidade máxima só acima de 87
+            return -14
         if t < 63:
             return -6
         return 2
@@ -2684,7 +2686,6 @@ def aplicar_trava_ft_jogo_morto(metricas, estrategia, score):
     # R1: exceção FT para diamantes borderline
     if eh_quase_alfa_puro(metricas, estrategia):
         return score
-    # R2: liga premium top não bypassa trava de jogo morto — bônus já foi aplicado antes
 
     gc, gf = extrair_gols_placar(metricas.get("placar", ""))
     if gc is None:
@@ -2692,47 +2693,29 @@ def aplicar_trava_ft_jogo_morto(metricas, estrategia, score):
 
     dif = abs(gc - gf)
     perdendo = lado_perdendo(metricas)
-    vencendo = lado_vencendo(metricas)
-    motivo = metricas.get("motivo_gol_contextual", "")
 
     if dif < 2 or perdendo in ["EMPATE", "DESCONHECIDO"]:
         return score
 
+    # OVER LOGIC: favorito perdendo por qualquer diferença é SEMPRE contexto
+    # favorável para mais gols — caos produtivo.
+    # Quanto mais o favorito está perdendo, mais desespero, mais espaços,
+    # mais transições. O gol pode vir de qualquer lado.
+    # Esta trava foi removida para não penalizar over em contexto de pressão real.
+    #
+    # Única exceção: jogo completamente morto — favorito sem nenhuma
+    # reação nos últimos 10 minutos (u10=0, rb=0, sem pressão).
     dados_perdendo = dados_lado(metricas, perdendo)
-    dados_vencendo = dados_lado(metricas, vencendo)
 
-    perdedor_vivo = (
-        dados_perdendo["u5"] >= 3
-        or dados_perdendo["u10"] >= 6
-        or dados_perdendo["rb"] >= 1
-        or dados_perdendo["rda"] >= 2
-        or dados_perdendo["cantos"] >= 2
-        or dados_perdendo["xg"] >= 0.35
+    jogo_realmente_morto = (
+        dados_perdendo["u10"] == 0
+        and dados_perdendo["rb"] == 0
+        and dados_perdendo["u5"] == 0
+        and dados_perdendo["xg"] < 0.10
     )
 
-    perdedor_convertivel = (
-        dados_perdendo["rb"] >= 1
-        or dados_perdendo["remates"] >= 4
-        or dados_perdendo["rda"] >= 2
-        or dados_perdendo["cantos"] >= 2
-        or dados_perdendo["xg"] >= 0.35
-    )
-
-    # 2x0/3x0 confortável: se quem precisa do gol não cria perigo real, trava.
-    if not perdedor_vivo or not perdedor_convertivel:
-        return min(score, 80)
-
-    # Se o perdedor tem só circulação/posse sem chute/área, ainda é fake pressure.
-    if dados_perdendo["rb"] == 0 and dados_perdendo["rda"] == 0 and dados_perdendo["xg"] < 0.30:
-        return min(score, 81)
-
-    # Se o time que vence ainda concentra a pressão, é mais controle que caos.
-    if dados_vencendo["u5"] > dados_perdendo["u5"] and dados_perdendo["rb"] == 0 and dados_perdendo["rda"] == 0:
-        return min(score, 81)
-
-    # Exceção: gol contra fluxo pode abrir o jogo, mas mesmo assim não vira diamante automático.
-    if motivo in ["GOL_ZEBRA_CONTRA_FLUXO", "GOL_TIME_PRESSIONADO_ABRIU_JOGO", "GOL_CONTRA_FLUXO_CONTEXTO_BOM", "GOL_ZEBRA_ABRIU_JOGO"]:
-        return min(score, 90)
+    if jogo_realmente_morto:
+        return min(score, 78)
 
     return score
 
@@ -2857,92 +2840,89 @@ def eh_liga_premium_top_ft(metricas):
 
 
 # =========================================================
-# DNA 3 PILARES — XG histórico + L15 + Odd favorito
-# Validado em 383 jogos de maio/2026:
-#   DNA completo (3/3): 71.1%
-#   DNA parcial  (1/2): 50.0%  ← cara ou coroa
-#   DNA fraco    (0/2): 36.7%  ← pior que acaso
-#
-# Thresholds mínimos (pior cenário):
-#   Odd ≤ 1.55: XG ≥ 1.60 + L15 ≥ 0.50
-#   Odd 1.56-2.00: XG ≥ 1.70 + L15 ≥ 0.55
-#
-# Só aplica quando os dados históricos estão disponíveis no alerta.
-# Se não disponíveis, sistema continua exatamente como antes.
+# DNA PROJETADO — ALFA/COUTIPS
+# Validado em 383 jogos maio/2026
+# DNA não bloqueia sozinho — funciona como termômetro/multiplicador
 # =========================================================
 
-def avaliar_dna_tres_pilares(metricas, estrategia):
-    """Avalia os 3 pilares históricos do DNA COUTIPS.
+def calcular_dna_projetado(metricas, estrategia):
+    """Calcula o DNA Projetado do jogo.
 
-    Retorna (pilares_ok, pilares_total, penalidade, motivo).
-    Se dados não disponíveis, retorna (None, 0, 0, "SEM_DADOS_HISTORICOS").
-    Só aplica para CHAMA_FT e ALFA_FT — FT exclusivo.
+    Combina 3 pilares históricos para medir se o jogo está
+    caminhando para o padrão dos greens históricos.
+
+    Retorna (dna_class, dna_score, ajuste_score)
+    Se dados insuficientes, retorna ("DNA_SEM_DADOS", 0, 0)
     """
     if not eh_ft(estrategia):
-        return None, 0, 0, "NAO_FT"
+        return "DNA_SEM_DADOS", 0, 0
 
-    # Extrai avgXG histórico do favorito
-    avgxg = metricas.get("avgxg", (0.0, 0.0))
-    avgxg_c, avgxg_f = avgxg if isinstance(avgxg, tuple) else (avgxg, avgxg)
-
-    # Se não tem dados históricos, não interfere
-    if avgxg_c == 0.0 and avgxg_f == 0.0:
-        return None, 0, 0, "SEM_DADOS_HISTORICOS"
-
-    # Extrai xgl (L15) histórico
-    xgl = metricas.get("xgl", (0.0, 0.0))
-    xgl_c, xgl_f = xgl if isinstance(xgl, tuple) else (xgl, xgl)
-
-    # Odd do favorito
     fav, odd_fav = lado_favorito(metricas)
+
+    # XG ao vivo total
+    xg_total = sum(metricas.get("xg", (0.0, 0.0)))
+
+    # L15 do favorito (xgl)
+    xgl = metricas.get("xgl", (0.0, 0.0))
     if fav == "CASA":
-        avgxg_fav = avgxg_c
-        l15_fav = xgl_c
+        l15 = xgl[0] if isinstance(xgl, tuple) else xgl
     elif fav == "FORA":
-        avgxg_fav = avgxg_f
-        l15_fav = xgl_f
+        l15 = xgl[1] if isinstance(xgl, tuple) else xgl
     else:
-        # Equilibrado: usa o maior
-        avgxg_fav = max(avgxg_c, avgxg_f)
-        l15_fav = max(xgl_c, xgl_f)
+        l15 = max(xgl) if isinstance(xgl, tuple) else xgl
 
-    if not odd_fav or odd_fav <= 0:
-        return None, 0, 0, "SEM_ODD"
+    # Se não tem dados históricos suficientes, não interfere
+    if xg_total == 0.0 and l15 == 0.0:
+        return "DNA_SEM_DADOS", 0, 0
 
-    # Thresholds por faixa de odd
-    if odd_fav <= 1.55:
-        xg_threshold = 1.60
-        l15_threshold = 0.50
-        odd_bate = True
-    elif odd_fav <= 2.00:
-        xg_threshold = 1.70
-        l15_threshold = 0.55
-        odd_bate = False  # odd fora da faixa ideal — não conta como pilar
+    dna_score = 0.0
+
+    # PILAR 1 — Favoritismo (régua separada HT/FT)
+    if odd_fav and odd_fav > 0:
+        if eh_ht(estrategia):
+            if odd_fav <= 1.40:
+                dna_score += 1.0
+            elif odd_fav <= 1.50:
+                dna_score += 0.7
+        else:  # FT
+            if odd_fav <= 1.55:
+                dna_score += 1.0
+            elif odd_fav <= 2.00:
+                dna_score += 0.5
+            elif odd_fav <= 2.50:
+                dna_score += 0.25
+
+    # PILAR 2 — XG ao vivo
+    if xg_total >= 1.80:
+        dna_score += 1.0
+    elif xg_total >= 1.60:
+        dna_score += 0.7
+    elif xg_total >= 1.40:
+        dna_score += 0.4
+
+    # PILAR 3 — L15
+    if l15 >= 0.65:
+        dna_score += 1.0
+    elif l15 >= 0.55:
+        dna_score += 0.7
+    elif l15 >= 0.45:
+        dna_score += 0.4
+
+    # Classificação
+    if dna_score >= 2.6:
+        dna_class = "DNA_FORTE"
+        ajuste = 4
+    elif dna_score >= 2.1:
+        dna_class = "DNA_ACEITAVEL"
+        ajuste = 2
+    elif dna_score >= 1.6:
+        dna_class = "DNA_PARCIAL"
+        ajuste = -1
     else:
-        # Odd > 2.00: fora do escopo do DNA
-        return None, 0, 0, "ODD_FORA_ESCOPO"
+        dna_class = "DNA_FRACO"
+        ajuste = -3
 
-    xg_bate = avgxg_fav >= xg_threshold
-    l15_bate = l15_fav >= l15_threshold
-
-    pilares_ok = sum([odd_bate, xg_bate, l15_bate])
-    pilares_total = 3 if odd_bate else 2  # odd 1.56-2.00 só tem 2 pilares possíveis
-
-    # Penalidade apenas quando DNA está claramente incompleto
-    # DNA completo ou dados insuficientes: sem penalidade
-    if pilares_ok == pilares_total:
-        penalidade = 0
-        motivo = "DNA_COMPLETO"
-    elif pilares_ok == pilares_total - 1:
-        # Faltou 1 pilar — penalidade leve
-        penalidade = -5
-        motivo = f"DNA_PARCIAL_XG={xg_bate}_L15={l15_bate}"
-    else:
-        # Faltaram 2+ pilares — penalidade maior
-        penalidade = -10
-        motivo = f"DNA_FRACO_XG={xg_bate}_L15={l15_bate}"
-
-    return pilares_ok, pilares_total, penalidade, motivo
+    return dna_class, round(dna_score, 2), ajuste
 
 
 def teto_contextual_gol(metricas, estrategia, score):
@@ -3049,6 +3029,121 @@ def teto_contextual_gol(metricas, estrategia, score):
     return score
 
 
+# =========================================================
+# RÉGUA DE ODD POR ESTRATÉGIA — HT vs FT
+# HT = super favorito / favorito forte no 1º tempo
+# FT = favorito contextual no fim do jogo
+# =========================================================
+
+# =========================================================
+# HT MASSACRE — Camada exclusiva para HT
+# HT não converte por desespero de resultado como FT.
+# HT converte quando existe massacre unilateral cedo:
+# super favorito + pressão viva + consequência real + domínio.
+# =========================================================
+
+def calcular_ht_massacre(metricas, estrategia):
+    """Avalia se o HT tem perfil de massacre unilateral.
+
+    Retorna (ht_massacre_class, ht_massacre_score, ht_massacre_ajuste)
+    Só aplica para estratégias HT.
+    """
+    if not eh_ht(estrategia):
+        return "HT_MASSACRE_NAO_APLICA", 0, 0
+
+    lado, _ = lado_alvo_contextual(metricas, estrategia)
+    if lado not in ["CASA", "FORA"]:
+        return "HT_MASSACRE_SEM_LADO", 0, -2
+
+    fav, odd_favorito = lado_favorito(metricas)
+    dados = dados_lado(metricas, lado)
+    ip = valores_pressao_lado(metricas, lado)
+    dom, dif_dom = lado_dominante(metricas)
+
+    score = 0.0
+
+    # Pilar 1: favorito forte
+    if fav == lado and odd_favorito and odd_favorito <= 1.40:
+        score += 1.0
+    elif fav == lado and odd_favorito and odd_favorito <= 1.50:
+        score += 0.7
+
+    # Pilar 2: pressão recente forte
+    if dados["u5"] >= 5 and dados["u10"] >= 10:
+        score += 1.0
+    elif dados["u5"] >= 3 and dados["u10"] >= 6:
+        score += 0.7
+
+    # Pilar 3: IP sustentado
+    if ip["c22"] >= 2 or ip["c18"] >= 3:
+        score += 1.0
+    elif ip["ip_pico"] >= 22:
+        score += 0.6
+
+    # Pilar 4: consequência real
+    if dados["rb"] >= 2 or dados["rda"] >= 2 or dados["xg"] >= 0.45:
+        score += 1.0
+    elif dados["rb"] >= 1 or dados["remates"] >= 4 or dados["xg"] >= 0.30:
+        score += 0.6
+
+    # Pilar 5: unilateralidade
+    if dom == lado and dif_dom >= 15:
+        score += 1.0
+    elif dom == lado and dif_dom >= 8:
+        score += 0.6
+
+    score = round(score, 2)
+
+    if score >= 4.2:
+        return "HT_MASSACRE_ELITE", score, 4
+    if score >= 3.4:
+        return "HT_MASSACRE_FORTE", score, 2
+    if score >= 2.6:
+        return "HT_MASSACRE_MODERADO", score, 0
+    return "HT_MASSACRE_FRACO", score, -3
+
+
+
+# =========================================================
+# HT_MASSACRE — Camada exclusiva para 1º tempo
+# Lógica diferente do DNA FT:
+# HT converte por massacre unilateral, não por desespero
+# =========================================================
+
+
+def pontuar_odd_ht(odd_favorito: float):
+    """Pontuação de odd para HT. Seletivo — super favorito."""
+    if not odd_favorito or odd_favorito <= 0:
+        return 0, "ODD_HT_DESCONHECIDA"
+    if odd_favorito <= 1.40:
+        return 6, "HT_SUPER_FAVORITO"
+    if odd_favorito <= 1.50:
+        return 3, "HT_FAVORITO_FORTE"
+    return -8, "HT_FORA_DA_REGUA"
+
+
+def pontuar_odd_ft(odd_favorito: float):
+    """Pontuação de odd para FT. Aceita favorito contextual até 2.50."""
+    if not odd_favorito or odd_favorito <= 0:
+        return 0, "ODD_FT_DESCONHECIDA"
+    if odd_favorito <= 1.55:
+        return 6, "FT_FAVORITO_FORTE"
+    if odd_favorito <= 2.00:
+        return 3, "FT_FAVORITO_MODERADO"
+    if odd_favorito <= 2.50:
+        return 1, "FT_FAVORITO_CONTEXTUAL"
+    return -8, "FT_FORA_DA_REGUA"
+
+
+def pontuar_odd_por_estrategia(odd_favorito: float, estrategia: str):
+    """Aplica régua correta de odd por estratégia."""
+    if eh_ht(estrategia):
+        return pontuar_odd_ht(odd_favorito)
+    if eh_ft(estrategia):
+        return pontuar_odd_ft(odd_favorito)
+    return 0, "ODD_SEM_REGUA"
+
+
 def score_gol(metricas, estrategia, chave_jogo):
     """Score institucional por funil.
 
@@ -3149,13 +3244,31 @@ def score_gol(metricas, estrategia, chave_jogo):
 
     score = score_classificacao_institucional(metricas, estrategia)
 
-    # DNA 3 PILARES — aplica penalidade se dados históricos disponíveis e DNA incompleto
-    _pilares_ok, _pilares_total, _pen_dna, _motivo_dna = avaliar_dna_tres_pilares(metricas, estrategia)
-    metricas["dna_pilares_ok"] = _pilares_ok
-    metricas["dna_pilares_motivo"] = _motivo_dna
-    if _pen_dna != 0:
-        score = score + _pen_dna
-        log(f"🧬 DNA {_pilares_ok}/{_pilares_total} | {_motivo_dna} | penalidade={_pen_dna} | {metricas.get('jogo','')}")
+    # DNA PROJETADO — camada de confiança histórica
+    _dna_class, _dna_score, _dna_ajuste = calcular_dna_projetado(metricas, estrategia)
+    metricas["dna_class"] = _dna_class
+    metricas["dna_score"] = _dna_score
+    if _dna_class != "DNA_SEM_DADOS":
+        score = score + _dna_ajuste
+        log(f"🧬 {_dna_class} | score={_dna_score} | ajuste={_dna_ajuste:+d} | {metricas.get('jogo','')}")
+
+    # HT_MASSACRE — camada exclusiva para 1º tempo
+    _ht_massacre_class, _ht_massacre_score, _ht_massacre_ajuste = calcular_ht_massacre(metricas, estrategia)
+    metricas["ht_massacre_class"] = _ht_massacre_class
+    metricas["ht_massacre_score"] = _ht_massacre_score
+    metricas["ht_massacre_ajuste"] = _ht_massacre_ajuste
+    if _ht_massacre_ajuste != 0:
+        score = score + _ht_massacre_ajuste
+        log(f"⚡ {_ht_massacre_class} | score={_ht_massacre_score} | ajuste={_ht_massacre_ajuste:+d} | {metricas.get('jogo','')}")
+
+    # RÉGUA DE ODD — pontuação separada por HT/FT
+    _fav_lado, _odd_fav = lado_favorito(metricas)
+    _odd_bonus, _faixa_odd = pontuar_odd_por_estrategia(_odd_fav, estrategia)
+    metricas["odd_favorito"] = _odd_fav
+    metricas["faixa_odd"] = _faixa_odd
+    metricas["odd_bonus"] = _odd_bonus
+    score = score + _odd_bonus
+    log(f"💰 {_faixa_odd} | odd={_odd_fav} | bonus={_odd_bonus:+d} | {metricas.get('jogo','')}")
 
     # Travas finais mantidas como proteção extra. Elas só reduzem, nunca aprovam.
     score = aplicar_trava_consequencia_ofensiva(metricas, estrategia, score)
@@ -3469,7 +3582,8 @@ def montar_mensagem_gol_nova(jogo, estrategia, score_alfa, score_media, metricas
 📊 COUTIPS: {score_media}%
 {linha_liga}
 💰 Odd mínima de entrada: 1.65
-⚠️ SIGA sua gestão de banca{link}"""
+📝 SIGA SUA GESTÃO DE BANCA
+⛔ APOSTE COM RESPONSABILIDADE ⛔{link}"""
 
 
 def montar_mensagem_canto(jogo, estrategia, score, metricas):
@@ -3482,112 +3596,155 @@ def montar_mensagem_canto(jogo, estrategia, score, metricas):
 # OPENAI — ANÁLISE CONTEXTUAL
 # =========================================================
 
-_PROMPT_NORMAL = """Você é um analista de futebol ao vivo especializado em identificar se um gol vai sair.
+_PROMPT_NORMAL = """Você é um auditor de futebol ao vivo do sistema ALFA.
 
-O sistema matemático ALFA já calculou um score. Sua função é confirmar ou bloquear com base nos DADOS AO VIVO.
+Sua função: verificar 6 critérios objetivos e informar se o contexto confirma ou enfraquece a leitura do Python.
+Você NÃO recalcula o score. NÃO cria regras. NÃO interpreta livremente.
 
-═══════════════════════════════════════════════════
-HIERARQUIA FUNDAMENTAL — LEIA COM ATENÇÃO
-═══════════════════════════════════════════════════
+Para cada critério, classifique como POSITIVO, NEUTRO ou NEGATIVO.
+Depois some os positivos e responda conforme a tabela de decisão.
 
-Os dados AO VIVO sempre prevalecem sobre o histórico pré-live.
-O histórico pré-live (liga, médias, previsões) serve APENAS para causar:
-- CAUTELA se a liga for ruim
-- CERTEZA se a liga for boa
-Nunca para bloquear sozinho um jogo que está gritando nos números ao vivo.
+═══════════════════════════════════════════════
+CRITÉRIO 1 — PRESSÃO VIVA
+═══════════════════════════════════════════════
+Verifique U5 e U10 do lado dominante/favorito.
+→ U5 ≥ 3 E U10 ≥ 6 = POSITIVO
+→ U5 ≤ 1 OU U10 ≤ 3 = NEGATIVO
+→ Caso contrário = NEUTRO
 
-═══════════════════════════════════════════════════
-REGRA DE PONDERAÇÃO POR SCORE E LIGA
-═══════════════════════════════════════════════════
+═══════════════════════════════════════════════
+CRITÉRIO 2 — PRESSÃO PREMIADA
+═══════════════════════════════════════════════
+O lado que pressionava já foi premiado com gol?
+→ Não foi premiado = POSITIVO
+→ Foi premiado e continua pressionando = NEUTRO
+→ Foi premiado e intensidade caiu = NEGATIVO
 
-LIGA BOA (Premium/Moderada):
-- Score 80%+ → confirme com tranquilidade. Os dados live mandam.
-- Score abaixo → cautela normal.
+═══════════════════════════════════════════════
+CRITÉRIO 3 — GOL RECENTE (últimos 10 minutos)
+═══════════════════════════════════════════════
+Houve gol nos últimos 10 minutos?
+→ Não houve = POSITIVO
+→ Gol do dominante + pressão continua = NEUTRO
+→ Gol do dominante + pressão morreu = NEGATIVO
+→ Gol do adversário + pressão continua = POSITIVO
+→ Gol do adversário + pressão morreu = NEUTRO
 
-LIGA RUIM (Under/Perigosa/Desconhecida):
-- Score 90%+ → APROVE se os dados live justificam. A liga é apenas contexto,
-  não pode bloquear um jogo onde o domínio ao vivo é claro.
-- Score 78-89% → exija mais evidência nos dados live. A liga pesa mais aqui.
-- Score abaixo de 78% → bloqueie.
+═══════════════════════════════════════════════
+CRITÉRIO 4 — FOME DO FAVORITO
+═══════════════════════════════════════════════
+Verifique situação do favorito no placar.
+→ Favorito perdendo = POSITIVO
+→ Favorito empatando = POSITIVO
+→ Favorito ganhando por 1 = NEUTRO
+→ Favorito ganhando por 2+ = NEGATIVO LEVE (conta como 0, não como negativo)
 
-HISTÓRICO ZERADO OU AUSENTE (liga nova, dados pré-live vazios):
-- Os dados live são a ÚNICA referência. Não bloqueie por falta de histórico.
-- Analise apenas o que está acontecendo em campo agora.
+═══════════════════════════════════════════════
+CRITÉRIO 5 — CONSEQUÊNCIA REAL
+═══════════════════════════════════════════════
+Verifique RDA, remates à baliza e XG.
+→ (RDA ≥ 2 OU RB ≥ 2) E XG ≥ 0.50 = POSITIVO
+→ Não bate = NEGATIVO
+AP alto sem remates e sem XG = fake pressure = NEGATIVO
 
-═══════════════════════════════════════════════════
-PASSO 1 — RELEITURA DOS DADOS AO VIVO
-═══════════════════════════════════════════════════
+═══════════════════════════════════════════════
+CRITÉRIO 6 — DNA PROJETADO
+═══════════════════════════════════════════════
+Calcule internamente:
 
-Analise com seus próprios olhos — o Python pode errar:
-- Quem está dominando de verdade? Olhe AP, u5, u10, remates, IP do lado dominante — não a soma dos dois times.
-- Esse domínio tem CONSEQUÊNCIA REAL no último terço? Chute no gol, chance de golo, xG, remates dentro da área.
-- Volume de ataque alto SEM xG e SEM remates dentro da área = pressão fake. Não aprove.
-- A pressão está ativa AGORA ou já esfriou? Olhe u5, u10 e IP recente.
-- O time tem motivo emocional para continuar atacando? Está perdendo, empatando, ou ganhando por pouco?
-- Se o adversário marcou em contra-ataque: o time dominante vai apertar mais. Não é motivo para bloquear.
-- Dados corrompidos no início (-1, 0): ignore esses valores e analise o restante.
+PILAR 1 - FAVORITISMO:
+odd ≤ 1.55 = 1.0 | odd 1.56-2.00 = 0.5 | acima 2.00 = 0
 
-═══════════════════════════════════════════════════
-PASSO 2 — DECISÃO
-═══════════════════════════════════════════════════
+PILAR 2 - XG:
+xg ≥ 1.80 = 1.0 | xg ≥ 1.60 = 0.7 | xg ≥ 1.40 = 0.4 | abaixo = 0
 
-APROVADO se:
-- Os dados live confirmam o score ALFA
-- Há domínio real com consequência no último terço
-- A pressão está viva agora
+PILAR 3 - L15:
+l15 ≥ 0.65 = 1.0 | l15 ≥ 0.55 = 0.7 | l15 ≥ 0.45 = 0.4 | abaixo = 0
 
-BLOQUEADO se:
-- Pressão é volume sem chegada (AP alto, xG baixo, zero dentro da área)
-- A pressão já esfriou (u5 e u10 zerados ou caindo)
-- Time perdendo com pressão morrendo no 2P
+Some os três pilares:
+≥ 2.6 = DNA_FORTE → POSITIVO
+≥ 2.1 = DNA_ACEITAVEL → POSITIVO
+≥ 1.6 = DNA_PARCIAL → NEUTRO
+< 1.6 = DNA_FRACO → NEGATIVO
 
-Copa, fase do campeonato, prestígio do time: irrelevante para a decisão.
+═══════════════════════════════════════════════
+CRITÉRIO 6 — CONTINUIDADE OFENSIVA
+═══════════════════════════════════════════════
+Verifique tendência de U5 e U10 nos dados.
+→ U5 crescendo OU U10 crescendo = POSITIVO
+→ Queda clara de intensidade recente = NEGATIVO
+→ Estável = NEUTRO
+
+═══════════════════════════════════════════════
+DECISÃO FINAL
+═══════════════════════════════════════════════
+Some apenas os POSITIVOS (NEUTRO = 0, NEGATIVO = -1):
+
+6 positivos → APROVADO, confianca: 95
+5 positivos → APROVADO, confianca: 88
+4 positivos → APROVADO, confianca: 80
+3 positivos → APROVADO, confianca: 70
+2 ou menos → BLOQUEADO, confianca: 50
+
+REGRAS ABSOLUTAS:
+→ Placar adverso para o favorito é FAVORÁVEL para over — não bloqueia
+→ Volume sem consequência (AP alto, XG baixo, RDA=0) = fake pressure = BLOQUEADO
+→ Dados ao vivo prevalecem sobre histórico
+→ Liga, copa, prestígio: irrelevante
 
 Responda APENAS com JSON puro, sem markdown:
 {"decisao": "APROVADO" ou "BLOQUEADO", "confianca": numero 0-100}"""
 
-_PROMPT_CONFIRMACAO = """Você é um analista de futebol ao vivo. O time dominante marcou um gol.
+_PROMPT_CONFIRMACAO = """Você é um auditor de futebol ao vivo do sistema ALFA. O lado dominante marcou um gol.
 
-Sua função é responder: a pressão continuou real após o gol, ou o time esfriou?
+Sua função: verificar se a pressão continua válida para mais um gol.
+Você NÃO recalcula o score. NÃO cria regras. NÃO interpreta livremente.
 
-═══════════════════════════════════════════════════
-HIERARQUIA FUNDAMENTAL
-═══════════════════════════════════════════════════
+Para cada critério, classifique como POSITIVO, NEUTRO ou NEGATIVO.
 
-Os dados AO VIVO prevalecem sempre sobre o histórico pré-live.
-A liga serve apenas para causar cautela (se ruim) ou certeza (se boa),
-nunca para bloquear um jogo onde o domínio segue claro.
+═══════════════════════════════════════════════
+CRITÉRIO 1 — PRESSÃO CONTINUA VIVA
+═══════════════════════════════════════════════
+Verifique U5 e U10 do lado dominante após o gol.
+→ U5 ≥ 3 E U10 ≥ 6 = POSITIVO
+→ U5 ≤ 1 OU U10 ≤ 3 = NEGATIVO
+→ Caso contrário = NEUTRO
 
-LIGA BOA + score 80%+ → confirme com tranquilidade
-LIGA RUIM + score 90%+ → dados live mandam, liga é só contexto
-LIGA RUIM + score 78-89% → exija mais evidência live
-Histórico zerado/ausente → analise apenas o ao vivo
+═══════════════════════════════════════════════
+CRITÉRIO 2 — TIPO DE GOL
+═══════════════════════════════════════════════
+→ Gol do dominante que empatou ou ainda está perdendo = POSITIVO
+→ Gol do adversário em transição = POSITIVO (dominante vai apertar mais)
+→ Gol do dominante que colocou na frente ou ampliou = NEUTRO
 
-═══════════════════════════════════════════════════
-PASSO 1 — RELEITURA APÓS O GOL
-═══════════════════════════════════════════════════
+═══════════════════════════════════════════════
+CRITÉRIO 3 — CONSEQUÊNCIA MANTIDA
+═══════════════════════════════════════════════
+Verifique RDA e remates à baliza recentes.
+→ RDA ≥ 1 OU RB ≥ 1 nos últimos minutos = POSITIVO
+→ Zero finalização desde o gol = NEGATIVO
 
-- O lado dominante continua atacando? Olhe u5, u10, remates e IP após o gol.
-- Ou parou e está administrando o resultado?
-- Gol sofrido em transição pelo dominante: vai apertar ainda mais — não é motivo para bloquear.
-- Gol de empate ou time ainda perdendo: contexto emocional vivo, tende a continuar atacando.
-- Pressão ativa mas SEM remate e SEM chance no último terço: domínio sem consequência — bloqueia.
+═══════════════════════════════════════════════
+CRITÉRIO 4 — DNA PROJETADO
+═══════════════════════════════════════════════
+Calcule internamente (mesmo cálculo do prompt normal):
+≥ 2.6 = DNA_FORTE → POSITIVO
+≥ 2.1 = DNA_ACEITAVEL → POSITIVO
+≥ 1.6 = DNA_PARCIAL → NEUTRO
+< 1.6 = DNA_FRACO → NEGATIVO
 
-═══════════════════════════════════════════════════
-PASSO 2 — DECISÃO
-═══════════════════════════════════════════════════
+═══════════════════════════════════════════════
+DECISÃO FINAL
+═══════════════════════════════════════════════
+4 positivos → APROVADO, confianca: 92
+3 positivos → APROVADO, confianca: 80
+2 positivos → APROVADO, confianca: 68
+1 ou menos → BLOQUEADO, confianca: 50
 
-APROVADO se:
-- O lado dominante continua atacando com consequência real
-- Pressão segue ativa nos últimos 5-10 minutos
-- Há remates, chance de golo ou xG crescente
-
-BLOQUEADO se:
-- Claramente esfriou e está administrando
-- AP alto mas zero remates e zero dentro da área
-- u5 e u10 zerados após o gol
-
-Copa, liga, prestígio: irrelevante.
+REGRAS ABSOLUTAS:
+→ Gol sofrido em transição = dominante vai apertar mais = FAVORÁVEL
+→ AP alto após gol mas zero remates e zero RDA = BLOQUEADO
+→ Copa, liga, prestígio: irrelevante
 
 Responda APENAS com JSON puro, sem markdown:
 {"decisao": "APROVADO" ou "BLOQUEADO", "confianca": numero 0-100}"""
@@ -3633,8 +3790,16 @@ async def consultar_openai(texto_alerta: str, score_alfa: int, jogo: str,
 
 
 LOG_CSV_PATH = os.getenv("LOG_CSV_PATH", "alertas_enviados.csv")
-_CSV_CABECALHO = ["data_hora", "jogo", "estrategia", "minuto", "placar",
-                  "score", "mercado", "liga", "lado_dominante", "resultado"]
+_CSV_CABECALHO = [
+    "data_hora", "jogo", "estrategia", "minuto", "placar",
+    "score_python", "score_medio", "mercado", "liga", "lado_dominante",
+    "odd_favorito", "faixa_odd", "odd_bonus",
+    "dna_class", "dna_score", "dna_ajuste",
+    "ht_massacre_class", "ht_massacre_score", "ht_massacre_ajuste",
+        "decisao_ia", "confianca_ia",
+    "motivo_gol", "motivo_pos_gol", "pressao_viva",
+    "resultado",
+]
 
 
 def registrar_alerta_csv(alerta: dict):
@@ -3644,17 +3809,38 @@ def registrar_alerta_csv(alerta: dict):
     após o jogo com: GOL, NAO_GOL ou INCONCLUSIVO.
     """
     m = alerta.get("metricas", {})
+    u5 = sum(m.get("ultimos5", (0, 0)))
+    u10 = sum(m.get("ultimos10", (0, 0)))
+    pressao_viva_flag = "SIM" if u5 >= 3 and u10 >= 6 else "NÃO"
     linha = {
-        "data_hora":     datetime.now().strftime("%d/%m/%Y %H:%M"),
-        "jogo":          alerta.get("jogo", ""),
-        "estrategia":    alerta.get("estrategia", ""),
-        "minuto":        m.get("tempo", ""),
-        "placar":        m.get("placar", ""),
-        "score":         alerta.get("score_gol", ""),
-        "mercado":       m.get("mercado", ""),
-        "liga":          m.get("competicao", ""),
+        "data_hora":      datetime.now().strftime("%d/%m/%Y %H:%M"),
+        "jogo":           alerta.get("jogo", ""),
+        "estrategia":     alerta.get("estrategia", ""),
+        "minuto":         m.get("tempo", ""),
+        "placar":         m.get("placar", ""),
+        "score_python":   alerta.get("score_gol", ""),
+        "score_medio":    alerta.get("score_medio", ""),
+        "mercado":        m.get("mercado", ""),
+        "liga":           m.get("competicao", ""),
         "lado_dominante": m.get("lado_dominante", ""),
-        "resultado":     "",  # preencher manualmente após o jogo
+        "odd_favorito":   m.get("odd_favorito", ""),
+        "faixa_odd":      m.get("faixa_odd", ""),
+        "odd_bonus":      m.get("odd_bonus", ""),
+        "dna_class":      m.get("dna_class", ""),
+        "ht_massacre_class":  m.get("ht_massacre_class", ""),
+        "ht_massacre_score":  m.get("ht_massacre_score", ""),
+        "ht_massacre_ajuste": m.get("ht_massacre_ajuste", ""),
+        "dna_score":      m.get("dna_score", ""),
+        "dna_ajuste":     m.get("dna_ajuste", ""),
+        "ht_massacre_class":  m.get("ht_massacre_class", ""),
+        "ht_massacre_score":  m.get("ht_massacre_score", ""),
+        "ht_massacre_ajuste": m.get("ht_massacre_ajuste", ""),
+        "decisao_ia":     alerta.get("decisao_ia", ""),
+        "confianca_ia":   alerta.get("confianca_ia", ""),
+        "motivo_gol":     m.get("motivo_gol_contextual", ""),
+        "motivo_pos_gol": m.get("motivo_pos_gol_institucional", ""),
+        "pressao_viva":   pressao_viva_flag,
+        "resultado":      "",  # preencher manualmente após o jogo
     }
     try:
         arquivo_existe = os.path.isfile(LOG_CSV_PATH)
@@ -3711,18 +3897,22 @@ async def trabalhador_envio():
                     estrategia=estrategia,
                     eh_conf=eh_conf,
                 )
-                if resultado_ia["decisao"] == "BLOQUEADO":
-                    log(f"🤖 OpenAI BLOQUEOU | {jogo}")
-                    liga_audit = classificar_liga(alerta["metricas"].get("competicao", ""))
-                    await enviar_auditoria(
-                        client, estrategia, jogo, score_alfa,
-                        resultado_ia.get("confianca", 0),
-                        score_alfa, liga_audit,
-                        aprovado=False,
-                        motivo=f"OpenAI bloqueou (confiança {resultado_ia.get('confianca', 0)}%)"
-                    )
-                    continue
                 score_ia = resultado_ia["confianca"]
+                if resultado_ia["decisao"] == "BLOQUEADO":
+                    log(f"🤖 OpenAI REBAIXOU | confiança={score_ia}% | {jogo}")
+                    if score_ia <= 45:
+                        # Bloqueio crítico — confiança muito baixa, não segue adiante
+                        log(f"🤖 OpenAI BLOQUEIO CRÍTICO | confiança={score_ia}% | {jogo}")
+                        liga_audit = classificar_liga(alerta["metricas"].get("competicao", ""))
+                        await enviar_auditoria(
+                            client, estrategia, jogo, score_alfa,
+                            score_ia, score_alfa, liga_audit,
+                            aprovado=False,
+                            motivo=f"OpenAI bloqueio crítico (confiança {score_ia}%)"
+                        )
+                        continue
+                    # Confiança > 45: não bloqueia direto — deixa a média decidir
+                    log(f"🤖 OpenAI rebaixou mas não bloqueou — média vai decidir | confiança={score_ia}%")
 
             # ── Média ALFA + IA ───────────────────────────────────────────────
             score_medio = round((score_alfa + score_ia) / 2)
@@ -3741,6 +3931,13 @@ async def trabalhador_envio():
 
             # ── Destino por liga e tipo ───────────────────────────────────────
             liga = classificar_liga(alerta["metricas"].get("competicao", ""))
+
+            # Salva campos de auditoria no alerta antes de registrar CSV
+            alerta["score_medio"] = score_medio
+            alerta["decisao_ia"] = resultado_ia.get("decisao", "") if OPENAI_HABILITADO and OPENAI_API_KEY and texto_raw else ""
+            alerta["confianca_ia"] = score_ia
+            if "dna_ajuste" not in alerta.get("metricas", {}):
+                alerta["metricas"]["dna_ajuste"] = alerta["metricas"].get("dna_score", "")
 
             if MODO_TESTE:
                 destino = CONFIRMATION_CHANNEL
