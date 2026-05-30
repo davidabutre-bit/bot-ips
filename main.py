@@ -44,7 +44,7 @@ except Exception:  # pragma: no cover
 # VERSÃO / CONFIGURAÇÃO BASE
 # =========================================================
 
-VERSAO_COUTIPS = "ALFA_COUTIPS_2026_05_30_V006_HT_FAVORITO_PRESSIONANTE"
+VERSAO_COUTIPS = "ALFA_COUTIPS_2026_05_30_V006_HT_FAVORITO_PRESSIONANTE_TITULO_MINUTO"
 
 load_dotenv()
 
@@ -144,10 +144,11 @@ def log(msg: str) -> None:
 def logar_versao_inicial() -> None:
     log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     log(f"🚀 VERSAO_COUTIPS_ATIVA = {VERSAO_COUTIPS}")
-    log("✅ GOAT V006 — HT com trava de favorito como pressionante")
+    log("✅ GOAT V006 — HT com trava de favorito como pressionante + título por minuto")
     log("🛡️ HT: exige que favorito seja o lado pressionante (bloqueia zebra dominando)")
     log("🛡️ Teto Python 96 / IA 95")
     log("🛡️ FT: mantém lógica V005 com cenários")
+    log("🛡️ Título do alerta: minuto manda no período exibido")
     log(f"📊 Corte HT={CORTE_GOL_HT}% | Corte FT={CORTE_GOL_FT}%")
     log(f"📤 Canal gols: {TARGET_CHANNEL}")
     log(f"🧪 Canal confirmação: {CONFIRMATION_CHANNEL}")
@@ -1739,22 +1740,28 @@ def emoji_score(score: int) -> str:
     return "💎" if score >= 90 else "🎯"
 
 
-def titulo_periodo(estrategia: str) -> str:
-    if estrategia == "ALFA_HT_CONFIRMACAO":
-        return "ALFA - CONFIRMADO | PRIMEIRO TEMPO"
-    if estrategia == "ALFA_FT_CONFIRMACAO":
-        return "ALFA - CONFIRMADO | SEGUNDO TEMPO"
-    if eh_ft(estrategia):
-        return "ALFA - AO VIVO | SEGUNDO TEMPO"
-    if eh_ht(estrategia):
-        return "ALFA - AO VIVO | PRIMEIRO TEMPO"
-    return "ALFA - AO VIVO | SEGUNDO TEMPO"
+def titulo_periodo(estrategia: str, tempo: int = 0) -> str:
+    """
+    Define o título exibido ao cliente usando o minuto como autoridade.
+
+    Correção crítica:
+    - Se a CornerPro mandar estratégia HT/ARCE_HT por engano aos 70+,
+      o cliente NÃO pode receber "PRIMEIRO TEMPO".
+    - 46' em diante = SEGUNDO TEMPO.
+    - Antes de 46' = PRIMEIRO TEMPO.
+    """
+    periodo = "SEGUNDO TEMPO" if int(tempo or 0) >= 46 else "PRIMEIRO TEMPO"
+
+    if eh_confirmacao(estrategia):
+        return f"ALFA - CONFIRMADO | {periodo}"
+
+    return f"ALFA - AO VIVO | {periodo}"
 
 
 def formatar_alerta_cliente(m: Metricas, score: int) -> str:
     link = m.bet365 or ""
     linhas = [
-        f"{emoji_score(score)} {titulo_periodo(m.estrategia)}",
+        f"{emoji_score(score)} {titulo_periodo(m.estrategia, m.tempo)}",
         "",
         f"🏟 {html.escape(m.jogo)}",
         f"⏱ {m.tempo}' | {m.placar}",
