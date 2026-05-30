@@ -1,14 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-COUTIPS / ALFA — REBUILD CONTEXTUAL V002 HÍBRIDO
+COUTIPS / ALFA — GOAT V004
+Unificação definitiva: melhor do V003 corrigido + melhor do V003 produção.
 
-Novo main.py reconstruído para operar com:
+Inclui:
 - Telethon / Telegram
 - OpenAI como auditora, não cérebro
-- Motor Python contextual
-- Valor pós-evento
-- Proteção contra IA derrubando cenário institucional forte
-- CSV de auditoria
+- Motor Python contextual com funil obrigatório híbrido
+- contexto_emocional_vivo() com lógica apurada (producao)
+- consequencia_minima_emocional() com limiares HT/FT separados (producao)
+- Funil FT: excecao_contextual_valida exige consequencia_minima (producao)
+- Funil HT: trava de favorito fraco odd > 1.50 (producao)
+- valor_forte_validado: contexto emocional só vale com finalização mínima (V003 corrigido)
+- Valor pós-evento, proteção IA, CSV de auditoria
 - Fila, watchdog, cooldown, locks e anti-duplicidade
 
 Start command: python main.py
@@ -46,7 +50,7 @@ except Exception:  # pragma: no cover
 # VERSÃO / CONFIGURAÇÃO BASE
 # =========================================================
 
-VERSAO_COUTIPS = "ALFA_COUTIPS_REBUILD_CONTEXTUAL_V003_PRODUCAO"
+VERSAO_COUTIPS = "ALFA_COUTIPS_2026_05_29_GOAT_V004_FINAL"
 
 load_dotenv()
 
@@ -96,7 +100,7 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 OPENAI_HABILITADO = os.getenv("OPENAI_HABILITADO", "true").lower() == "true"
 OPENAI_TIMEOUT = float(os.getenv("OPENAI_TIMEOUT", "30"))
 
-CORTE_GOL_HT = int(os.getenv("CORTE_GOL_HT", "88"))
+CORTE_GOL_HT = int(os.getenv("CORTE_GOL_HT", "86"))
 CORTE_GOL_FT = int(os.getenv("CORTE_GOL_FT", "83"))
 CORTE_CONFIRMACAO_GOL_HT = int(os.getenv("CORTE_CONFIRMACAO_GOL_HT", "85"))
 CORTE_CONFIRMACAO_GOL_FT = int(os.getenv("CORTE_CONFIRMACAO_GOL_FT", "80"))
@@ -146,10 +150,13 @@ def log(msg: str) -> None:
 def logar_versao_inicial() -> None:
     log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     log(f"🚀 VERSAO_COUTIPS_ATIVA = {VERSAO_COUTIPS}")
-    log("✅ Rebuild contextual ativo")
+    log("✅ GOAT V004 FINAL — versão definitiva para auditoria real")
+    log("🛡️ Funil: contexto_emocional_vivo + consequencia_minima_emocional + valor_forte_validado")
+    log("🛡️ HT: penalidade -2 removida (redundância estatística pós-funil)")
+    log(f"📊 Corte HT ajustado para {CORTE_GOL_HT}% | Corte FT={CORTE_GOL_FT}%")
     log(f"📤 Canal gols: {TARGET_CHANNEL}")
     log(f"🧪 Canal confirmação: {CONFIRMATION_CHANNEL}")
-    log(f"📊 Cortes: HT={CORTE_GOL_HT}% | FT={CORTE_GOL_FT}% | Conf HT={CORTE_CONFIRMACAO_GOL_HT}% | Conf FT={CORTE_CONFIRMACAO_GOL_FT}%")
+    log(f"📊 Conf HT={CORTE_CONFIRMACAO_GOL_HT}% | Conf FT={CORTE_CONFIRMACAO_GOL_FT}%")
     log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
 
@@ -304,6 +311,9 @@ class Metricas:
     valor_pos_evento_classe: str = "SEM_VALOR_ESPECIAL"
     valor_pos_evento_motivo: str = ""
     protecao_ia_ativa: bool = False
+    # Confiança do parser: quantos campos críticos vieram com valor real (0–8).
+    # Usado para detectar silenciosamente falhas de formato da CornerPro.
+    parser_confianca: int = 0
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -560,6 +570,43 @@ def _pressao_vazia() -> Dict[str, float]:
     }
 
 
+def calcular_confianca_parser(m: "Metricas") -> int:
+    """Conta quantos campos críticos vieram com valor real do parser.
+
+    Detecta silenciosamente falhas de formato da CornerPro.
+    Se a CornerPro mudar texto/emojis, o parser retorna zeros e o sistema
+    continua funcionando aparentemente normal — mas com dados falsos.
+
+    Campos avaliados (1 ponto cada, máximo 8):
+      ataques_perigosos, remates_baliza, ultimos5, ultimos10,
+      xg, chance_golo, odds, pressao_alfa
+
+    Score < 4: alerta nos logs — possível falha de parser.
+    Score 0–2: crítico — entrada provavelmente sem dados reais.
+    """
+    score = 0
+    if m.ataques_perigosos != (0, 0):
+        score += 1
+    if m.remates_baliza != (0, 0):
+        score += 1
+    if m.ultimos5 != (0, 0):
+        score += 1
+    if m.ultimos10 != (0, 0):
+        score += 1
+    if m.xg != (0.0, 0.0):
+        score += 1
+    if m.chance_golo != (0, 0):
+        score += 1
+    if m.odds != (0.0, 0.0, 0.0):
+        score += 1
+    if m.pressao_alfa and (
+        m.pressao_alfa.get("ip_pico_casa", 0) > 0
+        or m.pressao_alfa.get("ip_pico_fora", 0) > 0
+    ):
+        score += 1
+    return score
+
+
 def extrair_metricas(texto: str) -> Metricas:
     tl = normalizar(texto)
     estrategia = detectar_estrategia(tl)
@@ -617,6 +664,11 @@ def extrair_metricas(texto: str) -> Metricas:
         texto_bruto=texto,
     )
     preencher_contexto_calculado(m)
+    m.parser_confianca = calcular_confianca_parser(m)
+    if m.parser_confianca <= 2:
+        log(f"🔴 PARSER_CRITICO | confianca={m.parser_confianca}/8 | {m.jogo} | {m.tempo}' — possível mudança de formato CornerPro")
+    elif m.parser_confianca <= 4:
+        log(f"⚠️ PARSER_ALERTA | confianca={m.parser_confianca}/8 | {m.jogo} | {m.tempo}' — verificar campos zerados")
     return m
 
 
@@ -1162,19 +1214,49 @@ def aplicar_travas_finais(m: Metricas, score: int) -> Tuple[int, str, bool]:
 
 
 
+def finalização_minima_lado(m: Metricas, lado: str) -> bool:
+    """Exige pelo menos um sinal de finalização real do lado pressionante.
+
+    Impede que contexto emocional forte (valor_forte=True) libere jogos
+    onde não há nenhuma tentativa real de gol — apenas volume ofensivo
+    sem ruptura da defesa adversária.
+
+    Critério: RB >= 1 OU RDA >= 1 OU xG >= 0.15 OU Chance >= 5.
+    Mais permissivo que consequencia_minima_emocional() de propósito:
+    é o piso mínimo absoluto, não a trava completa.
+    """
+    d = dados_lado(m, lado)
+    return d["rb"] >= 1 or d["rda"] >= 1 or d["xg"] >= 0.15 or d["chance"] >= 5
+
+
 # =========================================================
-# FUNIL OBRIGATÓRIO HÍBRIDO
+# FUNIL OBRIGATÓRIO HÍBRIDO — GOAT V004
+# Unificação definitiva: melhor do V003 corrigido + melhor do V003 produção.
+#
+# Do V003 produção:
+#   - contexto_emocional_vivo() com lógica apurada (TIME_ATRAS_SEM_PRESSAO_REAL,
+#     HT_MASSACRE_CONTINUA, FT_FAVORITO_ATRAS_DO_PLACAR)
+#   - consequencia_minima_emocional() com limiares HT/FT separados
+#   - FT: excecao_contextual_valida = (valor_forte OR super_fav+extremo) AND consequencia_minima
+#   - HT: trava de favorito fraco odd > 1.50 sem massacre
+#
+# Do V003 corrigido:
+#   - valor_forte_validado: valor_forte só conta se há finalização_minima_lado()
+#     (impede contexto emocional sem nenhum remate/xG passar pelo funil)
+#   - motivo específico FUNIL_FT_VALOR_FORTE_SEM_FINALIZACAO para auditoria
 # =========================================================
+
 def funil_obrigatorio_hibrido(m: Metricas) -> Tuple[bool, int, str, Dict[str, Any]]:
     """Portão antes do score aditivo.
 
-    Preserva a filosofia central do ALFA antigo: RADAR → VALIDAÇÃO → TRAVAS → CLASSIFICAÇÃO.
-    O rebuild continua limpo, mas não deixa um jogo mediano somar pontos soltos
-    sem provar pressão, consequência, lado e valor contextual mínimo.
+    Filosofia: RADAR → VALIDAÇÃO → TRAVAS → CLASSIFICAÇÃO.
+    Um jogo precisa provar pressão viva, consequência real, contexto emocional
+    vivo E finalização mínima antes de chegar ao score aditivo.
     """
     lado = m.lado_pressionante
     detalhes: Dict[str, Any] = {}
 
+    # ── Bloqueios imediatos ──────────────────────────────────────────────────
     if m.liga == "PERIGOSA":
         return False, 72, "FUNIL_LIGA_PERIGOSA", detalhes
     if lado not in {"CASA", "FORA"}:
@@ -1182,62 +1264,90 @@ def funil_obrigatorio_hibrido(m: Metricas) -> Tuple[bool, int, str, Dict[str, An
     if vermelho_contra_pressionante(m):
         return False, 74, "FUNIL_VERMELHO_CONTRA_PRESSIONANTE", detalhes
 
-    pressao = pressao_viva_lado(m, lado)
+    # ── Avaliações base ──────────────────────────────────────────────────────
+    pressao      = pressao_viva_lado(m, lado)
     consequencia = consequencia_real_lado(m, lado)
-    extremo = pressao_extrema_lado(m, lado)
+    extremo      = pressao_extrema_lado(m, lado)
     fav_nao_vence = favorito_nao_vencendo(m) and m.lado_favorito == lado
-    super_fav = bool(m.odd_favorito and m.odd_favorito <= 1.30 and fav_nao_vence)
+    super_fav     = bool(m.odd_favorito and m.odd_favorito <= 1.30 and fav_nao_vence)
+
+    # valor_forte cru: contexto emocional favorável.
     valor_forte = m.valor_pos_evento_classe in {
         "GOL_CONTRA_FLUXO_VALORIZA",
         "FAVORITO_NAO_VENCE_PRESSAO_SUSTENTADA",
         "PRESSAO_PREMIADA_MAS_CONTINUA",
     }
 
+    # [V003 corrigido] valor_forte só é operacional com finalização mínima.
+    # Sem remate/xG/chance, contexto emocional não converte — é fake pressure emocional.
+    tem_finalizacao      = finalização_minima_lado(m, lado)
+    valor_forte_validado = valor_forte and tem_finalizacao
+
+    # [V003 produção] consequência mínima com limiares HT/FT separados.
+    consequencia_minima = consequencia_minima_emocional(m, lado)
+
+    # [V003 produção] contexto emocional apurado — avalia fome pelo placar.
+    emocional_vivo, motivo_emocional = contexto_emocional_vivo(m, lado)
+
     detalhes.update({
-        "pressao_viva": pressao,
-        "consequencia": consequencia,
-        "pressao_extrema": extremo,
-        "favorito_nao_vence": fav_nao_vence,
-        "super_favorito_nao_vence": super_fav,
-        "valor_pos_evento_forte": valor_forte,
+        "pressao_viva":               pressao,
+        "consequencia":               consequencia,
+        "pressao_extrema":            extremo,
+        "favorito_nao_vence":         fav_nao_vence,
+        "super_favorito_nao_vence":   super_fav,
+        "valor_pos_evento_forte":     valor_forte,
+        "valor_forte_validado":       valor_forte_validado,
+        "tem_finalizacao_minima":     tem_finalizacao,
+        "consequencia_minima_emocional": consequencia_minima,
+        "contexto_emocional_vivo":    emocional_vivo,
+        "motivo_emocional":           motivo_emocional,
     })
 
+    # Pressão morta bloqueia antes de qualquer outro check.
     if pressao_morta_lado(m, lado):
         return False, 74, "FUNIL_PRESSAO_MORTA", detalhes
 
-    emocional_vivo, motivo_emocional = contexto_emocional_vivo(m, lado)
-    consequencia_minima = consequencia_minima_emocional(m, lado)
-    detalhes["contexto_emocional_vivo"] = emocional_vivo
-    detalhes["motivo_emocional"] = motivo_emocional
-    detalhes["consequencia_minima_emocional"] = consequencia_minima
+    # Contexto emocional morto bloqueia.
+    # Exceção única: super favorito não vencendo com pressão extrema tem fome
+    # institucional suficiente para sobrepor o contexto de placar.
+    if not emocional_vivo and not (super_fav and extremo):
+        return False, 76, f"FUNIL_CONTEXTO_EMOCIONAL_MORTO_{motivo_emocional}", detalhes
 
-    if not emocional_vivo:
-        return False, 76, f"FUNIL_CONTEXTO_MORTO_{motivo_emocional}", detalhes
-
-    # HT precisa parecer massacre: pressão + consequência, salvo super favorito
-    # com pressão extrema E consequência mínima. Favorito fraco no HT só passa
-    # com números extremos.
+    # ── HT ──────────────────────────────────────────────────────────────────
+    # HT precisa parecer massacre: pressão + consequência.
+    # Favorito fraco (odd > 1.50) bloqueado sem números de massacre.
     if eh_ht(m.estrategia):
         if not pressao:
             return False, 76, "FUNIL_HT_SEM_PRESSAO_VIVA", detalhes
+        # [V003 produção] favorito fraco no HT só passa com pressão extrema.
         if m.odd_favorito and m.odd_favorito > 1.50 and not extremo:
             return False, 80, "FUNIL_HT_FAVORITO_FRACO_SEM_MASSACRE", detalhes
         if not consequencia and not (super_fav and extremo and consequencia_minima):
             return False, 78, "FUNIL_HT_SEM_CONSEQUENCIA_MINIMA", detalhes
         return True, 100, "FUNIL_HT_APROVADO", detalhes
 
-    # FT aceita mais contexto emocional, mas ainda exige pressão viva e pelo
-    # menos consequência mínima nas exceções fortes.
+    # ── FT ──────────────────────────────────────────────────────────────────
     if not pressao:
         return False, 76, "FUNIL_FT_SEM_PRESSAO_VIVA", detalhes
 
-    excecao_contextual_valida = (valor_forte or (super_fav and extremo)) and consequencia_minima
+    # [V003 produção + V003 corrigido] exceção contextual exige:
+    # (valor_forte_validado OU super_fav+extremo) AND consequencia_minima.
+    # valor_forte sem finalização não é exceção — é fake pressure emocional.
+    excecao_contextual_valida = (
+        (valor_forte_validado or (super_fav and extremo))
+        and consequencia_minima
+    )
+
     if not consequencia and not excecao_contextual_valida:
+        # Motivo específico para auditoria: saber se falhou por falta de finalização
+        # ou por ausência total de consequência.
+        if valor_forte and not tem_finalizacao:
+            return False, 78, "FUNIL_FT_VALOR_FORTE_SEM_FINALIZACAO", detalhes
         return False, 78, "FUNIL_FT_SEM_CONSEQUENCIA_MINIMA", detalhes
 
-    # Favorito fraco/equilibrado só passa com números extremos ou valor forte
-    # com consequência mínima.
-    if m.odd_favorito and m.odd_favorito > 1.85 and not extremo and not (valor_forte and consequencia_minima):
+    # [V003 produção] favorito fraco/equilibrado só passa com números extremos
+    # ou valor_forte_validado com consequência mínima.
+    if m.odd_favorito and m.odd_favorito > 1.85 and not extremo and not (valor_forte_validado and consequencia_minima):
         return False, 80, "FUNIL_FAVORITO_FRACO_SEM_NUMEROS_EXTREMOS", detalhes
 
     return True, 100, "FUNIL_FT_APROVADO", detalhes
@@ -1269,10 +1379,12 @@ def score_python_contextual(m: Metricas, chave: str) -> DecisaoPython:
     score_bruto = base + sum(componentes.values())
 
     if eh_ht(m.estrategia):
+        # Bônus para pressão extrema no HT — massacre confirmado.
+        # A penalidade de -2 foi removida: o funil já exigiu pressão viva
+        # e consequência real. Punir novamente por não ser extremo é
+        # redundância estatística. Calibração: corte HT ajustado para 86.
         if m.lado_pressionante in {"CASA", "FORA"} and pressao_extrema_lado(m, m.lado_pressionante):
             score_bruto += 4
-        else:
-            score_bruto -= 2
     else:
         if favorito_nao_vencendo(m) and m.lado_favorito == m.lado_pressionante:
             score_bruto += 4
@@ -1540,7 +1652,8 @@ CSV_FIELDS = [
     "score_python", "decisao_ia", "ia_original", "ia_corrigida", "score_medio",
     "lado_favorito", "odd_favorito", "lado_pressionante", "ultimo_gol_lado",
     "valor_pos_evento_classe", "valor_pos_evento_motivo", "protecao_ia_ativa",
-    "liga", "decisao_final", "motivo_bloqueio", "resultado_manual", "cornerpro", "bet365",
+    "liga", "decisao_final", "motivo_bloqueio", "parser_confianca",
+    "resultado_manual", "cornerpro", "bet365",
 ]
 
 
@@ -1568,6 +1681,7 @@ def registrar_csv(m: Metricas, decisao_py: DecisaoPython, decisao_ia: DecisaoIA,
         "liga": m.liga,
         "decisao_final": decisao_final,
         "motivo_bloqueio": motivo,
+        "parser_confianca": m.parser_confianca,
         "resultado_manual": "",
         "cornerpro": m.cornerpro,
         "bet365": m.bet365,
