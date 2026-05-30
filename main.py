@@ -1,19 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-COUTIPS / ALFA — GOAT V004
-Unificação definitiva: melhor do V003 corrigido + melhor do V003 produção.
+COUTIPS / ALFA — GOAT V006
+HT com trava de favorito como pressionante + teto Python 96 / IA 95
 
-Inclui:
-- Telethon / Telegram
-- OpenAI como auditora, não cérebro
-- Motor Python contextual com funil obrigatório híbrido
-- contexto_emocional_vivo() com lógica apurada (producao)
-- consequencia_minima_emocional() com limiares HT/FT separados (producao)
-- Funil FT: excecao_contextual_valida exige consequencia_minima (producao)
-- Funil HT: trava de favorito fraco odd > 1.50 (producao)
-- valor_forte_validado: contexto emocional só vale com finalização mínima (V003 corrigido)
-- Valor pós-evento, proteção IA, CSV de auditoria
-- Fila, watchdog, cooldown, locks e anti-duplicidade
+Mudanças V006:
+- Teto Python 96 / IA 95
+- HT: exige que favorito seja o lado pressionante (bloqueia zebra dominando)
+- Threshold odd para bloqueio HT: > 1.60 (preserva jogos equilibrados)
+- Mantém FT inalterado (75.9% de acerto na auditoria)
 
 Start command: python main.py
 """
@@ -50,7 +44,7 @@ except Exception:  # pragma: no cover
 # VERSÃO / CONFIGURAÇÃO BASE
 # =========================================================
 
-VERSAO_COUTIPS = "ALFA_COUTIPS_2026_05_30_CENARIO_FT_V005_JOGO_MORTO"
+VERSAO_COUTIPS = "ALFA_COUTIPS_2026_05_30_V006_HT_FAVORITO_PRESSIONANTE"
 
 load_dotenv()
 
@@ -150,13 +144,13 @@ def log(msg: str) -> None:
 def logar_versao_inicial() -> None:
     log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     log(f"🚀 VERSAO_COUTIPS_ATIVA = {VERSAO_COUTIPS}")
-    log("✅ GOAT V004 FINAL — versão definitiva para auditoria real")
-    log("🛡️ Funil: contexto_emocional_vivo + consequencia_minima_emocional + valor_forte_validado")
-    log("🛡️ HT: penalidade -2 removida (redundância estatística pós-funil)")
-    log(f"📊 Corte HT ajustado para {CORTE_GOL_HT}% | Corte FT={CORTE_GOL_FT}%")
+    log("✅ GOAT V006 — HT com trava de favorito como pressionante")
+    log("🛡️ HT: exige que favorito seja o lado pressionante (bloqueia zebra dominando)")
+    log("🛡️ Teto Python 96 / IA 95")
+    log("🛡️ FT: mantém lógica V005 com cenários")
+    log(f"📊 Corte HT={CORTE_GOL_HT}% | Corte FT={CORTE_GOL_FT}%")
     log(f"📤 Canal gols: {TARGET_CHANNEL}")
     log(f"🧪 Canal confirmação: {CONFIRMATION_CHANNEL}")
-    log(f"📊 Conf HT={CORTE_CONFIRMACAO_GOL_HT}% | Conf FT={CORTE_CONFIRMACAO_GOL_FT}%")
     log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
 
@@ -1362,7 +1356,7 @@ def classificar_cenario_ft(m: Metricas) -> CenarioFT:
 
 
 # =========================================================
-# FUNIL OBRIGATÓRIO HÍBRIDO — GOAT V004 + V005
+# FUNIL OBRIGATÓRIO HÍBRIDO — GOAT V004 + V005 + V006
 # Unificação definitiva: melhor do V003 corrigido + melhor do V003 produção.
 #
 # Do V003 produção:
@@ -1378,6 +1372,8 @@ def classificar_cenario_ft(m: Metricas) -> CenarioFT:
 #   - motivo específico FUNIL_FT_VALOR_FORTE_SEM_FINALIZACAO para auditoria
 #
 # V005: classificar_cenario_ft() entra antes do bloco FT do funil.
+#
+# V006: HT exige que favorito seja o lado pressionante (bloqueia zebra dominando)
 # =========================================================
 
 def funil_obrigatorio_hibrido(m: Metricas) -> Tuple[bool, int, str, Dict[str, Any]]:
@@ -1451,6 +1447,12 @@ def funil_obrigatorio_hibrido(m: Metricas) -> Tuple[bool, int, str, Dict[str, An
     # HT precisa parecer massacre: pressão + consequência.
     # Favorito fraco (odd > 1.50) bloqueado sem números de massacre.
     if eh_ht(m.estrategia):
+        # [V006] HT exige que o favorito seja o lado pressionante
+        # Bloqueia cenários onde zebra ou time equilibrado domina (causa dos 4 REDS na auditoria)
+        # Threshold 1.60 preserva jogos equilibrados (odd 1.85+) que não têm favorito claro
+        if m.lado_favorito != lado and m.odd_favorito and m.odd_favorito > 1.60:
+            return False, 80, f"FUNIL_HT_ZEBRA_DOMINANDO_ODD={m.odd_favorito:.2f}", detalhes
+        
         if not pressao:
             return False, 76, "FUNIL_HT_SEM_PRESSAO_VIVA", detalhes
         # [V003 produção] favorito fraco no HT só passa com pressão extrema.
@@ -1538,7 +1540,7 @@ def score_python_contextual(m: Metricas, chave: str) -> DecisaoPython:
         if favorito_nao_vencendo(m) and m.lado_favorito == m.lado_pressionante:
             score_bruto += 4
 
-    score = clamp(score_bruto)
+    score = clamp(score_bruto, 0, 96)  # teto Python: nunca 100
 
     if not passou_funil:
         score = min(score, teto_funil)
@@ -1663,7 +1665,7 @@ async def consultar_openai(m: Metricas, decisao_py: DecisaoPython) -> Tuple[str,
             conf = pegar_numero(r"CONFIANÇA\s*=\s*(\d+)", content, decisao_py.score)
         motivo = content[:250]
         log(f"🤖 OpenAI | {m.jogo} | {decisao} | confiança={conf}")
-        return decisao, clamp(conf), motivo
+        return decisao, clamp(conf, 0, 95), motivo  # teto IA: nunca passa de 95
     except Exception as e:
         log(f"⚠️ OpenAI falhou | usando score Python | {type(e).__name__}: {e}")
         return "APROVAR", decisao_py.score, "OPENAI_FALHOU_USANDO_SCORE_PYTHON"
@@ -1742,6 +1744,8 @@ def titulo_periodo(estrategia: str) -> str:
         return "ALFA - CONFIRMADO | PRIMEIRO TEMPO"
     if estrategia == "ALFA_FT_CONFIRMACAO":
         return "ALFA - CONFIRMADO | SEGUNDO TEMPO"
+    if eh_ft(estrategia):
+        return "ALFA - AO VIVO | SEGUNDO TEMPO"
     if eh_ht(estrategia):
         return "ALFA - AO VIVO | PRIMEIRO TEMPO"
     return "ALFA - AO VIVO | SEGUNDO TEMPO"
