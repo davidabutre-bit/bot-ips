@@ -1,20 +1,23 @@
 # -*- coding: utf-8 -*-
 """
-COUTIPS / ALFA — GOAT V005 FINAL CORRIGIDO
-HT separado do FT com Filtro de Massacre
+COUTIPS / ALFA — GOAT V005 DEFINITIVO
+HT com 3 portas + FT com funções no nível global
 
-HT: funil_ht_dominio_convertivel()
-- 4 pilares obrigatórios (AP dif ≥12, U10 dif ≥8, U5 dif >0, U5 lado ≥4)
-- Consequência contextual (RB≥1 OU chance≥7 OU remates_totais≥5 OU cantos_diff≥2)
-- Dois níveis: 87% (Domínio Convertível) e 92% (Massacre Total)
+HT:
+- Porta 1: Massacre Total (92%)
+- Porta 2: Domínio Convertível (87%)
+- Porta 3: Super Favorito em Crise (86%)
 
-FT: mantém lógica atual (contexto emocional, valor pós-evento, proteção IA)
+FT: funções no nível global (correção de escopo)
+CORREÇÃO: MASSACRE_CONTINUA_MESMO_PLACAR_ABERTO só libera lado PERDENDO
 
-CORREÇÕES V005 FINAL:
-- Removido bug do "INTERVALO" que convertia FT em HT
-- Template usa minuto como autoridade (não confia só na estratégia)
-- Corrigido bug ip_lado (faltava underscore)
-- Removida duplicação no titulo_periodo
+CORREÇÕES APLICADAS:
+- Bug do INTERVALO removido
+- ip_lado com underscore corrigido
+- titulo_periodo() usa minuto como autoridade
+- Duplicação removida
+- Funções FT movidas para nível global (fix NameError em produção)
+- contexto_emocional_vivo_ft: placar aberto só libera lado perdendo
 
 Start command: python main.py
 """
@@ -51,7 +54,7 @@ except Exception:
 # VERSÃO / CONFIGURAÇÃO BASE
 # =========================================================
 
-VERSAO_COUTIPS = "ALFA_COUTIPS_2026_05_30_HT_MASSACRE_V005_FINAL_CORRIGIDO"
+VERSAO_COUTIPS = "ALFA_COUTIPS_2026_05_30_HT_3_PORTAS_V005_DEFINITIVO"
 
 load_dotenv()
 
@@ -101,13 +104,13 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 OPENAI_HABILITADO = os.getenv("OPENAI_HABILITADO", "true").lower() == "true"
 OPENAI_TIMEOUT = float(os.getenv("OPENAI_TIMEOUT", "30"))
 
-# Cortes HT - dois níveis
-CORTE_HT_CONVERTIVEL = int(os.getenv("CORTE_HT_CONVERTIVEL", "87"))
+# Cortes HT - três portas
 CORTE_HT_MASSACRE = int(os.getenv("CORTE_HT_MASSACRE", "92"))
+CORTE_HT_CONVERTIVEL = int(os.getenv("CORTE_HT_CONVERTIVEL", "87"))
+CORTE_HT_CRISE = int(os.getenv("CORTE_HT_CRISE", "86"))
 CORTE_GOL_FT = int(os.getenv("CORTE_GOL_FT", "83"))
 CORTE_CONFIRMACAO_GOL_HT = int(os.getenv("CORTE_CONFIRMACAO_GOL_HT", "85"))
 CORTE_CONFIRMACAO_GOL_FT = int(os.getenv("CORTE_CONFIRMACAO_GOL_FT", "80"))
-CORTE_OBSERVACAO = int(os.getenv("CORTE_OBSERVACAO_JANELA", "82"))
 
 COOLDOWN_SEGUNDOS = int(os.getenv("COOLDOWN_SEGUNDOS", "600"))
 CACHE_MAX_SEGUNDOS = int(os.getenv("CACHE_MAX_SEGUNDOS", "3600"))
@@ -153,13 +156,11 @@ def log(msg: str) -> None:
 def logar_versao_inicial() -> None:
     log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     log(f"🚀 VERSAO_COUTIPS_ATIVA = {VERSAO_COUTIPS}")
-    log("✅ GOAT V005 FINAL CORRIGIDO — HT separado com Filtro de Massacre")
-    log("🛡️ HT: Domínio Convertível (87%) ou Massacre Total (92%)")
-    log("🛡️ FT: mantém lógica contextual original")
-    log("🛡️ CORREÇÕES: bug ip_lado, duplicação titulo_periodo, bug INTERVALO")
-    log(f"📊 Corte HT Convertível={CORTE_HT_CONVERTIVEL}% | Massacre={CORTE_HT_MASSACRE}% | FT={CORTE_GOL_FT}%")
-    log(f"📤 Canal gols: {TARGET_CHANNEL}")
-    log(f"🧪 Canal confirmação: {CONFIRMATION_CHANNEL}")
+    log("✅ GOAT V005 DEFINITIVO — HT 3 portas + FT funções globais")
+    log("🛡️ HT: Massacre (92%) | Domínio Convertível (87%) | Super Favorito Crise (86%)")
+    log("🛡️ FT: placar aberto só libera lado PERDENDO (fix MASSACRE_CONTINUA)")
+    log(f"📊 HT Massacre={CORTE_HT_MASSACRE}% | Convertível={CORTE_HT_CONVERTIVEL}% | Crise={CORTE_HT_CRISE}% | FT={CORTE_GOL_FT}%")
+    log(f"📤 Canal gols: {TARGET_CHANNEL} | 🧪 Confirmação: {CONFIRMATION_CHANNEL}")
     log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
 
@@ -250,7 +251,10 @@ def limpar_memoria_interna() -> None:
             if agora - ts > CACHE_MAX_SEGUNDOS:
                 cache.pop(k, None)
         if len(cache) > CACHE_MAX_ENTRADAS:
-            ordenadas = sorted(cache.keys(), key=lambda x: cache[x].get("recebido_em", 0) if isinstance(cache[x], dict) else cache[x])
+            ordenadas = sorted(
+                cache.keys(),
+                key=lambda x: cache[x].get("recebido_em", 0) if isinstance(cache[x], dict) else cache[x]
+            )
             for k in ordenadas[: len(cache) - CACHE_MAX_ENTRADAS]:
                 cache.pop(k, None)
 
@@ -383,9 +387,6 @@ def detectar_estrategia(texto: str) -> str:
         return "ALFA_FT"
 
     # REMOVIDO: bug do INTERVALO que convertia FT em HT
-    # if "INTERVALO" in t and "SEGUNDO TEMPO" not in t:
-    #     return "ALFA_HT"
-
     return "ALFA_FT"
 
 
@@ -460,8 +461,8 @@ def extrair_odds(texto: str) -> Tuple[float, float, float]:
 def extrair_ultimo_gol_lado(texto: str) -> str:
     t = remover_acentos(texto).upper()
     for padrao in (
-        r"ULTIMO\s+GOLO:\s*\d+\s*['’]?\s*(CASA|FORA|HOME|AWAY)",
-        r"ULTIMO\s+GOL:\s*\d+\s*['’]?\s*(CASA|FORA|HOME|AWAY)",
+        r"ULTIMO\s+GOLO:\s*\d+\s*['']?\s*(CASA|FORA|HOME|AWAY)",
+        r"ULTIMO\s+GOL:\s*\d+\s*['']?\s*(CASA|FORA|HOME|AWAY)",
     ):
         m = re.search(padrao, t)
         if m:
@@ -486,7 +487,7 @@ def extrair_ultimos_cantos_lados(texto: str) -> List[Tuple[int, str]]:
         return []
     linha = m.group(1).split("\n")[0]
     eventos: List[Tuple[int, str]] = []
-    for minuto, lado in re.findall(r"(\d+)\s*['’]?\s*(CASA|FORA|HOME|AWAY)", linha):
+    for minuto, lado in re.findall(r"(\d+)\s*['']?\s*(CASA|FORA|HOME|AWAY)", linha):
         eventos.append((int(minuto), "CASA" if lado in {"CASA", "HOME"} else "FORA"))
     return eventos
 
@@ -627,8 +628,8 @@ def extrair_metricas(texto: str) -> Metricas:
         remates_lado=pegar_par(r"Remates lado:\s*(\d+)\s*-\s*(\d+)", tl),
         remates_dentro_area=rda,
         vermelhos=pegar_par(r"Cartões vermelhos:\s*(\d+)\s*-\s*(\d+)", tl),
-        ultimos5=pegar_par(r"(?:Ultimos|Últimos)\s*5['’]?:\s*(-?\d+)\s*\([^)]*\)\s*-\s*(-?\d+)", tl),
-        ultimos10=pegar_par(r"(?:Ultimos|Últimos)\s*10['’]?:\s*(-?\d+)\s*\([^)]*\)\s*-\s*(-?\d+)", tl),
+        ultimos5=pegar_par(r"(?:Ultimos|Últimos)\s*5['']?:\s*(-?\d+)\s*\([^)]*\)\s*-\s*(-?\d+)", tl),
+        ultimos10=pegar_par(r"(?:Ultimos|Últimos)\s*10['']?:\s*(-?\d+)\s*\([^)]*\)\s*-\s*(-?\d+)", tl),
         odds=extrair_odds(tl),
         ultimo_gol=extrair_ultimo_gol_minuto(tl),
         ultimo_gol_lado=extrair_ultimo_gol_lado(tl),
@@ -677,7 +678,6 @@ LIGAS_PERIGOSAS = {
     "mongolia", "myanmar", "cambodia", "laos", "bhutan", "san marino",
     "andorra", "gibraltar", "kosovo", "moldova", "armenia", "azerbaijan",
 }
-
 
 _TIMES_ELITE_TRANSICAO = {
     "atletico madrid", "atletico de madrid", "real madrid", "barcelona",
@@ -735,7 +735,7 @@ def lado_favorito(m: Metricas) -> Tuple[str, float]:
     return "EQUILIBRADO", oc
 
 
-def lado_zebra(fav: str) -> str:
+def lado_zebra_fn(fav: str) -> str:
     if fav == "CASA":
         return "FORA"
     if fav == "FORA":
@@ -786,7 +786,7 @@ def ip_lado(m: Metricas, lado: str) -> Dict[str, float]:
     p = m.pressao_alfa or _pressao_vazia()
     suf = "casa" if lado == "CASA" else "fora"
     return {
-        "pico": float(p.get(f"ip_pico_{suf}", 0)),  # CORRIGIDO: adicionado underscore
+        "pico": float(p.get(f"ip_pico_{suf}", 0)),
         "media": float(p.get(f"ip_media_{suf}", 0)),
         "c10": float(p.get(f"ip_consec_10_{suf}", 0)),
         "c15": float(p.get(f"ip_consec_15_{suf}", 0)),
@@ -798,14 +798,11 @@ def ip_lado(m: Metricas, lado: str) -> Dict[str, float]:
 def preencher_contexto_calculado(m: Metricas) -> None:
     m.liga = classificar_liga(m.competicao)
     m.lado_favorito, m.odd_favorito = lado_favorito(m)
-    m.lado_zebra = lado_zebra(m.lado_favorito)
-    
-    # Define lado pressionante baseado no favorito para HT
-    # Para FT, mantém lógica original que será chamada separadamente
+    m.lado_zebra = lado_zebra_fn(m.lado_favorito)
+
     if eh_ht(m.estrategia):
         m.lado_pressionante = m.lado_favorito if m.lado_favorito in {"CASA", "FORA"} else "DESCONHECIDO"
     else:
-        # FT: tenta identificar dominante
         casa_pontos = (
             dados_lado(m, "CASA")["ap"] * 1.0
             + dados_lado(m, "CASA")["u5"] * 2.2
@@ -826,7 +823,11 @@ def preencher_contexto_calculado(m: Metricas) -> None:
             m.lado_pressionante = "FORA"
         else:
             m.lado_dominante = "EQUILIBRADO"
-            m.lado_pressionante = m.lado_favorito if m.lado_favorito in {"CASA", "FORA"} and m.odd_favorito <= 1.85 else "DESCONHECIDO"
+            m.lado_pressionante = (
+                m.lado_favorito
+                if m.lado_favorito in {"CASA", "FORA"} and m.odd_favorito <= 1.85
+                else "DESCONHECIDO"
+            )
 
 
 # =========================================================
@@ -834,7 +835,6 @@ def preencher_contexto_calculado(m: Metricas) -> None:
 # =========================================================
 
 def validar_consistencia_estrategia(m: Metricas) -> Tuple[bool, str]:
-    """Valida se a estratégia declarada é compatível com o minuto do jogo"""
     if eh_ht(m.estrategia) and m.tempo > 45:
         return False, f"HT_STRATEGIA_COM_MINUTO_{m.tempo}"
     if eh_ft(m.estrategia) and m.tempo < 46:
@@ -843,79 +843,7 @@ def validar_consistencia_estrategia(m: Metricas) -> Tuple[bool, str]:
 
 
 # =========================================================
-# FUNIL HT - DOMÍNIO CONVERTÍVEL / MASSACRE TOTAL
-# =========================================================
-
-def funil_ht_dominio_convertivel(m: Metricas) -> Tuple[bool, int, str]:
-    """
-    HT: filtro de massacre
-    - Domínio Convertível: 87%
-    - Massacre Total: 92%
-    """
-    lado = m.lado_pressionante
-    if lado not in {"CASA", "FORA"}:
-        return False, 72, "SEM_LADO_PRESSIONANTE"
-    
-    # ========== 4 PILARES OBRIGATÓRIOS ==========
-    # 1. AP diferença >= 12
-    ap_casa, ap_fora = m.ataques_perigosos
-    diff_ap = (ap_casa - ap_fora) if lado == "CASA" else (ap_fora - ap_casa)
-    if diff_ap < 12:
-        return False, 80, f"AP_DIF_{diff_ap}_<12"
-    
-    # 2. Últimos 10' diferença >= 8
-    u10_casa, u10_fora = m.ultimos10
-    diff_u10 = (u10_casa - u10_fora) if lado == "CASA" else (u10_fora - u10_casa)
-    if diff_u10 < 8:
-        return False, 80, f"U10_DIF_{diff_u10}_<8"
-    
-    # 3. Últimos 5' diferença > 0
-    u5_casa, u5_fora = m.ultimos5
-    diff_u5 = (u5_casa - u5_fora) if lado == "CASA" else (u5_fora - u5_casa)
-    if diff_u5 <= 0:
-        return False, 78, f"U5_DIF_{diff_u5}_<=0"
-    
-    # 4. Últimos 5' do lado >= 4
-    u5_lado = m.ultimos5[0] if lado == "CASA" else m.ultimos5[1]
-    if u5_lado < 4:
-        return False, 76, f"U5_LADO_{u5_lado}_<4"
-    
-    # ========== CONSEQUÊNCIA CONTEXTUAL (para 85-89) ==========
-    rb_lado = m.remates_baliza[0] if lado == "CASA" else m.remates_baliza[1]
-    chance_lado = m.chance_golo[0] if lado == "CASA" else m.chance_golo[1]
-    remates_totais_lado = (m.remates_baliza[0] + m.remates_lado[0]) if lado == "CASA" else (m.remates_baliza[1] + m.remates_lado[1])
-    cantos_lado = m.cantos[0] if lado == "CASA" else m.cantos[1]
-    cantos_adv = m.cantos[1] if lado == "CASA" else m.cantos[0]
-    cantos_diff = cantos_lado - cantos_adv
-    
-    consequencia_convertivel = (
-        rb_lado >= 1 or
-        chance_lado >= 7 or
-        remates_totais_lado >= 5 or
-        cantos_diff >= 2
-    )
-    
-    if not consequencia_convertivel:
-        return False, 78, "SEM_CONSEQUENCIA_CONVERTIVEL"
-    
-    # ========== MASSACRE TOTAL (90+) ==========
-    massacre_total = (
-        diff_ap >= 18 and
-        diff_u10 >= 12 and
-        diff_u5 >= 5 and
-        (rb_lado >= 1 or chance_lado >= 8 or remates_totais_lado >= 6)
-    )
-    
-    if massacre_total:
-        m.ht_score_nivel = "MASSACRE"
-        return True, CORTE_HT_MASSACRE, "MASSACRE_TOTAL_90+"
-    else:
-        m.ht_score_nivel = "CONVERTIVEL"
-        return True, CORTE_HT_CONVERTIVEL, "DOMINIO_CONVERTIVEL_85-89"
-
-
-# =========================================================
-# FUNIL FT - CONTEXTO EMOCIONAL (mantido do V004)
+# FUNÇÕES FT — NÍVEL GLOBAL
 # =========================================================
 
 def favorito_nao_vencendo(m: Metricas) -> bool:
@@ -971,6 +899,10 @@ def consequencia_minima_emocional(m: Metricas, lado: str) -> bool:
 
 
 def contexto_emocional_vivo_ft(m: Metricas, lado: str) -> Tuple[bool, str]:
+    """
+    CORREÇÃO V005: placar aberto (total>=3, dif>=2) só libera o lado PERDENDO.
+    O lado vencedor por 3x0, 4x0 etc não tem fome — jogo encerrado emocionalmente.
+    """
     gc, gf = extrair_gols_placar(m.placar)
     if gc is None or gf is None:
         return True, "PLACAR_DESCONHECIDO"
@@ -982,10 +914,14 @@ def contexto_emocional_vivo_ft(m: Metricas, lado: str) -> Tuple[bool, str]:
     vencendo = lado_vencendo(m)
 
     if total_gols >= 3 and dif >= 2:
-        if lado == vencendo and pressao_viva_lado_ft(m, lado) and consequencia_real_lado_ft(m, lado):
-            return True, "MASSACRE_CONTINUA_MESMO_PLACAR_ABERTO"
+        # Lado vencendo por placar aberto não tem fome — jogo resolvido
+        if lado == vencendo:
+            return False, "PLACAR_RESOLVIDO_VENCEDOR_SEM_NECESSIDADE"
+        # Lado perdendo: só libera se ainda tem pressão e consequência real
+        if pressao_viva_lado_ft(m, lado) and consequencia_real_lado_ft(m, lado):
+            return True, "TIME_ATRAS_REAGE_PLACAR_ABERTO"
         return False, "PLACAR_ABERTO_DEMAIS_SEM_VALOR"
-    
+
     if vencendo == "EMPATE":
         return True, "EMPATE_CONTEXTO_VIVO"
     if dif <= 1:
@@ -1075,7 +1011,6 @@ def finalizacao_minima_lado_ft(m: Metricas, lado: str) -> bool:
 
 
 def funil_ft_contextual(m: Metricas) -> Tuple[bool, int, str, Dict[str, Any]]:
-    """FT: mantém lógica contextual do V004"""
     lado = m.lado_pressionante
     detalhes: Dict[str, Any] = {}
 
@@ -1236,10 +1171,11 @@ def aplicar_travas_finais_ft(m: Metricas, score: int) -> Tuple[int, str, bool]:
 
 
 def score_python_ft(m: Metricas) -> DecisaoPython:
+    """FT: chama funções globais — sem aninhamento."""
     preencher_contexto_calculado(m)
-    
+
     passou_funil, teto_funil, motivo_funil, detalhes_funil = funil_ft_contextual(m)
-    
+
     base = 45
     componentes = {
         "pressao_viva": score_pressao_viva_ft(m),
@@ -1248,16 +1184,16 @@ def score_python_ft(m: Metricas) -> DecisaoPython:
         "liga": liga_ajuste(m.liga),
         "relogio": score_relogio_ft(m),
     }
-    
+
     valor_classe, valor_motivo, ajuste_evento, proteger_ia = avaliar_valor_pos_evento_ft(m)
     m.valor_pos_evento_classe = valor_classe
     m.valor_pos_evento_motivo = valor_motivo
     m.protecao_ia_ativa = proteger_ia
     componentes["valor_pos_evento"] = ajuste_evento
-    
+
     score_bruto = base + sum(componentes.values())
     score = clamp(score_bruto)
-    
+
     if not passou_funil:
         score = min(score, teto_funil)
         detalhes = {
@@ -1268,13 +1204,13 @@ def score_python_ft(m: Metricas) -> DecisaoPython:
             "funil_detalhes": detalhes_funil,
         }
         return DecisaoPython(score=score, aprovado_pre_ia=False, status="REPROVADO", motivo=motivo_funil, detalhes=detalhes)
-    
+
     score, motivo_trava, bloqueado_trava = aplicar_travas_finais_ft(m, score)
     corte = CORTE_GOL_FT
     aprovado = score >= corte and not bloqueado_trava
     status = "APROVADO" if aprovado else "REPROVADO"
     motivo = motivo_trava if bloqueado_trava else f"score={score} corte={corte}"
-    
+
     detalhes = {
         "componentes": componentes,
         "score_bruto": score_bruto,
@@ -1287,55 +1223,174 @@ def score_python_ft(m: Metricas) -> DecisaoPython:
 
 
 # =========================================================
-# PONTO DE ENTRADA DO SCORE (HT usa função específica, FT usa a antiga)
+# FUNÇÕES HT — NÍVEL GLOBAL (3 PORTAS)
+# =========================================================
+
+def funil_ht_massacre(m: Metricas) -> Tuple[bool, int, str]:
+    """Porta 1 HT: Massacre Total → 92%"""
+    lado = m.lado_pressionante
+    if lado not in {"CASA", "FORA"}:
+        return False, 72, "SEM_LADO_PRESSIONANTE"
+
+    ap_casa, ap_fora = m.ataques_perigosos
+    diff_ap = (ap_casa - ap_fora) if lado == "CASA" else (ap_fora - ap_casa)
+    if diff_ap < 18:
+        return False, 80, f"AP_DIF_{diff_ap}_<18"
+
+    u10_casa, u10_fora = m.ultimos10
+    diff_u10 = (u10_casa - u10_fora) if lado == "CASA" else (u10_fora - u10_casa)
+    if diff_u10 < 12:
+        return False, 80, f"U10_DIF_{diff_u10}_<12"
+
+    u5_casa, u5_fora = m.ultimos5
+    diff_u5 = (u5_casa - u5_fora) if lado == "CASA" else (u5_fora - u5_casa)
+    if diff_u5 < 5:
+        return False, 78, f"U5_DIF_{diff_u5}_<5"
+
+    d = dados_lado(m, lado)
+    consequencia_forte = d["rb"] >= 1 or d["chance"] >= 8 or (d["rb"] + d["rl"]) >= 6
+    if not consequencia_forte:
+        return False, 78, "CONSEQUENCIA_FORTE_INSUFICIENTE"
+
+    m.ht_score_nivel = "MASSACRE"
+    return True, CORTE_HT_MASSACRE, "MASSACRE_TOTAL_92"
+
+
+def funil_ht_dominio_convertivel(m: Metricas) -> Tuple[bool, int, str]:
+    """Porta 2 HT: Domínio Convertível → 87%"""
+    lado = m.lado_pressionante
+    if lado not in {"CASA", "FORA"}:
+        return False, 72, "SEM_LADO_PRESSIONANTE"
+
+    ap_casa, ap_fora = m.ataques_perigosos
+    diff_ap = (ap_casa - ap_fora) if lado == "CASA" else (ap_fora - ap_casa)
+    if diff_ap < 12:
+        return False, 80, f"AP_DIF_{diff_ap}_<12"
+
+    u10_casa, u10_fora = m.ultimos10
+    diff_u10 = (u10_casa - u10_fora) if lado == "CASA" else (u10_fora - u10_casa)
+    if diff_u10 < 8:
+        return False, 80, f"U10_DIF_{diff_u10}_<8"
+
+    u5_casa, u5_fora = m.ultimos5
+    diff_u5 = (u5_casa - u5_fora) if lado == "CASA" else (u5_fora - u5_casa)
+    if diff_u5 <= 0:
+        return False, 78, f"U5_DIF_{diff_u5}_<=0"
+
+    u5_lado = m.ultimos5[0] if lado == "CASA" else m.ultimos5[1]
+    if u5_lado < 4:
+        return False, 76, f"U5_LADO_{u5_lado}_<4"
+
+    d = dados_lado(m, lado)
+    cantos_adv = valor_lado(m, "cantos", m.lado_zebra)
+    cantos_diff = d["cantos"] - cantos_adv
+
+    consequencia_convertivel = (
+        d["rb"] >= 1
+        or d["chance"] >= 7
+        or (d["rb"] + d["rl"]) >= 5
+        or cantos_diff >= 2
+    )
+    if not consequencia_convertivel:
+        return False, 78, "SEM_CONSEQUENCIA_CONVERTIVEL"
+
+    m.ht_score_nivel = "CONVERTIVEL"
+    return True, CORTE_HT_CONVERTIVEL, "DOMINIO_CONVERTIVEL_87"
+
+
+def funil_ht_super_favorito_crise(m: Metricas) -> Tuple[bool, int, str]:
+    """Porta 3 HT: Super Favorito em Crise → 86%"""
+    lado = m.lado_favorito
+    if lado not in {"CASA", "FORA"}:
+        return False, 72, "SEM_FAVORITO"
+
+    if m.odd_favorito > 1.50:
+        return False, 76, f"ODD_{m.odd_favorito}_>1.50"
+
+    vencedor = lado_vencendo(m)
+    if vencedor == lado:
+        return False, 74, "FAVORITO_NAO_ESTA_PERDENDO"
+    if vencedor == "EMPATE":
+        return False, 74, "JOGO_EMPATADO_NAO_E_CRISE"
+
+    if m.tempo < 15 or m.tempo > 40:
+        return False, 72, f"JANELA_TEMPO_{m.tempo}_FORA_15-40"
+
+    d = dados_lado(m, lado)
+    ip = ip_lado(m, lado)
+    pressao_viva = d["u5"] >= 2 or d["u10"] >= 4 or ip["pico"] >= 18
+    if not pressao_viva:
+        return False, 74, "SUPER_FAVORITO_PERDENDO_SEM_PRESSAO"
+
+    consequencia = d["rb"] >= 1 or d["chance"] >= 5 or d["xg"] >= 0.15
+    if not consequencia:
+        return False, 74, "SUPER_FAVORITO_PERDENDO_SEM_CONSEQUENCIA"
+
+    ap_adv = valor_lado(m, "ataques_perigosos", m.lado_zebra)
+    colapso_ap = d["ap"] < ap_adv * 0.60
+    colapso_consequencia = d["rb"] == 0 and d["chance"] < 4 and d["xg"] < 0.10
+    if colapso_ap and colapso_consequencia:
+        return False, 72, "FAVORITO_COLAPSADO"
+
+    total_ap = m.ataques_perigosos[0] + m.ataques_perigosos[1]
+    total_fin = sum(m.remates_baliza) + sum(m.remates_lado)
+    if total_ap < 30 and total_fin < 8:
+        return False, 70, "JOGO_MORTO_SEM_VOLUME"
+
+    m.ht_score_nivel = "SUPER_FAVORITO_CRISE"
+    return True, CORTE_HT_CRISE, "SUPER_FAVORITO_EM_CRISE_86"
+
+
+# =========================================================
+# ROTEADOR PRINCIPAL
 # =========================================================
 
 def score_python_contextual(m: Metricas, chave: str) -> DecisaoPython:
-    """Ponto de entrada principal - roteia HT e FT para funções diferentes"""
-    
-    # Primeiro, valida consistência estratégia-minuto
+    """Roteia HT (3 portas) ou FT."""
+
     consistente, motivo_consistente = validar_consistencia_estrategia(m)
     if not consistente:
         log(f"⛔ INCONSISTENCIA_ESTRATEGIA | {m.estrategia} | {motivo_consistente} | {m.jogo}")
-        return DecisaoPython(
-            score=70,
-            aprovado_pre_ia=False,
-            status="REPROVADO",
-            motivo=motivo_consistente,
-            detalhes={}
-        )
-    
-    # Trava por parser_confiança crítico
+        return DecisaoPython(score=70, aprovado_pre_ia=False, status="REPROVADO", motivo=motivo_consistente)
+
     if m.parser_confianca <= 2:
         log(f"🔴 BLOQUEADO_PARSER_CRITICO | confianca={m.parser_confianca}/8 | {m.jogo}")
-        return DecisaoPython(
-            score=65,
-            aprovado_pre_ia=False,
-            status="REPROVADO",
-            motivo=f"PARSER_CRITICO_{m.parser_confianca}/8",
-            detalhes={}
-        )
-    
+        return DecisaoPython(score=65, aprovado_pre_ia=False, status="REPROVADO", motivo=f"PARSER_CRITICO_{m.parser_confianca}/8")
+
     if eh_ht(m.estrategia):
+        motivos: List[str] = []
+
+        aprovado, score, motivo = funil_ht_massacre(m)
+        if aprovado:
+            log(f"📊 HT_MASSACRE | {m.jogo} | {motivo}")
+            return DecisaoPython(score=score, aprovado_pre_ia=True, status="APROVADO", motivo=motivo, detalhes={"ht_nivel": "MASSACRE", "porta": 1})
+        motivos.append(f"MASSACRE:{motivo}")
+
         aprovado, score, motivo = funil_ht_dominio_convertivel(m)
-        return DecisaoPython(
-            score=score,
-            aprovado_pre_ia=aprovado,
-            status="APROVADO" if aprovado else "REPROVADO",
-            motivo=motivo,
-            detalhes={"ht_nivel": m.ht_score_nivel}
-        )
-    else:
-        return score_python_ft(m)
+        if aprovado:
+            log(f"📊 HT_CONVERTIVEL | {m.jogo} | {motivo}")
+            return DecisaoPython(score=score, aprovado_pre_ia=True, status="APROVADO", motivo=motivo, detalhes={"ht_nivel": "CONVERTIVEL", "porta": 2})
+        motivos.append(f"CONVERTIVEL:{motivo}")
+
+        aprovado, score, motivo = funil_ht_super_favorito_crise(m)
+        if aprovado:
+            log(f"📊 HT_CRISE | {m.jogo} | {motivo}")
+            return DecisaoPython(score=score, aprovado_pre_ia=True, status="APROVADO", motivo=motivo, detalhes={"ht_nivel": "SUPER_FAVORITO_CRISE", "porta": 3})
+        motivos.append(f"CRISE:{motivo}")
+
+        motivo_final = " | ".join(motivos)
+        log(f"📊 HT_REPROVADO | {m.jogo} | {motivo_final}")
+        return DecisaoPython(score=72, aprovado_pre_ia=False, status="REPROVADO", motivo=motivo_final, detalhes={"ht_nivel": "REPROVADO", "motivos": motivos})
+
+    return score_python_ft(m)
 
 
 # =========================================================
-# IA AUDITORA (apenas para FT, HT não usa IA)
+# IA AUDITORA (apenas FT)
 # =========================================================
 
 def montar_prompt_ia_ft(m: Metricas) -> str:
-    return f"""
-Você é a IA Auditora do projeto COUTIPS/ALFA para SEGUNDO TEMPO.
+    return f"""Você é a IA Auditora do projeto COUTIPS/ALFA para SEGUNDO TEMPO.
 Responda obrigatoriamente em UMA linha no formato:
 DECISAO=APROVAR|BLOQUEAR; CONFIANCA=0-100; MOTIVO=texto curto
 
@@ -1357,8 +1412,7 @@ RB: {m.remates_baliza}
 Remates lado: {m.remates_lado}
 Chance gol: {m.chance_golo}
 xG: {m.xg}
-Valor pós-evento: {m.valor_pos_evento_classe} | {m.valor_pos_evento_motivo}
-""".strip()
+Valor pós-evento: {m.valor_pos_evento_classe} | {m.valor_pos_evento_motivo}""".strip()
 
 
 async def consultar_openai_ft(m: Metricas, score_py: int) -> Tuple[str, int, str]:
@@ -1385,8 +1439,7 @@ async def consultar_openai_ft(m: Metricas, score_py: int) -> Tuple[str, int, str
         conf = pegar_numero(r"CONFIANCA\s*=\s*(\d+)", content, score_py)
         if conf == score_py:
             conf = pegar_numero(r"CONFIANÇA\s*=\s*(\d+)", content, score_py)
-        motivo = content[:250]
-        return decisao, clamp(conf), motivo
+        return decisao, clamp(conf), content[:250]
     except Exception as e:
         log(f"⚠️ OpenAI falhou | {type(e).__name__}: {e}")
         return "APROVAR", score_py, "OPENAI_FALHOU"
@@ -1446,14 +1499,10 @@ def emoji_score(score: int) -> str:
 
 
 def titulo_periodo(m: Metricas) -> str:
-    # CORREÇÃO: segurança por minuto - NÃO confia só na estratégia
-    # Confirmações (sem duplicação)
     if m.estrategia == "ALFA_HT_CONFIRMACAO":
         return "ALFA - CONFIRMADO | PRIMEIRO TEMPO" if m.tempo <= 45 else "ALFA - CONFIRMADO | SEGUNDO TEMPO"
     if m.estrategia == "ALFA_FT_CONFIRMACAO":
         return "ALFA - CONFIRMADO | SEGUNDO TEMPO"
-    
-    # SEGURANÇA POR MINUTO - autoridade máxima
     if m.tempo >= 46:
         return "ALFA - AO VIVO | SEGUNDO TEMPO"
     return "ALFA - AO VIVO | PRIMEIRO TEMPO"
@@ -1502,14 +1551,6 @@ async def enviar_auditoria(m: Metricas, score_py: int, score_ia: int, score_medi
     await send_resiliente(canal, texto)
 
 
-def garantir_csv() -> None:
-    if CSV_PATH.exists():
-        return
-    with CSV_PATH.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
-        writer.writeheader()
-
-
 CSV_FIELDS = [
     "data_hora", "jogo", "estrategia", "minuto", "placar", "mercado",
     "score_python", "decisao_ia", "ia_original", "ia_corrigida", "score_medio",
@@ -1520,39 +1561,35 @@ CSV_FIELDS = [
 ]
 
 
+def garantir_csv() -> None:
+    if CSV_PATH.exists():
+        return
+    with CSV_PATH.open("w", newline="", encoding="utf-8") as f:
+        csv.DictWriter(f, fieldnames=CSV_FIELDS).writeheader()
+
+
 def registrar_csv(m: Metricas, decisao_py: DecisaoPython, decisao_ia: Optional[DecisaoIA], score_medio: int, decisao_final: str, motivo: str) -> None:
     garantir_csv()
     row = {
-        "data_hora": now_iso(),
-        "jogo": m.jogo,
-        "estrategia": m.estrategia,
-        "minuto": m.tempo,
-        "placar": m.placar,
-        "mercado": m.mercado,
+        "data_hora": now_iso(), "jogo": m.jogo, "estrategia": m.estrategia,
+        "minuto": m.tempo, "placar": m.placar, "mercado": m.mercado,
         "score_python": decisao_py.score,
         "decisao_ia": decisao_ia.decisao if decisao_ia else "HT_SEM_IA",
         "ia_original": decisao_ia.confianca_original if decisao_ia else 0,
         "ia_corrigida": decisao_ia.confianca_corrigida if decisao_ia else 0,
-        "score_medio": score_medio,
-        "lado_favorito": m.lado_favorito,
-        "odd_favorito": m.odd_favorito,
-        "lado_pressionante": m.lado_pressionante,
+        "score_medio": score_medio, "lado_favorito": m.lado_favorito,
+        "odd_favorito": m.odd_favorito, "lado_pressionante": m.lado_pressionante,
         "ultimo_gol_lado": m.ultimo_gol_lado,
         "valor_pos_evento_classe": m.valor_pos_evento_classe,
         "valor_pos_evento_motivo": m.valor_pos_evento_motivo,
-        "protecao_ia_ativa": m.protecao_ia_ativa,
-        "liga": m.liga,
-        "decisao_final": decisao_final,
-        "motivo_bloqueio": motivo,
+        "protecao_ia_ativa": m.protecao_ia_ativa, "liga": m.liga,
+        "decisao_final": decisao_final, "motivo_bloqueio": motivo,
         "parser_confianca": m.parser_confianca,
         "ht_nivel": getattr(m, "ht_score_nivel", ""),
-        "resultado_manual": "",
-        "cornerpro": m.cornerpro,
-        "bet365": m.bet365,
+        "resultado_manual": "", "cornerpro": m.cornerpro, "bet365": m.bet365,
     }
     with CSV_PATH.open("a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
-        writer.writerow(row)
+        csv.DictWriter(f, fieldnames=CSV_FIELDS).writerow(row)
 
 
 # =========================================================
@@ -1572,7 +1609,7 @@ async def send_resiliente(canal: str, mensagem: str, parse_mode: Optional[str] =
             log(f"⚠️ FloodWait {espera}s | canal={canal}")
             await asyncio.sleep(espera)
         except TypeNotFoundError:
-            log(f"⚠️ TypeNotFoundError envio tent={tentativa}/{max_tentativas}")
+            log(f"⚠️ TypeNotFoundError tent={tentativa}/{max_tentativas}")
             try:
                 await client.disconnect()
             except Exception:
@@ -1595,7 +1632,7 @@ async def trabalhador_fila_envio() -> None:
             await send_resiliente(canal, mensagem, parse_mode=parse_mode)
             await asyncio.sleep(INTERVALO_ENVIO_SEGUNDOS)
         except Exception as e:
-            log(f"❌ Erro trabalhador_fila_envio: {type(e).__name__}: {e}")
+            log(f"❌ Erro fila_envio: {type(e).__name__}: {e}")
             log(traceback.format_exc())
         finally:
             fila_envio.task_done()
@@ -1605,28 +1642,23 @@ async def enfileirar_envio(canal: str, mensagem: str, parse_mode: Optional[str] 
     try:
         await fila_envio.put((canal, mensagem, parse_mode))
     except asyncio.QueueFull:
-        log("❌ FILA CHEIA — alerta descartado por segurança")
+        log("❌ FILA CHEIA — alerta descartado")
 
 
 # =========================================================
-# CHAVE ÚNICA / COOLDOWN
+# CHAVE ÚNICA / COOLDOWN / DESTINO
 # =========================================================
 
 def chave_alerta_unica(texto: str) -> str:
     limpo = remover_acentos(texto)
-    jogo = extrair_jogo(limpo)
-    tempo = extrair_tempo(limpo)
-    resultado = extrair_resultado(limpo)
-    estrategia = detectar_estrategia(limpo)
-    return f"{normalizar_chave_jogo(jogo)}|{estrategia}|{tempo}|{resultado}"
+    return f"{normalizar_chave_jogo(extrair_jogo(limpo))}|{detectar_estrategia(limpo)}|{extrair_tempo(limpo)}|{extrair_resultado(limpo)}"
 
 
 def pode_enviar(chave: str) -> bool:
-    agora = time.time()
     ultimo = ultimos_enviados.get(chave)
     if not ultimo:
         return True
-    return agora - float(ultimo.get("recebido_em", 0)) >= COOLDOWN_SEGUNDOS
+    return time.time() - float(ultimo.get("recebido_em", 0)) >= COOLDOWN_SEGUNDOS
 
 
 def marcar_enviado(chave: str, m: Metricas, score: int) -> None:
@@ -1650,29 +1682,24 @@ async def processar_alerta(alerta: Alerta) -> None:
     chave = alerta.chave_jogo
 
     decisao_py = score_python_contextual(m, chave)
-    
-    log(f"📊 PY_PROCESSADO | {m.estrategia} | score={decisao_py.score}% | {m.jogo} | Liga={m.liga} | Press={m.lado_pressionante} | Valor={m.valor_pos_evento_classe}")
+    log(f"📊 PY | {m.estrategia} | score={decisao_py.score}% | {m.jogo} | Liga={m.liga} | Press={m.lado_pressionante} | Valor={m.valor_pos_evento_classe}")
 
-    # HT não usa IA
+    # HT: sem IA
     if eh_ht(m.estrategia):
         score_medio = decisao_py.score
-        corte = CORTE_HT_CONVERTIVEL if m.ht_score_nivel == "CONVERTIVEL" else CORTE_HT_MASSACRE
-        aprovado = decisao_py.aprovado_pre_ia and score_medio >= corte
-        
-        motivo_final = "APROVADO" if aprovado else f"score={score_medio}% < {corte}% OU {decisao_py.motivo}"
+        aprovado = decisao_py.aprovado_pre_ia
+        motivo_final = "APROVADO" if aprovado else f"REPROVADO: {decisao_py.motivo}"
         registrar_csv(m, decisao_py, None, score_medio, "APROVADO" if aprovado else "REPROVADO", motivo_final)
         await enviar_auditoria(m, decisao_py.score, 0, score_medio, aprovado, motivo_final)
-        
         ultimas_leituras_por_jogo[chave] = {"metricas": m, "score": decisao_py.score, "recebido_em": time.time()}
-        
+
         if not aprovado:
-            log(f"⛔ BLOQUEADO | score={score_medio}% | corte={corte}% | {m.jogo}")
+            log(f"⛔ BLOQUEADO | {m.jogo} | {decisao_py.motivo}")
             return
-        
         if not pode_enviar(chave):
             log(f"⏳ COOLDOWN | {m.jogo}")
             return
-        
+
         mensagem = formatar_alerta_cliente(m, score_medio)
         canal = destino_principal(m, score_medio)
         await enfileirar_envio(canal, mensagem)
@@ -1680,7 +1707,7 @@ async def processar_alerta(alerta: Alerta) -> None:
         log(f"✅ ENVIADO | {m.estrategia} | score={score_medio}% | {m.ht_score_nivel} | {m.jogo}")
         return
 
-    # FT com IA
+    # FT: com IA
     decisao_ia_txt, confianca_ia, motivo_ia = await consultar_openai_ft(m, decisao_py.score)
     decisao_ia = calcular_protecao_ia_ft(m, decisao_py.score, decisao_ia_txt, confianca_ia)
 
@@ -1703,13 +1730,11 @@ async def processar_alerta(alerta: Alerta) -> None:
     motivo_final = "APROVADO" if aprovado else f"MÉDIA={score_medio}% < {corte}% OU trava_py={decisao_py.motivo}"
     registrar_csv(m, decisao_py, decisao_ia, score_medio, "APROVADO" if aprovado else "REPROVADO", motivo_final)
     await enviar_auditoria(m, decisao_py.score, decisao_ia.confianca_corrigida, score_medio, aprovado, motivo_final)
-
     ultimas_leituras_por_jogo[chave] = {"metricas": m, "score": decisao_py.score, "recebido_em": time.time()}
 
     if not aprovado:
-        log(f"⛔ BLOQUEADO | score_medio={score_medio}% | corte={corte}% | {m.jogo}")
+        log(f"⛔ BLOQUEADO | score_medio={score_medio}% < {corte}% | {m.jogo}")
         return
-
     if not pode_enviar(chave):
         log(f"⏳ COOLDOWN | {m.jogo}")
         return
@@ -1747,14 +1772,13 @@ async def receber_mensagem(event: events.NewMessage.Event) -> None:
         m = extrair_metricas(texto)
         chave = normalizar_chave_jogo(m.jogo)
         alerta = Alerta(texto=texto, metricas=m, chave_jogo=chave, recebido_em=time.time())
-
         log(f"📩 EVENTO | {m.estrategia} | {m.jogo} | {m.tempo}' | {m.placar}")
 
         async with lock_jogo(chave):
             pendentes_por_jogo.setdefault(chave, []).append({"alerta": alerta, "recebido_em": alerta.recebido_em})
             if chave not in tarefas_decisao or tarefas_decisao[chave].done():
                 tarefas_decisao[chave] = asyncio.create_task(janela_decisao(chave))
-                log(f"⏳ JANELA DECISÃO | {m.estrategia} | aguardando {JANELA_DECISAO_SEGUNDOS}s | {m.jogo}")
+                log(f"⏳ JANELA | {m.estrategia} | {JANELA_DECISAO_SEGUNDOS}s | {m.jogo}")
     except Exception as e:
         log(f"❌ Erro receber_mensagem: {type(e).__name__}: {e}")
         log(traceback.format_exc())
