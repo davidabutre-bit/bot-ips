@@ -55,7 +55,7 @@ except Exception:  # pragma: no cover
 # VERSÃO / CONFIGURAÇÃO BASE
 # =========================================================
 
-VERSAO_COUTIPS = "ALFA_COUTIPS_2026_05_31_V008_CONSOLIDADO_TRES_V7"
+VERSAO_COUTIPS = "ALFA_COUTIPS_2026_05_31_V009_SCORE_FREIO_CONTEXTUAL"
 
 load_dotenv()
 
@@ -132,6 +132,16 @@ HABILITAR_BLOQUEIO_BASE_SEM_MERCADO = os.getenv("HABILITAR_BLOQUEIO_BASE_SEM_MER
 HABILITAR_BLOQUEIO_PARSER_CRITICO = os.getenv("HABILITAR_BLOQUEIO_PARSER_CRITICO", "true").lower() == "true"
 HABILITAR_HT_PREMIUM_V2 = os.getenv("HABILITAR_HT_PREMIUM_V2", "true").lower() == "true"
 
+# V009 — freio de inflação do score.
+# Mantém o cérebro/fluxo do V8 e apenas impede que jogos medianos virem 90/96.
+HABILITAR_SCORE_V9 = os.getenv("HABILITAR_SCORE_V9", "true").lower() == "true"
+V9_CAP_JOGO_ABERTO = int(os.getenv("V9_CAP_JOGO_ABERTO", "90"))
+V9_CAP_APROVADO_COMUM = int(os.getenv("V9_CAP_APROVADO_COMUM", "88"))
+V9_CAP_LIGA_UNDER = int(os.getenv("V9_CAP_LIGA_UNDER", "86"))
+V9_CAP_LIGA_UNDER_FRACA = int(os.getenv("V9_CAP_LIGA_UNDER_FRACA", "82"))
+V9_CAP_FINALIZACAO_BAIXA = int(os.getenv("V9_CAP_FINALIZACAO_BAIXA", "86"))
+V9_CAP_PRESSAO_RECENTE_FRACA = int(os.getenv("V9_CAP_PRESSAO_RECENTE_FRACA", "86"))
+
 # Segurança do parser: abaixo disso o dado está provavelmente quebrado,
 # não apenas com rótulo errado. Rótulo errado corrigível segue normalmente.
 PARSER_CONFIANCA_CRITICA = int(os.getenv("PARSER_CONFIANCA_CRITICA", "2"))
@@ -181,6 +191,7 @@ def logar_versao_inicial() -> None:
     log(f"🛡️ Bloqueio base U18/U19/U20: {'ATIVO' if HABILITAR_BLOQUEIO_BASE_SEM_MERCADO else 'DESATIVADO'}")
     log(f"🛡️ Parser crítico: {'BLOQUEIA' if HABILITAR_BLOQUEIO_PARSER_CRITICO else 'SÓ OBSERVA'}")
     log(f"🛡️ HT Premium V2: {'ATIVO' if HABILITAR_HT_PREMIUM_V2 else 'DESATIVADO'}")
+    log(f"🧮 Score V9 anti-inflação: {'ATIVO' if HABILITAR_SCORE_V9 else 'DESATIVADO'}")
     log("🛡️ Teto Python 96 / IA 95")
     log(f"📊 Corte HT={CORTE_GOL_HT}% | Corte FT={CORTE_GOL_FT}%")
     log(f"📤 Canal gols: {TARGET_CHANNEL}")
@@ -1426,6 +1437,96 @@ def aplicar_travas_finais(m: Metricas, score: int) -> Tuple[int, str, bool]:
     return score, "SEM_TRAVA_FINAL", False
 
 
+def aplicar_teto_score_v9(m: Metricas, score: int, detalhes_funil: Optional[Dict[str, Any]] = None) -> Tuple[int, str]:
+    """V009 — freio contextual de inflação do score.
+
+    Esta camada NÃO muda parser, fluxo, confirmação, gol recente ou funil.
+    Ela só corrige a régua: jogos bons continuam podendo passar, mas nem todo
+    aprovado comum pode virar 90/96.
+
+    Filosofia:
+    - massacre real / super favorito em campo: pode manter 92–96;
+    - jogo aberto produtivo: teto moderado;
+    - liga UNDER + baixa produção: teto forte;
+    - pressão recente fraca/finalização baixa: teto preventivo.
+    """
+    if not HABILITAR_SCORE_V9:
+        return score, "SCORE_V9_DESATIVADO"
+    if eh_ht(m.estrategia):
+        # HT já passa pelo funil premium de massacre; não mexer aqui.
+        return score, "SCORE_V9_HT_PRESERVADO"
+
+    lado = m.lado_pressionante
+    if lado not in {"CASA", "FORA"}:
+        return min(score, 82), "SCORE_V9_SEM_LADO_TETO_82"
+
+    detalhes_funil = detalhes_funil or {}
+    cenario = str(detalhes_funil.get("cenario_ft", ""))
+    d = dados_lado(m, lado)
+    oposto = "FORA" if lado == "CASA" else "CASA"
+    od = dados_lado(m, oposto)
+    ip = ip_lado(m, lado)
+    ap_diff = d["ap"] - od["ap"]
+
+    # Massacre real: preserva elite. Exemplo: Kongsvinger.
+    massacre_extremo = (
+        d["ap"] >= 60
+        and ap_diff >= 30
+        and d["cantos"] >= 5
+        and (d["rb"] >= 2 or d["rl"] >= 7 or d["chance"] >= 12)
+        and (d["u10"] >= 7 or ip["pico"] >= 24 or ip["c18"] >= 2)
+    )
+    elite_contextual = (
+        m.lado_favorito == lado
+        and favorito_nao_vencendo(m)
+        and d["ap"] >= 45
+        and ap_diff >= 18
+        and (d["u10"] >= 6 or ip["pico"] >= 22)
+        and (d["rb"] >= 1 or d["rl"] >= 5 or d["chance"] >= 9 or d["xg"] >= 0.45)
+    )
+    if massacre_extremo:
+        return score, "SCORE_V9_LIBERADO_MASSACRE_EXTREMO"
+    if elite_contextual and score <= 94:
+        return score, "SCORE_V9_LIBERADO_ELITE_CONTEXTUAL"
+    if elite_contextual and score > 94:
+        return 94, "SCORE_V9_TETO_94_ELITE_CONTEXTUAL_NAO_EXTREMO"
+
+    cap = 96
+    motivos: List[str] = []
+
+    # Jogos abertos são bons, mas não devem morar na mesma prateleira do massacre.
+    if cenario == "CAOS_PRODUTIVO":
+        cap = min(cap, V9_CAP_JOGO_ABERTO)
+        motivos.append("JOGO_ABERTO_NAO_MASSACRE")
+
+    # Liga UNDER precisa provar mais; se vier com xG/chance baixa, teto forte.
+    if m.liga == "UNDER":
+        cap = min(cap, V9_CAP_LIGA_UNDER)
+        motivos.append("LIGA_UNDER")
+        if d["xg"] < 0.45 and d["chance"] < 8 and d["rb"] <= 1:
+            cap = min(cap, V9_CAP_LIGA_UNDER_FRACA)
+            motivos.append("UNDER_COM_PRODUCAO_BAIXA")
+
+    # Finalização baixa: evita MP/Fénix/Liniers virarem 90+ sem cara elite.
+    if d["rb"] <= 1 and d["chance"] < 8 and d["xg"] < 0.45:
+        cap = min(cap, V9_CAP_FINALIZACAO_BAIXA)
+        motivos.append("FINALIZACAO_BAIXA")
+
+    # Pressão recente fraca: domínio acumulado não basta no FT.
+    if d["u5"] <= 2 and d["u10"] <= 5 and not elite_contextual:
+        cap = min(cap, V9_CAP_PRESSAO_RECENTE_FRACA)
+        motivos.append("PRESSAO_RECENTE_FRACA")
+
+    # Aprovado comum: passou no funil, mas sem massacre nem elite contextual.
+    if not motivos and not massacre_extremo and not elite_contextual:
+        cap = min(cap, V9_CAP_APROVADO_COMUM)
+        motivos.append("APROVADO_COMUM_SEM_ELITE")
+
+    if score > cap:
+        return cap, "SCORE_V9_TETO_" + "+".join(motivos)
+    return score, "SCORE_V9_SEM_REDUCAO_" + ("+".join(motivos) if motivos else "FORTE")
+
+
 
 def finalização_minima_lado(m: Metricas, lado: str) -> bool:
     """Exige pelo menos um sinal de finalização real do lado pressionante.
@@ -1785,6 +1886,10 @@ def score_python_contextual(m: Metricas, chave: str) -> DecisaoPython:
 
     score, motivo_trava, bloqueado_trava = aplicar_travas_finais(m, score)
 
+    motivo_teto_v9 = "SCORE_V9_NAO_APLICADO"
+    if not bloqueado_trava:
+        score, motivo_teto_v9 = aplicar_teto_score_v9(m, score, detalhes_funil)
+
     corte = corte_por_estrategia(m.estrategia)
     aprovado = score >= corte and not bloqueado_trava
     status = "APROVADO" if aprovado else "REPROVADO"
@@ -1800,6 +1905,7 @@ def score_python_contextual(m: Metricas, chave: str) -> DecisaoPython:
         "funil": motivo_funil,
         "funil_detalhes": detalhes_funil,
         "trava": motivo_trava,
+        "teto_v9": motivo_teto_v9,
         "time_elite": elite_motivo,
         "cenario_ft": detalhes_funil.get("cenario_ft", "N/A"),
         "cenario_ft_motivo": detalhes_funil.get("cenario_ft_motivo", "N/A"),
@@ -2041,6 +2147,7 @@ CSV_FIELDS = [
     "valor_pos_evento_classe", "valor_pos_evento_motivo", "protecao_ia_ativa",
     "liga", "decisao_final", "motivo_bloqueio", "parser_confianca",
     "parser_observacoes", "fluxo_decisao", "fluxo_motivo",
+    "teto_v9",
     "resultado_manual", "cornerpro", "bet365",
 ]
 
@@ -2073,6 +2180,7 @@ def registrar_csv(m: Metricas, decisao_py: DecisaoPython, decisao_ia: DecisaoIA,
         "parser_observacoes": " | ".join(m.parser_observacoes),
         "fluxo_decisao": m.fluxo_decisao,
         "fluxo_motivo": m.fluxo_motivo,
+        "teto_v9": decisao_py.detalhes.get("teto_v9", ""),
         "resultado_manual": "",
         "cornerpro": m.cornerpro,
         "bet365": m.bet365,
