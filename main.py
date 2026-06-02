@@ -55,7 +55,7 @@ except Exception:  # pragma: no cover
 # VERSÃO / CONFIGURAÇÃO BASE
 # =========================================================
 
-VERSAO_COUTIPS = "ALFA_COUTIPS_2026_05_31_V009_SCORE_FREIO_CONTEXTUAL"
+VERSAO_COUTIPS = "ALFA_COUTIPS_2026_06_02_V10_FINAL_CONSOLIDADO"
 
 load_dotenv()
 
@@ -137,10 +137,14 @@ HABILITAR_HT_PREMIUM_V2 = os.getenv("HABILITAR_HT_PREMIUM_V2", "true").lower() =
 HABILITAR_SCORE_V9 = os.getenv("HABILITAR_SCORE_V9", "true").lower() == "true"
 V9_CAP_JOGO_ABERTO = int(os.getenv("V9_CAP_JOGO_ABERTO", "90"))
 V9_CAP_APROVADO_COMUM = int(os.getenv("V9_CAP_APROVADO_COMUM", "88"))
-V9_CAP_LIGA_UNDER = int(os.getenv("V9_CAP_LIGA_UNDER", "86"))
-V9_CAP_LIGA_UNDER_FRACA = int(os.getenv("V9_CAP_LIGA_UNDER_FRACA", "82"))
+V9_CAP_LIGA_UNDER = int(os.getenv("V9_CAP_LIGA_UNDER", "84"))
+V9_CAP_LIGA_UNDER_FRACA = int(os.getenv("V9_CAP_LIGA_UNDER_FRACA", "80"))
 V9_CAP_FINALIZACAO_BAIXA = int(os.getenv("V9_CAP_FINALIZACAO_BAIXA", "86"))
 V9_CAP_PRESSAO_RECENTE_FRACA = int(os.getenv("V9_CAP_PRESSAO_RECENTE_FRACA", "86"))
+
+# V010 — trava de prova extra para ligas UNDER/Sul-Americanas problemáticas.
+# Argentina excluída da régua rígida por comportamento melhor na auditoria.
+HABILITAR_UNDER_PROVA_EXTRA = os.getenv("HABILITAR_UNDER_PROVA_EXTRA", "true").lower() == "true"
 
 # Segurança do parser: abaixo disso o dado está provavelmente quebrado,
 # não apenas com rótulo errado. Rótulo errado corrigível segue normalmente.
@@ -185,13 +189,14 @@ def log(msg: str) -> None:
 def logar_versao_inicial() -> None:
     log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     log(f"🚀 VERSAO_COUTIPS_ATIVA = {VERSAO_COUTIPS}")
-    log("✅ GOAT V008 — consolidado dos três V7, sem mexer no score central")
+    log("✅ GOAT V10 FINAL CONSOLIDADO — gol premiado + prova extra UNDER")
     log("🛡️ Parser: minuto manda no período + observações internas")
     log(f"🛡️ Confirmação V2: {'ATIVA' if HABILITAR_CONFIRMACAO_V2 else 'DESATIVADA'}")
     log(f"🛡️ Bloqueio base U18/U19/U20: {'ATIVO' if HABILITAR_BLOQUEIO_BASE_SEM_MERCADO else 'DESATIVADO'}")
     log(f"🛡️ Parser crítico: {'BLOQUEIA' if HABILITAR_BLOQUEIO_PARSER_CRITICO else 'SÓ OBSERVA'}")
     log(f"🛡️ HT Premium V2: {'ATIVO' if HABILITAR_HT_PREMIUM_V2 else 'DESATIVADO'}")
     log(f"🧮 Score V9 anti-inflação: {'ATIVO' if HABILITAR_SCORE_V9 else 'DESATIVADO'}")
+    log(f"🛡️ UNDER prova extra: {'ATIVA' if HABILITAR_UNDER_PROVA_EXTRA else 'DESATIVADA'}")
     log("🛡️ Teto Python 96 / IA 95")
     log(f"📊 Corte HT={CORTE_GOL_HT}% | Corte FT={CORTE_GOL_FT}%")
     log(f"📤 Canal gols: {TARGET_CHANNEL}")
@@ -1289,6 +1294,11 @@ def avaliar_valor_pos_evento(m: Metricas) -> Tuple[str, str, int, bool]:
 
     # Gol do lado pressionante.
     if ultimo_lado == lado:
+        # V010 — quando o gol deixou o pressionante vencendo e o U5/RB/IP já
+        # caíram, força PRESSAO_PREMIADA_MORREU mesmo que U10 ainda esteja alto
+        # (U10 carrega pressão pré-gol por até 10 minutos — contaminação real).
+        if gol_recente_do_pressionante(m, janela=5) and ultimo_gol_deixou_lado_vencendo(m) and pressao_pos_gol_esfriou(m, lado):
+            return "PRESSAO_PREMIADA_MORREU", "GOL_PREMIOU_PRESSAO_U10_CONTAMINADO_U5_CAIU", -14, False
         if pressao_morta_lado(m, lado):
             return "PRESSAO_PREMIADA_MORREU", "GOL_PREMIOU_PRESSAO_E_RITMO_CAIU", -14, False
         if pressao_viva_lado(m, lado):
@@ -1298,7 +1308,36 @@ def avaliar_valor_pos_evento(m: Metricas) -> Tuple[str, str, int, bool]:
     return "SEM_VALOR_ESPECIAL", "GOL_RECENTE_SEM_LEITURA_ESPECIAL", 0, False
 
 
+def pressao_pos_gol_esfriou(m: "Metricas", lado: str) -> bool:
+    """V10 FINAL — detecta pressão que esfriou após gol premiado.
+
+    O objetivo é evitar que o U10, ainda contaminado pela pressão antes do gol,
+    faça o sistema tratar como viva uma pressão que morreu no pós-gol.
+
+    Critério conservador: só considera que esfriou quando U5, finalização, cantos
+    e IP do lado pressionante estão baixos ao mesmo tempo.
+    """
+    if lado not in {"CASA", "FORA"}:
+        return False
+    d = dados_lado(m, lado)
+    ip = ip_lado(m, lado)
+    return (
+        d.get("u5", 0) <= 1
+        and d.get("rb", 0) <= 0
+        and d.get("cantos", 0) == 0
+        and ip.get("pico", 0) < 10
+    )
+
+
 def pressao_extrema_lado(m: Metricas, lado: str) -> bool:
+    """Pressão extrema real, usada como exceção de elite no funil.
+
+    Esta função precisa existir no escopo global porque várias camadas do score
+    chamam pressao_extrema_lado(). Sem ela, o bot compila, mas quebra em runtime
+    quando chega um alerta que passa por esses caminhos.
+    """
+    if lado not in {"CASA", "FORA"}:
+        return False
     d = dados_lado(m, lado)
     ip = ip_lado(m, lado)
     return (
@@ -1675,6 +1714,59 @@ def classificar_cenario_ft(m: Metricas) -> CenarioFT:
     return CenarioFT("ALFA_REAL", False, 100, 99, "CENARIO_IDEAL_CONFIRMADO")
 
 
+def liga_under_exige_prova_extra(m: Metricas) -> bool:
+    """V010 — identifica ligas UNDER/Sul-Americanas que precisam de prova extra.
+
+    Argentina excluída: comportamento melhor na auditoria operacional.
+    México incluído mesmo não estando na lista UNDER formal — historicamente
+    problemático nas auditorias.
+    """
+    if not HABILITAR_UNDER_PROVA_EXTRA:
+        return False
+    texto = remover_acentos(f"{m.competicao} {m.jogo}").lower()
+    if "argentina" in texto:
+        return False
+    termos_rigidos = (
+        "venezuela", "chile", "peru", "colombia", "bolivia",
+        "paraguay", "paraguai", "mexico", "equador", "ecuador",
+        "uruguay", "uruguai",
+    )
+    return m.liga == "UNDER" or any(t in texto for t in termos_rigidos)
+
+
+def prova_extra_liga_under(m: Metricas, lado: str) -> Tuple[bool, str]:
+    """V010 — exige consequência real comprovada para ligas UNDER/rígidas.
+
+    Cinco caminhos aceitos (qualquer um basta):
+      1. RB forte + pressão recente viva
+      2. xG alto + chance alta
+      3. Pressão elite (U5/U10/IP) + consequência real
+      4. Área + chance (domínio de área comprovado)
+      5. Pressão extrema + xG + RB mínimo
+    """
+    if lado not in {"CASA", "FORA"}:
+        return False, "UNDER_SEM_LADO"
+    d = dados_lado(m, lado)
+    ip = ip_lado(m, lado)
+
+    if d["rb"] >= 2 and (d["u5"] >= 3 or d["u10"] >= 7):
+        return True, "UNDER_OK_RB_FORTE"
+    if d["xg"] >= 0.60 and d["chance"] >= 9:
+        return True, "UNDER_OK_XG_CHANCE"
+    if d["u5"] >= 4 and d["u10"] >= 8 and ip["pico"] >= 24 and consequencia_real_lado(m, lado):
+        return True, "UNDER_OK_PRESSAO_ELITE"
+    if d["rda"] >= 3 and d["chance"] >= 10:
+        return True, "UNDER_OK_AREA_CHANCE"
+    if pressao_extrema_lado(m, lado) and d["xg"] >= 0.45 and d["rb"] >= 1:
+        return True, "UNDER_OK_EXTREMO"
+
+    return False, (
+        f"UNDER_SEM_PROVA_EXTRA rb={d['rb']} rda={d['rda']} "
+        f"xg={d['xg']:.2f} chance={d['chance']} "
+        f"u5={d['u5']} u10={d['u10']} ip={ip['pico']}"
+    )
+
+
 # =========================================================
 # FUNIL OBRIGATÓRIO HÍBRIDO — GOAT V004 + V005 + V006
 # Unificação definitiva: melhor do V003 corrigido + melhor do V003 produção.
@@ -1713,6 +1805,16 @@ def funil_obrigatorio_hibrido(m: Metricas) -> Tuple[bool, int, str, Dict[str, An
         return False, 72, "FUNIL_SEM_LADO_PRESSIONANTE", detalhes
     if vermelho_contra_pressionante(m):
         return False, 74, "FUNIL_VERMELHO_CONTRA_PRESSIONANTE", detalhes
+
+    # ── V010 — Prova extra para ligas UNDER/rígidas ──────────────────────────
+    # Roda antes das avaliações base para bloquear cedo e registrar motivo claro.
+    # Argentina excluída. México e Sul-Americanas problemáticas incluídas.
+    if liga_under_exige_prova_extra(m):
+        under_ok, under_motivo = prova_extra_liga_under(m, lado)
+        detalhes["under_prova_extra"] = under_ok
+        detalhes["under_prova_extra_motivo"] = under_motivo
+        if not under_ok:
+            return False, 78, f"FUNIL_UNDER_SEM_PROVA_EXTRA | {under_motivo}", detalhes
 
     # ── Avaliações base ──────────────────────────────────────────────────────
     pressao      = pressao_viva_lado(m, lado)
@@ -2251,15 +2353,35 @@ async def enfileirar_envio(canal: str, mensagem: str, parse_mode: Optional[str] 
 def deve_aguardar_confirmacao_ft(m: Metricas) -> Tuple[bool, str]:
     """Regra do primeiro alerta FT.
 
-    Quando o pressionante/dominante marcou recentemente e aumentou vantagem,
-    não enviamos direto e não matamos. Aguardamos BOT_FT CONFIRMAÇÃO.
+    Quando o pressionante marcou recentemente e com esse gol ficou vencendo
+    (seja saindo de empate ou ampliando vantagem já existente), não enviamos
+    direto e não matamos. Aguardamos BOT_FT CONFIRMAÇÃO.
+
+    V010 — corrigido: antes usava gol_recente_pressionante_aumentou_vantagem(),
+    que só pegava ampliação de vantagem (1x0→2x0, 2x1→3x1) mas não pegava
+    o caso de empate→vitória (0x0→1x0, 1x1→2x1, 2x2→3x2).
+    Bug real: Cienciano x Sporting Cristal — gol no 69' fez 3x2, alerta no 73'
+    com pressão pré-gol ainda contaminando U10, score chegou a 90%.
+
+    Casos que DEVEM cair em espera (pressionante vencendo após o gol):
+      0x0 → 1x0 | 1x1 → 2x1 | 2x2 → 3x2 | 1x0 → 2x0 | 2x1 → 3x1
+
+    Casos que NÃO devem cair em espera (pressionante não vencendo):
+      0x1 → 1x1  (empatou — ainda tem jogo)
+      0x2 → 1x2  (reduziu — ainda perdendo)
+      gol da zebra / gol contra o pressionante
     """
     if not eh_ft(m.estrategia) or eh_confirmacao(m.estrategia):
         return False, "NAO_E_FT_GATILHO"
-    if not gol_recente_pressionante_aumentou_vantagem(m, janela=5):
-        return False, "SEM_GOL_RECENTE_PRESSIONANTE_AUMENTANDO_VANTAGEM"
+    if not (gol_recente_do_pressionante(m, janela=5) and ultimo_gol_deixou_lado_vencendo(m)):
+        return False, "SEM_GOL_RECENTE_PRESSIONANTE_DEIXANDO_VENCENDO"
+    if pressao_pos_gol_esfriou(m, m.lado_pressionante):
+        return True, (
+            f"GOL_RECENTE_PRESSIONANTE_DEIXOU_VENCENDO_E_PRESSAO_ESFRIOU | "
+            f"ultimo={m.ultimo_gol}' {m.ultimo_gol_lado} | placar={m.placar} | press={m.lado_pressionante}"
+        )
     return True, (
-        f"GOL_RECENTE_PRESSIONANTE_AUMENTOU_VANTAGEM | "
+        f"GOL_RECENTE_PRESSIONANTE_DEIXOU_VENCENDO | "
         f"ultimo={m.ultimo_gol}' {m.ultimo_gol_lado} | placar={m.placar} | press={m.lado_pressionante}"
     )
 
