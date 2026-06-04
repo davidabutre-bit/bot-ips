@@ -55,7 +55,7 @@ except Exception:  # pragma: no cover
 # VERSÃO / CONFIGURAÇÃO BASE
 # =========================================================
 
-VERSAO_COUTIPS = "ALFA_COUTIPS_2026_06_04_V12_FINAL_CORRECAO_OPERACIONAL"
+VERSAO_COUTIPS = "ALFA_COUTIPS_2026_06_04_V12_1_BUGFIX_HT_OVER05"
 
 load_dotenv()
 
@@ -2060,14 +2060,7 @@ def score_python_contextual(m: Metricas, chave: str) -> DecisaoPython:
         # redundância estatística. Calibração: corte HT ajustado para 86.
         if m.lado_pressionante in {"CASA", "FORA"} and pressao_extrema_lado(m, m.lado_pressionante):
             score_bruto += 4
-        if (
-            HABILITAR_V11_HT_CORRECOES
-            and m.previsao_over05_ht >= V11_HT_OVER05_BONUS_MIN
-            and m.lado_pressionante in {"CASA", "FORA"}
-            and pressao_viva_lado(m, m.lado_pressionante)
-            and consequencia_minima_emocional(m, m.lado_pressionante)
-        ):
-            score_bruto += V11_HT_OVER05_BONUS_SCORE
+        # HT-3 (bônus Over 0.5HT histórico) — reservado para versão futura com auditoria específica.
     else:
         # [V005] Aplica cap de bônus de favoritismo definido pelo cenário FT.
         cenario_ft = classificar_cenario_ft(m)
