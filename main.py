@@ -35,7 +35,7 @@ import time
 import traceback
 import unicodedata
 from dataclasses import dataclass, field, asdict
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -55,7 +55,7 @@ except Exception:  # pragma: no cover
 # VERSÃO / CONFIGURAÇÃO BASE
 # =========================================================
 
-VERSAO_COUTIPS = "ALFA_COUTIPS_2026_06_02_V10_FINAL_CONSOLIDADO"
+VERSAO_COUTIPS = "ALFA_COUTIPS_2026_06_04_V12_FINAL_CORRECAO_OPERACIONAL"
 
 load_dotenv()
 
@@ -146,6 +146,27 @@ V9_CAP_PRESSAO_RECENTE_FRACA = int(os.getenv("V9_CAP_PRESSAO_RECENTE_FRACA", "86
 # Argentina excluída da régua rígida por comportamento melhor na auditoria.
 HABILITAR_UNDER_PROVA_EXTRA = os.getenv("HABILITAR_UNDER_PROVA_EXTRA", "true").lower() == "true"
 
+# V012 — camadas cirúrgicas: grupo grátis, ALAVANCAGEM, Austrália especial e HT-2.
+# Mantém score, funil, IA e parser centrais preservados.
+HABILITAR_V11_GRUPO_GRATUITO = os.getenv("HABILITAR_V11_GRUPO_GRATUITO", "true").lower() == "true"
+HABILITAR_V11_ALAVANCAGEM = os.getenv("HABILITAR_V11_ALAVANCAGEM", "true").lower() == "true"
+HABILITAR_V11_AUSTRALIA = os.getenv("HABILITAR_V11_AUSTRALIA", "true").lower() == "true"
+HABILITAR_V11_HT_CORRECOES = os.getenv("HABILITAR_V11_HT_CORRECOES", "true").lower() == "true"
+
+# Canal completo = recebe todos os aprovados. Por padrão reaproveita o antigo canal de confirmação.
+COMPLETE_CHANNEL = os.getenv("COMPLETE_CHANNEL") or CONFIRMATION_CHANNEL
+FREE_CHANNEL = os.getenv("FREE_CHANNEL") or TARGET_CHANNEL
+
+# Janelas do grupo grátis.
+V11_FREE_J1_LIMITE = int(os.getenv("V11_FREE_J1_LIMITE", "3"))   # 06:30–12:00
+V11_FREE_J2_LIMITE = int(os.getenv("V11_FREE_J2_LIMITE", "4"))   # 12:00–18:00
+V11_FREE_J3_LIMITE = int(os.getenv("V11_FREE_J3_LIMITE", "4"))   # 18:00–23:00
+V11_FREE_GOL_VANTAGEM_MIN = int(os.getenv("V11_FREE_GOL_VANTAGEM_MIN", "10"))
+V11_FREE_COOLDOWN_JOGO_HORAS = int(os.getenv("V11_FREE_COOLDOWN_JOGO_HORAS", "24"))
+V11_TZ_OFFSET_HORAS = int(os.getenv("V11_TZ_OFFSET_HORAS", "-4"))
+
+# V12: HT-2 corrigido. HT-1/HT-3 ficam fora desta versão operacional.
+
 # Segurança do parser: abaixo disso o dado está provavelmente quebrado,
 # não apenas com rótulo errado. Rótulo errado corrigível segue normalmente.
 PARSER_CONFIANCA_CRITICA = int(os.getenv("PARSER_CONFIANCA_CRITICA", "2"))
@@ -171,6 +192,11 @@ locks_por_jogo: Dict[str, asyncio.Lock] = {}
 pendentes_confirmacao_ft: Dict[str, Dict[str, Any]] = {}
 tarefas_timeout_confirmacao_ft: Dict[str, asyncio.Task] = {}
 
+# V011 — estado do grupo grátis.
+# Contadores por janela não acumulam e reiniciam automaticamente pela data/janela.
+v11_gratis_contadores: Dict[str, int] = {}
+v11_gratis_enviados_por_jogo: Dict[str, float] = {}
+
 
 # =========================================================
 # LOG / UTILITÁRIOS
@@ -189,7 +215,7 @@ def log(msg: str) -> None:
 def logar_versao_inicial() -> None:
     log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     log(f"🚀 VERSAO_COUTIPS_ATIVA = {VERSAO_COUTIPS}")
-    log("✅ GOAT V10 FINAL CONSOLIDADO — gol premiado + prova extra UNDER")
+    log("✅ GOAT V12 FINAL — correção HT-2 + grupo grátis + ALAVANCAGEM + Austrália")
     log("🛡️ Parser: minuto manda no período + observações internas")
     log(f"🛡️ Confirmação V2: {'ATIVA' if HABILITAR_CONFIRMACAO_V2 else 'DESATIVADA'}")
     log(f"🛡️ Bloqueio base U18/U19/U20: {'ATIVO' if HABILITAR_BLOQUEIO_BASE_SEM_MERCADO else 'DESATIVADO'}")
@@ -199,8 +225,12 @@ def logar_versao_inicial() -> None:
     log(f"🛡️ UNDER prova extra: {'ATIVA' if HABILITAR_UNDER_PROVA_EXTRA else 'DESATIVADA'}")
     log("🛡️ Teto Python 96 / IA 95")
     log(f"📊 Corte HT={CORTE_GOL_HT}% | Corte FT={CORTE_GOL_FT}%")
-    log(f"📤 Canal gols: {TARGET_CHANNEL}")
-    log(f"🧪 Canal confirmação: {CONFIRMATION_CHANNEL}")
+    log(f"📤 Canal grátis: {FREE_CHANNEL}")
+    log(f"🧪 Canal completo: {COMPLETE_CHANNEL}")
+    log(f"🆓 V12 grupo grátis: {'ATIVO' if HABILITAR_V11_GRUPO_GRATUITO else 'DESATIVADO'} | limites={V11_FREE_J1_LIMITE}/{V11_FREE_J2_LIMITE}/{V11_FREE_J3_LIMITE}")
+    log(f"🔺 V12 ALAVANCAGEM: {'ATIVA' if HABILITAR_V11_ALAVANCAGEM else 'DESATIVADA'}")
+    log(f"🇦🇺 V12 Austrália especial: {'ATIVA' if HABILITAR_V11_AUSTRALIA else 'DESATIVADA'}")
+    log(f"🧰 V12 HT-2 ap_diff por lado avaliado: {'ATIVO' if HABILITAR_V11_HT_CORRECOES else 'DESATIVADO'}")
     log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
 
@@ -308,6 +338,12 @@ def limpar_memoria_interna() -> None:
             tarefas_decisao.pop(k, None)
             locks_por_jogo.pop(k, None)
 
+    # V011 — limpeza do cooldown do grupo grátis.
+    for k in list(v11_gratis_enviados_por_jogo.keys()):
+        ts = float(v11_gratis_enviados_por_jogo.get(k, 0) or 0)
+        if agora - ts > V11_FREE_COOLDOWN_JOGO_HORAS * 3600:
+            v11_gratis_enviados_por_jogo.pop(k, None)
+
     # Pendências FT precisam durar mais que a janela curta, pois aguardam confirmação até ~81/82.
     for k in list(pendentes_confirmacao_ft.keys()):
         item = pendentes_confirmacao_ft.get(k, {})
@@ -371,6 +407,16 @@ class Metricas:
     parser_observacoes: List[str] = field(default_factory=list)
     fluxo_decisao: str = "NORMAL"
     fluxo_motivo: str = ""
+
+    # V011 — campos auxiliares para logs/CSV/roteamento.
+    previsao_over05_ht: float = 0.0
+    grupo_gratuito: str = "NAO"
+    motivo_grupo_gratuito: str = ""
+    alavancagem: str = "NAO"
+    motivo_alavancagem: str = ""
+    australia_leitura: str = ""
+    motivo_australia: str = ""
+    destino_final: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -606,7 +652,7 @@ def massacre_contextual_ht(m: "Metricas", lado: str, pos_gol_recente: bool = Fal
     od = dados_lado(m, op)
     ip = ip_lado(m, lado)
 
-    ap_diff = d["ap"] - od["ap"]
+    ap_diff = ap_diff_lado(m, lado)
     finalizacao = d["rb"] >= 1 or (d["rb"] + d["rl"]) >= 4 or d["chance"] >= 8 or d["xg"] >= 0.25
     territorio = d["u5"] >= 5 and d["u10"] >= 10 and ap_diff >= 15
     pressao_ip = ip["pico"] >= 22 or ip["c18"] >= 2 or ip["c22"] >= 1
@@ -884,6 +930,7 @@ def extrair_metricas(texto: str) -> Metricas:
         xgl=xgl,
         xgi=xgi,
         avgxg=pegar_float_par(r"avgXGaFavor:Casa=([0-9.,]+)\s*/\s*Fora=([0-9.,]+)", tl),
+        previsao_over05_ht=pegar_float(r"Previsao\s+Over\s+0\.5HT\s+golos\s*%:\s*([0-9.,]+)", remover_acentos(tl), 0.0),
         pressao_alfa=extrair_pressao_alfa(tl),
         bet365=bet365,
         cornerpro=corner,
@@ -1042,6 +1089,45 @@ def lado_perdendo(m: Metricas) -> str:
     return "EMPATE"
 
 
+def lado_oposto(lado: str) -> str:
+    if lado == "CASA":
+        return "FORA"
+    if lado == "FORA":
+        return "CASA"
+    return "DESCONHECIDO"
+
+
+def diferenca_placar(m: Metricas) -> int:
+    gc, gf = extrair_gols_placar(m.placar)
+    if gc is None or gf is None:
+        return 0
+    return abs(gc - gf)
+
+
+def total_gols_placar(m: Metricas) -> int:
+    gc, gf = extrair_gols_placar(m.placar)
+    if gc is None or gf is None:
+        return 0
+    return gc + gf
+
+
+def minutos_desde_ultimo_gol(m: Metricas) -> int:
+    if not m.ultimo_gol:
+        return 999
+    return int(m.tempo or 0) - int(m.ultimo_gol or 0)
+
+
+def ap_diff_lado(m: Metricas, lado: str) -> float:
+    """Diferença de AP pela ótica do lado analisado.
+
+    Evita o erro de interpretar AP casa-fora como negativo quando o favorito/
+    pressionante joga fora e domina o jogo.
+    """
+    if lado not in {"CASA", "FORA"}:
+        return 0.0
+    return valor_lado(m, "ataques_perigosos", lado) - valor_lado(m, "ataques_perigosos", lado_oposto(lado))
+
+
 def dados_lado(m: Metricas, lado: str) -> Dict[str, float]:
     return {
         "ap": valor_lado(m, "ataques_perigosos", lado),
@@ -1160,10 +1246,26 @@ def pressao_morta_lado(m: Metricas, lado: str) -> bool:
     return d["u5"] <= 1 and d["u10"] <= 3 and ip["pico"] < 18 and ip["c18"] == 0
 
 
+def xg_baixo_compensado_por_rb(m: Metricas, lado: str) -> bool:
+    """HT-1 fica fora do V12 definitivo.
+
+    Mantemos a função apenas para compatibilidade interna, mas ela não altera
+    nenhuma decisão nesta versão. O único ajuste HT ativo é o HT-2:
+    ap_diff pela ótica do lado avaliado.
+    """
+    return False
+
+
 def consequencia_real_lado(m: Metricas, lado: str) -> bool:
     d = dados_lado(m, lado)
     if eh_ht(m.estrategia):
-        return d["rb"] >= 1 or d["rb"] + d["rl"] >= 3 or d["cantos"] >= 1 or d["chance"] >= 6 or d["xg"] >= 0.20
+        return (
+            d["rb"] >= 1
+            or d["rb"] + d["rl"] >= 3
+            or d["cantos"] >= 1
+            or d["chance"] >= 6
+            or d["xg"] >= 0.20
+        )
     return d["rb"] >= 1 or d["rb"] + d["rl"] >= 4 or d["cantos"] >= 2 or d["chance"] >= 8 or d["xg"] >= 0.28
 
 
@@ -1505,7 +1607,7 @@ def aplicar_teto_score_v9(m: Metricas, score: int, detalhes_funil: Optional[Dict
     oposto = "FORA" if lado == "CASA" else "CASA"
     od = dados_lado(m, oposto)
     ip = ip_lado(m, lado)
-    ap_diff = d["ap"] - od["ap"]
+    ap_diff = ap_diff_lado(m, lado)
 
     # Massacre real: preserva elite. Exemplo: Kongsvinger.
     massacre_extremo = (
@@ -1958,6 +2060,14 @@ def score_python_contextual(m: Metricas, chave: str) -> DecisaoPython:
         # redundância estatística. Calibração: corte HT ajustado para 86.
         if m.lado_pressionante in {"CASA", "FORA"} and pressao_extrema_lado(m, m.lado_pressionante):
             score_bruto += 4
+        if (
+            HABILITAR_V11_HT_CORRECOES
+            and m.previsao_over05_ht >= V11_HT_OVER05_BONUS_MIN
+            and m.lado_pressionante in {"CASA", "FORA"}
+            and pressao_viva_lado(m, m.lado_pressionante)
+            and consequencia_minima_emocional(m, m.lado_pressionante)
+        ):
+            score_bruto += V11_HT_OVER05_BONUS_SCORE
     else:
         # [V005] Aplica cap de bônus de favoritismo definido pelo cenário FT.
         cenario_ft = classificar_cenario_ft(m)
@@ -2191,7 +2301,7 @@ def titulo_periodo(estrategia: str, tempo: int = 0) -> str:
     return f"ALFA - AO VIVO | {periodo}"
 
 
-def formatar_alerta_cliente(m: Metricas, score: int) -> str:
+def formatar_alerta_cliente(m: Metricas, score: int, alavancagem: bool = False) -> str:
     link = m.bet365 or ""
     linhas = [
         f"{emoji_score(score)} {titulo_periodo(m.estrategia, m.tempo)}",
@@ -2207,7 +2317,230 @@ def formatar_alerta_cliente(m: Metricas, score: int) -> str:
     ]
     if link:
         linhas.append(f"🔗 {link}")
-    return "\n".join(linhas)
+    msg = "\n".join(linhas)
+    if alavancagem:
+        return "🔺 ALAVANCAGEM 🔺\n\n" + msg
+    return msg
+
+
+def agora_operacional_v11() -> datetime:
+    return datetime.now(timezone.utc) + timedelta(hours=V11_TZ_OFFSET_HORAS)
+
+
+def janela_grupo_gratis_v11(dt: Optional[datetime] = None) -> Tuple[Optional[str], int]:
+    """Retorna janela e limite do grupo grátis.
+
+    J1: 06:30–12:00 | J2: 12:00–18:00 | J3: 18:00–23:00.
+    Fora disso retorna (None, 0).
+    """
+    dt = dt or agora_operacional_v11()
+    minutos = dt.hour * 60 + dt.minute
+    if 6 * 60 + 30 <= minutos < 12 * 60:
+        return "J1", V11_FREE_J1_LIMITE
+    if 12 * 60 <= minutos < 18 * 60:
+        return "J2", V11_FREE_J2_LIMITE
+    if 18 * 60 <= minutos < 23 * 60:
+        return "J3", V11_FREE_J3_LIMITE
+    return None, 0
+
+
+def chave_contador_gratis_v11(janela: str, dt: Optional[datetime] = None) -> str:
+    dt = dt or agora_operacional_v11()
+    return f"{dt.strftime('%Y-%m-%d')}:{janela}"
+
+
+def grupo_gratis_tem_vaga_v11() -> Tuple[bool, str]:
+    janela, limite = janela_grupo_gratis_v11()
+    if not janela:
+        return False, "FORA_DAS_JANELAS"
+    chave_janela = chave_contador_gratis_v11(janela)
+    usados = int(v11_gratis_contadores.get(chave_janela, 0))
+    if usados >= limite:
+        return False, f"SEM_VAGA_{janela}_{usados}/{limite}"
+    return True, f"COM_VAGA_{janela}_{usados}/{limite}"
+
+
+def marcar_envio_gratis_v11(chave_jogo: str) -> None:
+    janela, limite = janela_grupo_gratis_v11()
+    if not janela:
+        return
+    chave_janela = chave_contador_gratis_v11(janela)
+    v11_gratis_contadores[chave_janela] = int(v11_gratis_contadores.get(chave_janela, 0)) + 1
+    v11_gratis_enviados_por_jogo[chave_jogo] = time.time()
+
+
+def jogo_em_cooldown_gratis_v11(chave_jogo: str) -> bool:
+    ts = float(v11_gratis_enviados_por_jogo.get(chave_jogo, 0) or 0)
+    return ts > 0 and time.time() - ts < V11_FREE_COOLDOWN_JOGO_HORAS * 3600
+
+
+def favorito_vencendo_por_um_com_gol_antigo_v11(m: Metricas) -> Tuple[bool, str]:
+    fav = m.lado_favorito
+    if fav not in {"CASA", "FORA"}:
+        return False, "SEM_FAVORITO"
+    if lado_vencendo(m) != fav:
+        return False, "FAVORITO_NAO_VENCE"
+    if diferenca_placar(m) != 1:
+        return False, "FAVORITO_NAO_VENCE_POR_1"
+    if m.ultimo_gol and m.ultimo_gol_lado == fav and minutos_desde_ultimo_gol(m) < V11_FREE_GOL_VANTAGEM_MIN:
+        return False, f"GOL_VANTAGEM_RECENTE_{minutos_desde_ultimo_gol(m)}MIN"
+    return True, "FAVORITO_VENCE_1_GOL_ANTIGO"
+
+
+def apto_contexto_grupo_gratuito_v11(m: Metricas) -> Tuple[bool, str]:
+    if not HABILITAR_V11_GRUPO_GRATUITO:
+        return False, "V11_GRUPO_GRATUITO_DESATIVADO"
+    if eh_confirmacao(m.estrategia):
+        return False, "CONF_FORA_DO_GRATIS"
+    fav = m.lado_favorito
+    if fav not in {"CASA", "FORA"}:
+        return False, "SEM_FAVORITO"
+    vencedor = lado_vencendo(m)
+    if vencedor != fav and vencedor != "EMPATE":
+        return True, "CENARIO_A_FAVORITO_PERDENDO"
+    if vencedor == "EMPATE":
+        return True, "CENARIO_B_FAVORITO_EMPATANDO"
+    ok_c, motivo_c = favorito_vencendo_por_um_com_gol_antigo_v11(m)
+    if ok_c:
+        return True, "CENARIO_C_" + motivo_c
+    return False, motivo_c
+
+
+def liga_australiana_v11(m: Metricas) -> bool:
+    texto = remover_acentos(f"{m.competicao} {m.jogo}").lower()
+    return "australia" in texto
+
+
+def leitura_australia_v11(m: Metricas) -> Tuple[str, str]:
+    """Leitura especial de ligas australianas/abertas.
+
+    Não bloqueia o canal completo. Apenas informa cautela para grupo grátis e
+    ALAVANCAGEM quando placar elástico + gol recente indicam pressão premiada.
+    """
+    if not HABILITAR_V11_AUSTRALIA or not liga_australiana_v11(m):
+        return "NAO_APLICA", "NAO_AUSTRALIA_OU_FLAG_OFF"
+
+    dif = diferenca_placar(m)
+    total = total_gols_placar(m)
+    delta_gol = minutos_desde_ultimo_gol(m)
+    lado = m.lado_pressionante
+    if lado not in {"CASA", "FORA"}:
+        return "CAUTELA", "AUSTRALIA_SEM_LADO_PRESSIONANTE"
+
+    d = dados_lado(m, lado)
+    ip = ip_lado(m, lado)
+    continuidade_forte = (
+        d["u5"] >= 4
+        or d["u10"] >= 8
+        or ip["pico"] >= 20
+        or ip["c18"] >= 2
+        or d["rb"] >= 2
+        or d["chance"] >= 9
+    )
+    continuidade_absurda = (
+        d["u5"] >= 5
+        and (ip["pico"] >= 24 or d["u10"] >= 10)
+        and (d["rb"] >= 2 or d["chance"] >= 10 or d["cantos"] >= 2)
+    )
+
+    if dif >= 2 and delta_gol <= 5:
+        if continuidade_absurda:
+            return "CAUTELA", f"DIF={dif}_GOL_RECENTE_{delta_gol}MIN_MAS_CONTINUIDADE_ABSURDA"
+        return "CAUTELA", f"DIF={dif}_GOL_RECENTE_{delta_gol}MIN_PRESSAO_PREMIADA"
+    if dif >= 2 and 6 <= delta_gol <= 20 and continuidade_forte:
+        return "OK", f"DIF={dif}_GOL_{delta_gol}MIN_JANELA_FORTE_CONTINUIDADE"
+    if dif >= 6 and not continuidade_absurda:
+        return "CAUTELA", f"DIF={dif}_CAUTELA_MAXIMA_SEM_CONTINUIDADE_ABSURDA"
+    if dif >= 4 and not continuidade_forte:
+        return "CAUTELA", f"DIF={dif}_SEM_PROVA_EXTRA_CONTINUIDADE"
+    if total >= 4 and continuidade_forte:
+        return "OK", f"PLACAR_ABERTO_TOTAL={total}_COM_CONTINUIDADE"
+    return "OK", f"AUSTRALIA_SEM_RISCO_ESPECIAL_DIF={dif}_GOLDELTA={delta_gol}"
+
+
+def liga_cautela_forte_v11(m: Metricas) -> bool:
+    texto = remover_acentos(f"{m.competicao} {m.jogo}").lower()
+    termos = (
+        "brazil serie d", "brasil serie d", "brasileiro serie d",
+        "bolivia liga de futbol prof", "ecuador liga pro",
+        "south america copa sudamericana", "peru segunda division",
+        "slovakia 3. liga",
+    )
+    return any(t in texto for t in termos)
+
+
+def tres_pilares_estilo_v11(m: Metricas, lado: str) -> Tuple[bool, str]:
+    """Referência dos antigos três pilares; usado para ALAVANCAGEM, não para aprovar."""
+    if lado not in {"CASA", "FORA"}:
+        return False, "SEM_LADO"
+    d = dados_lado(m, lado)
+    p1 = bool(m.odd_favorito and m.odd_favorito <= 1.55)
+    p2 = bool(d["rb"] >= 2 or d["chance"] >= 9)
+    p3 = bool(d["u5"] >= 4 and d["u10"] >= 8)
+    ok = p1 and p2 and p3
+    return ok, f"p1_odd={p1}|p2_rb_chance={p2}|p3_u5u10={p3}"
+
+
+def selo_alavancagem_v11(m: Metricas, score: int) -> Tuple[bool, str]:
+    """ALAVANCAGEM é classificação contextual rara, não aprovação."""
+    if not HABILITAR_V11_ALAVANCAGEM:
+        return False, "V11_ALAVANCAGEM_DESATIVADA"
+    if eh_confirmacao(m.estrategia):
+        return False, "CONF_NAO_RECEBE_ALAVANCAGEM"
+    lado = m.lado_pressionante
+    fav = m.lado_favorito
+    if lado not in {"CASA", "FORA"} or fav not in {"CASA", "FORA"}:
+        return False, "SEM_LADO_OU_FAVORITO"
+    if fav != lado:
+        return False, "FAVORITO_NAO_E_PRESSIONANTE"
+    if not favorito_nao_vencendo(m):
+        return False, "FAVORITO_JA_VENCE"
+    if liga_cautela_forte_v11(m):
+        return False, "LIGA_CAUTELA_FORTE"
+
+    leitura_aus, motivo_aus = leitura_australia_v11(m)
+    if leitura_aus == "CAUTELA":
+        return False, "AUSTRALIA_CAUTELA_" + motivo_aus
+
+    d = dados_lado(m, lado)
+    ip = ip_lado(m, lado)
+    pilares_ok, pilares_motivo = tres_pilares_estilo_v11(m, lado)
+
+    if eh_ht(m.estrategia):
+        massacre_ok, massacre_motivo = massacre_contextual_ht(m, lado, pos_gol_recente=False)
+        if massacre_ok and (pilares_ok or d["rb"] >= 3 or ip["pico"] >= 26):
+            return True, "HT_MASSACRE_ALFA|" + massacre_motivo + "|" + pilares_motivo
+        return False, "HT_SEM_MASSACRE_ALFA|" + massacre_motivo + "|" + pilares_motivo
+
+    pressao_extrema = pressao_extrema_lado(m, lado) or (d["u5"] >= 5 and d["u10"] >= 10 and ip["pico"] >= 22)
+    dominio_convertivel = d["rb"] >= 2 or d["chance"] >= 10 or d["xg"] >= 0.50
+    score_ok = score >= 86
+
+    if score_ok and pressao_extrema and dominio_convertivel and pilares_ok:
+        return True, f"FT_ALFA_FAVORITO_NAO_VENCE_PRESSAO_EXTREMA|{pilares_motivo}|score={score}"
+    return False, (
+        f"SEM_ALFA score_ok={score_ok}|pressao_extrema={pressao_extrema}|"
+        f"dominio_convertivel={dominio_convertivel}|{pilares_motivo}|score={score}"
+    )
+
+
+def elegivel_grupo_gratuito_v11(m: Metricas, chave_jogo: str) -> Tuple[bool, str]:
+    ok_ctx, motivo_ctx = apto_contexto_grupo_gratuito_v11(m)
+    if not ok_ctx:
+        return False, motivo_ctx
+    if jogo_em_cooldown_gratis_v11(chave_jogo):
+        return False, "COOLDOWN_JOGO_GRATIS"
+    leitura_aus, motivo_aus = leitura_australia_v11(m)
+    m.australia_leitura = leitura_aus
+    m.motivo_australia = motivo_aus
+    if leitura_aus == "CAUTELA":
+        return False, "AUSTRALIA_CAUTELA_" + motivo_aus
+    if liga_cautela_forte_v11(m):
+        return False, "LIGA_CAUTELA_FORTE_GRATIS"
+    vaga, motivo_vaga = grupo_gratis_tem_vaga_v11()
+    if not vaga:
+        return False, motivo_vaga
+    return True, motivo_ctx + "|" + motivo_vaga
 
 
 def canal_auditoria(m: Metricas, aprovado: bool) -> str:
@@ -2250,6 +2583,11 @@ CSV_FIELDS = [
     "liga", "decisao_final", "motivo_bloqueio", "parser_confianca",
     "parser_observacoes", "fluxo_decisao", "fluxo_motivo",
     "teto_v9",
+    "grupo_gratuito", "motivo_grupo_gratuito",
+    "alavancagem", "motivo_alavancagem",
+    "australia_leitura", "motivo_australia",
+    "destino_final", "modo_teste",
+    "previsao_over05_ht",
     "resultado_manual", "cornerpro", "bet365",
 ]
 
@@ -2283,6 +2621,15 @@ def registrar_csv(m: Metricas, decisao_py: DecisaoPython, decisao_ia: DecisaoIA,
         "fluxo_decisao": m.fluxo_decisao,
         "fluxo_motivo": m.fluxo_motivo,
         "teto_v9": decisao_py.detalhes.get("teto_v9", ""),
+        "grupo_gratuito": m.grupo_gratuito,
+        "motivo_grupo_gratuito": m.motivo_grupo_gratuito,
+        "alavancagem": m.alavancagem,
+        "motivo_alavancagem": m.motivo_alavancagem,
+        "australia_leitura": m.australia_leitura,
+        "motivo_australia": m.motivo_australia,
+        "destino_final": m.destino_final,
+        "modo_teste": str(MODO_TESTE),
+        "previsao_over05_ht": m.previsao_over05_ht,
         "resultado_manual": "",
         "cornerpro": m.cornerpro,
         "bet365": m.bet365,
@@ -2530,12 +2877,12 @@ def marcar_enviado(chave: str, m: Metricas, score: int) -> None:
 
 
 def destino_principal(m: Metricas, score_medio: int) -> str:
-    if MODO_TESTE:
-        return CONFIRMATION_CHANNEL
-    if eh_confirmacao(m.estrategia):
-        # confirmação forte 92+ pode ir no principal; abaixo fica no canal técnico.
-        return TARGET_CHANNEL if score_medio >= 92 else CONFIRMATION_CHANNEL
-    return TARGET_CHANNEL
+    """Compatibilidade legada.
+
+    No V11 o canal completo recebe tudo aprovado. O grupo grátis é um envio
+    adicional, controlado por elegivel_grupo_gratuito_v11().
+    """
+    return COMPLETE_CHANNEL
 
 
 async def registrar_bloqueio_fluxo(m: Metricas, motivo: str, decisao: str = "REPROVADO", score: int = 0) -> None:
@@ -2662,6 +3009,26 @@ async def processar_alerta(alerta: Alerta) -> None:
     if eh_confirmacao(m.estrategia) and score_medio >= 92:
         aprovado = True
 
+    # Pré-calcula campos V11 para CSV antes do registro.
+    if aprovado:
+        alavanca_pre, alavanca_motivo_pre = selo_alavancagem_v11(m, score_medio)
+        m.alavancagem = "SIM" if alavanca_pre else "NAO"
+        m.motivo_alavancagem = alavanca_motivo_pre
+        if MODO_TESTE:
+            m.grupo_gratuito = "NAO"
+            m.motivo_grupo_gratuito = "MODO_TESTE_ATIVO"
+            m.destino_final = COMPLETE_CHANNEL
+        else:
+            gratis_pre, gratis_motivo_pre = elegivel_grupo_gratuito_v11(m, chave)
+            m.grupo_gratuito = "SIM" if gratis_pre else "NAO"
+            m.motivo_grupo_gratuito = gratis_motivo_pre
+            destinos_pre = [COMPLETE_CHANNEL]
+            if gratis_pre:
+                destinos_pre.append(FREE_CHANNEL)
+            m.destino_final = ",".join(destinos_pre)
+    else:
+        m.destino_final = "NAO_ENVIADO"
+
     motivo_final = "APROVADO" if aprovado else f"MÉDIA={score_medio}% < {corte}% OU trava_py={decisao_py.motivo}"
     registrar_csv(m, decisao_py, decisao_ia, score_medio, "APROVADO" if aprovado else "REPROVADO", motivo_final)
     await enviar_auditoria(m, decisao_py.score, decisao_ia.confianca_corrigida, score_medio, aprovado, motivo_final)
@@ -2676,11 +3043,39 @@ async def processar_alerta(alerta: Alerta) -> None:
         log(f"⏳ COOLDOWN | {m.jogo}")
         return
 
-    mensagem = formatar_alerta_cliente(m, score_medio)
-    canal = destino_principal(m, score_medio)
-    await enfileirar_envio(canal, mensagem)
+    # V011 — canal completo recebe tudo que foi aprovado.
+    alavanca_ok, alavanca_motivo = selo_alavancagem_v11(m, score_medio)
+    m.alavancagem = "SIM" if alavanca_ok else "NAO"
+    m.motivo_alavancagem = alavanca_motivo
+
+    mensagem_completa = formatar_alerta_cliente(m, score_medio, alavancagem=alavanca_ok)
+    canal_completo = destino_principal(m, score_medio)
+    await enfileirar_envio(canal_completo, mensagem_completa)
+    destinos = [canal_completo]
+
+    # V011 — grupo grátis é vitrine: limitado, sem selo, sem confirmações.
+    if MODO_TESTE:
+        m.grupo_gratuito = "NAO"
+        m.motivo_grupo_gratuito = "MODO_TESTE_ATIVO"
+    else:
+        gratis_ok, gratis_motivo = elegivel_grupo_gratuito_v11(m, chave)
+        m.motivo_grupo_gratuito = gratis_motivo
+        if gratis_ok:
+            mensagem_gratis = formatar_alerta_cliente(m, score_medio, alavancagem=False)
+            await enfileirar_envio(FREE_CHANNEL, mensagem_gratis)
+            marcar_envio_gratis_v11(chave)
+            m.grupo_gratuito = "SIM"
+            destinos.append(FREE_CHANNEL)
+        else:
+            m.grupo_gratuito = "NAO"
+
+    m.destino_final = ",".join(destinos)
     marcar_enviado(chave, m, score_medio)
-    log(f"✅ ENVIADO/ENFILEIRADO | {m.estrategia} | score={score_medio}% | canal={canal} | {m.jogo}")
+    log(
+        f"✅ ENVIADO/ENFILEIRADO V11 | {m.estrategia} | score={score_medio}% | "
+        f"destinos={m.destino_final} | gratis={m.grupo_gratuito}:{m.motivo_grupo_gratuito} | "
+        f"alfa={m.alavancagem}:{m.motivo_alavancagem} | {m.jogo}"
+    )
 
 async def janela_decisao(chave: str) -> None:
     await asyncio.sleep(JANELA_DECISAO_SEGUNDOS)
@@ -2730,9 +3125,15 @@ async def watchdog() -> None:
     while True:
         try:
             limpar_memoria_interna()
+            j1 = chave_contador_gratis_v11("J1")
+            j2 = chave_contador_gratis_v11("J2")
+            j3 = chave_contador_gratis_v11("J3")
             log(
                 f"🐕 WATCHDOG OK | fila={fila_envio.qsize()} | pendentes={len(pendentes_por_jogo)} | "
-                f"cache={len(ultimos_enviados)} | leituras={len(ultimas_leituras_por_jogo)}"
+                f"cache={len(ultimos_enviados)} | leituras={len(ultimas_leituras_por_jogo)} | "
+                f"janelas=J1:{v11_gratis_contadores.get(j1, 0)}/{V11_FREE_J1_LIMITE} "
+                f"J2:{v11_gratis_contadores.get(j2, 0)}/{V11_FREE_J2_LIMITE} "
+                f"J3:{v11_gratis_contadores.get(j3, 0)}/{V11_FREE_J3_LIMITE}"
             )
         except Exception as e:
             log(f"⚠️ Watchdog erro: {e}")
