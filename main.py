@@ -55,7 +55,7 @@ except Exception:  # pragma: no cover
 # VERSÃO / CONFIGURAÇÃO BASE
 # =========================================================
 
-VERSAO_COUTIPS = "ALFA_COUTIPS_2026_06_04_V12_1_BUGFIX_HT_OVER05"
+VERSAO_COUTIPS = "ALFA_COUTIPS_2026_06_04_V12_2_HT_SUPER_FAV_VENCENDO"
 
 load_dotenv()
 
@@ -152,6 +152,7 @@ HABILITAR_V11_GRUPO_GRATUITO = os.getenv("HABILITAR_V11_GRUPO_GRATUITO", "true")
 HABILITAR_V11_ALAVANCAGEM = os.getenv("HABILITAR_V11_ALAVANCAGEM", "true").lower() == "true"
 HABILITAR_V11_AUSTRALIA = os.getenv("HABILITAR_V11_AUSTRALIA", "true").lower() == "true"
 HABILITAR_V11_HT_CORRECOES = os.getenv("HABILITAR_V11_HT_CORRECOES", "true").lower() == "true"
+HABILITAR_HT_BONUS_SUPER_FAV_VENCENDO = os.getenv("HABILITAR_HT_BONUS_SUPER_FAV_VENCENDO", "true").lower() == "true"
 
 # Canal completo = recebe todos os aprovados. Por padrão reaproveita o antigo canal de confirmação.
 COMPLETE_CHANNEL = os.getenv("COMPLETE_CHANNEL") or CONFIRMATION_CHANNEL
@@ -165,7 +166,8 @@ V11_FREE_GOL_VANTAGEM_MIN = int(os.getenv("V11_FREE_GOL_VANTAGEM_MIN", "10"))
 V11_FREE_COOLDOWN_JOGO_HORAS = int(os.getenv("V11_FREE_COOLDOWN_JOGO_HORAS", "24"))
 V11_TZ_OFFSET_HORAS = int(os.getenv("V11_TZ_OFFSET_HORAS", "-4"))
 
-# V12: HT-2 corrigido. HT-1/HT-3 ficam fora desta versão operacional.
+# V12: HT-2 corrigido. HT-3 fica fora desta versão operacional.
+# V12_2: bônus cirúrgico para super favorito vencendo por 1 no HT com pressão extrema.
 
 # Segurança do parser: abaixo disso o dado está provavelmente quebrado,
 # não apenas com rótulo errado. Rótulo errado corrigível segue normalmente.
@@ -231,6 +233,7 @@ def logar_versao_inicial() -> None:
     log(f"🔺 V12 ALAVANCAGEM: {'ATIVA' if HABILITAR_V11_ALAVANCAGEM else 'DESATIVADA'}")
     log(f"🇦🇺 V12 Austrália especial: {'ATIVA' if HABILITAR_V11_AUSTRALIA else 'DESATIVADA'}")
     log(f"🧰 V12 HT-2 ap_diff por lado avaliado: {'ATIVO' if HABILITAR_V11_HT_CORRECOES else 'DESATIVADO'}")
+    log(f"➕ V12_2 bônus HT super favorito vencendo por 1: {'ATIVO' if HABILITAR_HT_BONUS_SUPER_FAV_VENCENDO else 'DESATIVADO'}")
     log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
 
@@ -1256,6 +1259,37 @@ def xg_baixo_compensado_por_rb(m: Metricas, lado: str) -> bool:
     return False
 
 
+def ht_bonus_super_fav_vencendo_v12_2(m: Metricas) -> Tuple[bool, str]:
+    """V12_2 — bônus cirúrgico para super favorito vencendo por 1 no HT.
+
+    Não é atalho de aprovação. Só aplica quando:
+    - HT até 37';
+    - favorito fora odd <= 1.55 OU favorito casa odd <= 1.30;
+    - favorito vencendo por exatamente 1 gol;
+    - favorito é o lado pressionante;
+    - pressão extrema confirmada.
+    """
+    if not HABILITAR_HT_BONUS_SUPER_FAV_VENCENDO:
+        return False, "FLAG_OFF"
+    if not eh_ht(m.estrategia):
+        return False, "NAO_HT"
+    if int(m.tempo or 0) > 37:
+        return False, f"MINUTO_ACIMA_37_{m.tempo}"
+    fav = m.lado_favorito
+    if fav not in {"CASA", "FORA"}:
+        return False, "SEM_FAVORITO"
+    if fav != m.lado_pressionante:
+        return False, "FAVORITO_NAO_PRESSIONANTE"
+    odd_ok = (fav == "FORA" and m.odd_favorito <= 1.55) or (fav == "CASA" and m.odd_favorito <= 1.30)
+    if not odd_ok:
+        return False, f"ODD_FORA_DA_REGRA_{fav}_{m.odd_favorito}"
+    if lado_vencendo(m) != fav or diferenca_placar(m) != 1:
+        return False, f"PLACAR_NAO_VENCE_1_{m.placar}"
+    if not pressao_extrema_lado(m, fav):
+        return False, "SEM_PRESSAO_EXTREMA"
+    return True, f"SUPER_FAV_{fav}_ODD={m.odd_favorito}_VENCE_1_HT_PRESSAO_EXTREMA"
+
+
 def consequencia_real_lado(m: Metricas, lado: str) -> bool:
     d = dados_lado(m, lado)
     if eh_ht(m.estrategia):
@@ -2060,6 +2094,10 @@ def score_python_contextual(m: Metricas, chave: str) -> DecisaoPython:
         # redundância estatística. Calibração: corte HT ajustado para 86.
         if m.lado_pressionante in {"CASA", "FORA"} and pressao_extrema_lado(m, m.lado_pressionante):
             score_bruto += 4
+
+        bonus_super_fav_ok, bonus_super_fav_motivo = ht_bonus_super_fav_vencendo_v12_2(m)
+        if bonus_super_fav_ok:
+            score_bruto += 5
         # HT-3 (bônus Over 0.5HT histórico) — reservado para versão futura com auditoria específica.
     else:
         # [V005] Aplica cap de bônus de favoritismo definido pelo cenário FT.
@@ -2086,6 +2124,8 @@ def score_python_contextual(m: Metricas, chave: str) -> DecisaoPython:
             "funil": motivo_funil,
             "funil_detalhes": detalhes_funil,
             "time_elite": elite_motivo,
+            "ht_bonus_super_fav_vencendo": locals().get("bonus_super_fav_ok", False),
+            "ht_bonus_super_fav_motivo": locals().get("bonus_super_fav_motivo", "NAO_AVALIADO"),
         }
         return DecisaoPython(score=score, aprovado_pre_ia=False, status="REPROVADO", motivo=motivo_funil, detalhes=detalhes)
 
@@ -2112,6 +2152,8 @@ def score_python_contextual(m: Metricas, chave: str) -> DecisaoPython:
         "trava": motivo_trava,
         "teto_v9": motivo_teto_v9,
         "time_elite": elite_motivo,
+        "ht_bonus_super_fav_vencendo": locals().get("bonus_super_fav_ok", False),
+        "ht_bonus_super_fav_motivo": locals().get("bonus_super_fav_motivo", "NAO_AVALIADO"),
         "cenario_ft": detalhes_funil.get("cenario_ft", "N/A"),
         "cenario_ft_motivo": detalhes_funil.get("cenario_ft_motivo", "N/A"),
     }
