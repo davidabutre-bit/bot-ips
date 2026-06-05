@@ -55,7 +55,7 @@ except Exception:  # pragma: no cover
 # VERSÃO / CONFIGURAÇÃO BASE
 # =========================================================
 
-VERSAO_COUTIPS = "ALFA_COUTIPS_2026_06_04_V12_2_HT_SUPER_FAV_VENCENDO"
+VERSAO_COUTIPS = "ALFA_COUTIPS_2026_06_04_V14_VOLUME_FT"
 
 load_dotenv()
 
@@ -146,6 +146,15 @@ V9_CAP_PRESSAO_RECENTE_FRACA = int(os.getenv("V9_CAP_PRESSAO_RECENTE_FRACA", "86
 # Argentina excluída da régua rígida por comportamento melhor na auditoria.
 HABILITAR_UNDER_PROVA_EXTRA = os.getenv("HABILITAR_UNDER_PROVA_EXTRA", "true").lower() == "true"
 
+# V013 — auditoria HTML automática.
+# Gera JSON diário + HTML diário em /data (ou pasta local como fallback).
+# Envia HTMLs às 00:05 para CONFIRMATION_CHANNEL. Zero impacto no score/funil.
+HABILITAR_V13_AUDITORIA_HTML = os.getenv("HABILITAR_V13_AUDITORIA_HTML", "true").lower() == "true"
+
+# V014 — VOLUME_FT: radar interno da CornerPro com filtro exclusivo antes do score.
+# Reprovados morrem silenciosamente. Aprovados seguem fluxo ALFA normal.
+HABILITAR_VOLUME_FT = os.getenv("HABILITAR_VOLUME_FT", "true").lower() == "true"
+
 # V012 — camadas cirúrgicas: grupo grátis, ALAVANCAGEM, Austrália especial e HT-2.
 # Mantém score, funil, IA e parser centrais preservados.
 HABILITAR_V11_GRUPO_GRATUITO = os.getenv("HABILITAR_V11_GRUPO_GRATUITO", "true").lower() == "true"
@@ -234,6 +243,8 @@ def logar_versao_inicial() -> None:
     log(f"🇦🇺 V12 Austrália especial: {'ATIVA' if HABILITAR_V11_AUSTRALIA else 'DESATIVADA'}")
     log(f"🧰 V12 HT-2 ap_diff por lado avaliado: {'ATIVO' if HABILITAR_V11_HT_CORRECOES else 'DESATIVADO'}")
     log(f"➕ V12_2 bônus HT super favorito vencendo por 1: {'ATIVO' if HABILITAR_HT_BONUS_SUPER_FAV_VENCENDO else 'DESATIVADO'}")
+    log(f"📄 V13 auditoria HTML automática: {'ATIVA' if HABILITAR_V13_AUDITORIA_HTML else 'DESATIVADA'} | dir={_data_dir()}")
+    log(f"🔊 V14 VOLUME_FT: {'ATIVO' if HABILITAR_VOLUME_FT else 'DESATIVADO'}")
     log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
 
@@ -473,6 +484,10 @@ def detectar_estrategia(texto: str) -> str:
     if "BOT_FT CONFIRMACAO" in t or "FT CONFIRMACAO" in t or "FT CONFIRMAÇÃO" in t or "ALFA FT CONFIRMACAO" in t:
         return "ALFA_FT_CONFIRMACAO"
 
+    # V014 — radar interno VOLUME_FT. Detectado antes dos radares canônicos.
+    if "VOLUME_FT" in t:
+        return "VOLUME_FT"
+
     # Radares canônicos.
     if "ARCE_HT" in t or "ARCE HT" in t or " ARCE " in t:
         return "ARCE_HT"
@@ -507,11 +522,16 @@ def eh_ht(estrategia: str) -> bool:
 
 
 def eh_ft(estrategia: str) -> bool:
-    return estrategia in {"ALFA_FT", "ALFA_FT_CONFIRMACAO", "CHAMA_FT"}
+    return estrategia in {"ALFA_FT", "ALFA_FT_CONFIRMACAO", "CHAMA_FT", "VOLUME_FT"}
 
 
 def eh_confirmacao(estrategia: str) -> bool:
     return estrategia in {"ALFA_HT_CONFIRMACAO", "ALFA_FT_CONFIRMACAO"}
+
+
+def eh_volume_ft(estrategia: str) -> bool:
+    """V014 — radar interno VOLUME_FT."""
+    return estrategia == "VOLUME_FT"
 
 
 # =========================================================
@@ -2887,6 +2907,341 @@ def timeout_confirmacao_segundos(m: Metricas) -> int:
     return max(120, min(600, (82 - tempo + 1) * 60))
 
 # =========================================================
+# V014 — FILTRO EXCLUSIVO VOLUME_FT
+# Porta isolada antes do score normal.
+# Reprovados morrem silenciosamente (CSV/log apenas).
+# Aprovados seguem fluxo ALFA normal com mensagem pública ALFA.
+# Não toca: score, IA, CHAMA, ARCE, HT, FT principal, grupo grátis, alavancagem, V13 HTML.
+# =========================================================
+
+def _volume_ft_favorito_nao_vencendo(m: "Metricas") -> Tuple[bool, str]:
+    """Favorito deve estar empatando ou perdendo. Bloqueia se vencendo mesmo por 1."""
+    fav = m.lado_favorito
+    if fav not in {"CASA", "FORA"}:
+        return False, "VOLUME_FT_SEM_FAVORITO_IDENTIFICADO"
+    gc, gf = extrair_gols_placar(m.placar)
+    if gc is None or gf is None:
+        return False, "VOLUME_FT_PLACAR_INVALIDO"
+    gols_fav = gc if fav == "CASA" else gf
+    gols_adv = gf if fav == "CASA" else gc
+    if gols_fav > gols_adv:
+        return False, f"VOLUME_FT_FAVORITO_VENCENDO_{gols_fav}x{gols_adv}"
+    return True, "VOLUME_FT_FAVORITO_EMPATANDO_OU_PERDENDO"
+
+
+def _volume_ft_gol_recente_ok(m: "Metricas") -> Tuple[bool, str]:
+    """Só bloqueia gol recente se colocou o favorito vencendo.
+    Não bloqueia: favorito empatou, zebra marcou, favorito continua perdendo.
+    """
+    if not gol_recente(m, janela=5):
+        return True, "VOLUME_FT_SEM_GOL_RECENTE"
+    fav = m.lado_favorito
+    lado_gol = m.ultimo_gol_lado
+    # Gol do favorito que deixou ele vencendo — mata o contexto.
+    if lado_gol == fav and ultimo_gol_deixou_lado_vencendo(m):
+        return False, f"VOLUME_FT_GOL_RECENTE_FAV_VENCENDO | {m.ultimo_gol}' {lado_gol} | {m.placar}"
+    return True, f"VOLUME_FT_GOL_RECENTE_OK | {m.ultimo_gol}' {lado_gol} | {m.placar}"
+
+
+def _volume_ft_pressao_viva(m: "Metricas") -> Tuple[bool, str]:
+    """U10 e U5 com vantagem clara para o lado pressionante."""
+    lado = m.lado_pressionante
+    if lado not in {"CASA", "FORA"}:
+        return False, "VOLUME_FT_SEM_LADO_PRESSIONANTE"
+    idx = 0 if lado == "CASA" else 1
+    u10_fav = m.ultimos10[idx]
+    u10_adv = m.ultimos10[1 - idx]
+    u5_fav = m.ultimos5[idx]
+    u5_adv = m.ultimos5[1 - idx]
+    # U10: diferença mínima de 4. U5: diferença mínima de 2.
+    if (u10_fav - u10_adv) < 4:
+        return False, f"VOLUME_FT_U10_INSUFICIENTE | {u10_fav}x{u10_adv}"
+    if (u5_fav - u5_adv) < 2:
+        return False, f"VOLUME_FT_U5_INSUFICIENTE | {u5_fav}x{u5_adv}"
+    return True, f"VOLUME_FT_PRESSAO_VIVA | U10={u10_fav}x{u10_adv} U5={u5_fav}x{u5_adv}"
+
+
+def _volume_ft_ataques_perigosos(m: "Metricas") -> Tuple[bool, str]:
+    """Ataques perigosos com vantagem clara para o lado pressionante."""
+    lado = m.lado_pressionante
+    if lado not in {"CASA", "FORA"}:
+        return False, "VOLUME_FT_SEM_LADO_PRESSIONANTE_AP"
+    idx = 0 if lado == "CASA" else 1
+    ap_fav = m.ataques_perigosos[idx]
+    ap_adv = m.ataques_perigosos[1 - idx]
+    # Diferença mínima de 8 e razão mínima de 1.4x.
+    if (ap_fav - ap_adv) < 8:
+        return False, f"VOLUME_FT_AP_DIFERENCA_INSUFICIENTE | {ap_fav}x{ap_adv}"
+    if ap_adv > 0 and (ap_fav / ap_adv) < 1.4:
+        return False, f"VOLUME_FT_AP_RAZAO_INSUFICIENTE | {ap_fav}x{ap_adv}"
+    return True, f"VOLUME_FT_AP_OK | {ap_fav}x{ap_adv}"
+
+
+def _volume_ft_remates(m: "Metricas") -> Tuple[bool, str]:
+    """Remates confirmando ofensiva real."""
+    lado = m.lado_pressionante
+    if lado not in {"CASA", "FORA"}:
+        return False, "VOLUME_FT_SEM_LADO_PRESSIONANTE_RB"
+    idx = 0 if lado == "CASA" else 1
+    rb_fav = m.remates_baliza[idx]
+    rb_adv = m.remates_baliza[1 - idx]
+    rl_fav = m.remates_lado[idx]
+    # Exige mínimo de remates à baliza OU remates totais significativos.
+    if rb_fav < 2 and rl_fav < 4:
+        return False, f"VOLUME_FT_REMATES_INSUFICIENTES | RB={rb_fav} RL={rl_fav}"
+    if rb_fav <= rb_adv and rb_fav < 3:
+        return False, f"VOLUME_FT_RB_SEM_VANTAGEM | {rb_fav}x{rb_adv}"
+    return True, f"VOLUME_FT_REMATES_OK | RB={rb_fav}x{rb_adv} RL={rl_fav}"
+
+
+def _volume_ft_chance_golo(m: "Metricas") -> Tuple[bool, str]:
+    """Chance de gol mínima para o lado pressionante."""
+    lado = m.lado_pressionante
+    if lado not in {"CASA", "FORA"}:
+        return False, "VOLUME_FT_SEM_LADO_PRESSIONANTE_CHANCE"
+    idx = 0 if lado == "CASA" else 1
+    chance = m.chance_golo[idx]
+    if chance < 8:
+        return False, f"VOLUME_FT_CHANCE_INSUFICIENTE | chance={chance}"
+    return True, f"VOLUME_FT_CHANCE_OK | chance={chance}"
+
+
+def _volume_ft_favorito_pressionando(m: "Metricas") -> Tuple[bool, str]:
+    """Favorito deve ser o lado pressionante/dominante."""
+    fav = m.lado_favorito
+    press = m.lado_pressionante
+    if fav not in {"CASA", "FORA"} or press not in {"CASA", "FORA"}:
+        return False, "VOLUME_FT_SEM_FAV_OU_PRESS"
+    if fav != press:
+        return False, f"VOLUME_FT_FAV_NAO_PRESSIONANTE | fav={fav} press={press}"
+    return True, f"VOLUME_FT_FAV_PRESSIONANTE | {fav}"
+
+
+def _volume_ft_minuto(m: "Metricas") -> Tuple[bool, str]:
+    """Janela ideal 65–80. Após 85 bloqueia."""
+    t = int(m.tempo or 0)
+    if t > 85:
+        return False, f"VOLUME_FT_FORA_JANELA_TARDIO | {t}'"
+    if t < 65:
+        return False, f"VOLUME_FT_FORA_JANELA_CEDO | {t}'"
+    return True, f"VOLUME_FT_MINUTO_OK | {t}'"
+
+
+def filtro_volume_ft(m: "Metricas") -> Tuple[bool, str]:
+    """Porta exclusiva do VOLUME_FT. Aplica todos os filtros em sequência.
+    Retorna (True, motivo) se passou. (False, motivo) se bloqueado.
+    """
+    checks = [
+        _volume_ft_minuto,
+        _volume_ft_favorito_nao_vencendo,
+        _volume_ft_gol_recente_ok,
+        _volume_ft_favorito_pressionando,
+        _volume_ft_pressao_viva,
+        _volume_ft_ataques_perigosos,
+        _volume_ft_remates,
+        _volume_ft_chance_golo,
+    ]
+    for check in checks:
+        ok, motivo = check(m)
+        if not ok:
+            return False, motivo
+    return True, "VOLUME_FT_FILTRO_PASSOU"
+
+
+# =========================================================
+# V013 — AUDITORIA HTML AUTOMÁTICA
+# Camada completamente isolada. Zero impacto no score/funil.
+# Ponto de inserção: após registrar_csv() e enviar_auditoria().
+# Bots excluídos dos reprovados: BOT_VOLUME_FT, BOT_VOLUME_HT (futuros).
+# =========================================================
+
+import json
+import threading as _threading
+
+# Diretório de dados: Railway Volume /data com fallback para pasta local.
+def _data_dir() -> Path:
+    d = Path(os.getenv("DATA_DIR", "/data"))
+    if not d.exists():
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            d = Path("auditoria_html")
+            d.mkdir(parents=True, exist_ok=True)
+    return d
+
+_v13_lock = _threading.Lock()
+
+# Estratégias excluídas dos reprovados (bots de volume).
+_V13_ESTRATEGIAS_EXCLUIDAS_REPROV = {"BOT_VOLUME_FT", "BOT_VOLUME_HT", "VOLUME_FT"}
+
+
+def _v13_arquivo_json(tipo: str, dt: Optional[datetime] = None) -> Path:
+    """Retorna caminho do JSON diário. tipo = 'aprovados' ou 'reprovados'."""
+    dt = dt or datetime.now()
+    nome = f"{tipo}_{dt.strftime('%Y_%m_%d')}.json"
+    return _data_dir() / nome
+
+
+def _v13_arquivo_html(tipo: str, dt: Optional[datetime] = None) -> Path:
+    dt = dt or datetime.now()
+    nome = f"{tipo}_{dt.strftime('%Y_%m_%d')}.html"
+    return _data_dir() / nome
+
+
+def v13_registrar(m: "Metricas", score_medio: int, aprovado: bool, motivo: str) -> None:
+    """Registra alerta no JSON diário e regera o HTML imediatamente."""
+    if not HABILITAR_V13_AUDITORIA_HTML:
+        return
+    # Reprovados de bots de volume não entram no HTML de auditoria.
+    if not aprovado and m.estrategia in _V13_ESTRATEGIAS_EXCLUIDAS_REPROV:
+        return
+    tipo = "aprovados" if aprovado else "reprovados"
+    entrada = {
+        "ts": now_iso(),
+        "bot": m.estrategia,
+        "jogo": m.jogo,
+        "minuto": m.tempo,
+        "placar": m.placar,
+        "score": score_medio,
+        "liga": m.liga,
+        "motivo": motivo if not aprovado else "",
+        "cornerpro": m.cornerpro,
+    }
+    try:
+        with _v13_lock:
+            arq = _v13_arquivo_json(tipo)
+            registros: list = []
+            if arq.exists():
+                try:
+                    registros = json.loads(arq.read_text(encoding="utf-8"))
+                except Exception:
+                    registros = []
+            registros.append(entrada)
+            arq.write_text(json.dumps(registros, ensure_ascii=False, indent=2), encoding="utf-8")
+            v13_gerar_html(tipo)
+    except Exception as e:
+        log(f"⚠️ V13 registrar erro | {type(e).__name__}: {e}")
+
+
+def v13_gerar_html(tipo: str, dt: Optional[datetime] = None) -> Path:
+    """Gera HTML diário a partir do JSON. Retorna o caminho do arquivo gerado."""
+    dt = dt or datetime.now()
+    arq_json = _v13_arquivo_json(tipo, dt)
+    arq_html = _v13_arquivo_html(tipo, dt)
+    registros: list = []
+    if arq_json.exists():
+        try:
+            registros = json.loads(arq_json.read_text(encoding="utf-8"))
+        except Exception:
+            registros = []
+
+    titulo = "APROVADOS" if tipo == "aprovados" else "REPROVADOS"
+    cor = "#00c853" if tipo == "aprovados" else "#e53935"
+    data_fmt = dt.strftime("%d/%m/%Y")
+    total = len(registros)
+
+    linhas_html = []
+    for r in registros:
+        link = r.get("cornerpro", "")
+        link_tag = f'<a href="{html.escape(link)}" target="_blank">🔗 CornerPro</a>' if link else "—"
+        motivo_txt = f'<div class="motivo">{html.escape(str(r.get("motivo","") or ""))}</div>' if r.get("motivo") else ""
+        linhas_html.append(f"""
+        <div class="item">
+          <span class="badge">{html.escape(str(r.get("bot","") or ""))}</span>
+          <strong>{html.escape(str(r.get("jogo","") or ""))}</strong>
+          &nbsp;|&nbsp;⏱ {r.get("minuto","")}' &nbsp;|&nbsp; 📊 {html.escape(str(r.get("placar","") or ""))}
+          &nbsp;|&nbsp; Score: <b>{r.get("score","")}%</b>
+          &nbsp;|&nbsp; Liga: {html.escape(str(r.get("liga","") or ""))}
+          &nbsp;|&nbsp; {link_tag}
+          {motivo_txt}
+        </div>""")
+
+    corpo = "\n".join(linhas_html) if linhas_html else "<p style='color:#888'>Nenhum registro ainda.</p>"
+
+    conteudo = f"""<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>COUTIPS {titulo} — {data_fmt}</title>
+<style>
+  *{{box-sizing:border-box;margin:0;padding:0}}
+  body{{font-family:system-ui,sans-serif;background:#0d0d0d;color:#e0e0e0;padding:16px}}
+  h1{{color:{cor};font-size:1.2rem;margin-bottom:4px}}
+  .sub{{color:#888;font-size:0.8rem;margin-bottom:14px}}
+  .item{{background:#181818;border-left:4px solid {cor};border-radius:6px;
+         padding:10px 12px;margin:6px 0;font-size:0.85rem;line-height:1.6}}
+  .badge{{display:inline-block;background:#1e3a5f;color:#90caf9;
+          padding:1px 7px;border-radius:10px;font-size:0.72rem;font-weight:700;margin-right:6px}}
+  .motivo{{color:#ff8a65;font-size:0.78rem;margin-top:3px}}
+  a{{color:#ffb300;text-decoration:none}}
+  a:hover{{text-decoration:underline}}
+</style>
+</head>
+<body>
+<h1>📋 COUTIPS — {titulo}</h1>
+<div class="sub">{data_fmt} &nbsp;|&nbsp; {total} registro(s)</div>
+{corpo}
+</body>
+</html>"""
+
+    try:
+        arq_html.write_text(conteudo, encoding="utf-8")
+        log(f"📄 V13 HTML gerado | {arq_html.name} | {total} registros")
+    except Exception as e:
+        log(f"⚠️ V13 gerar_html erro | {type(e).__name__}: {e}")
+    return arq_html
+
+
+async def v13_enviar_htmls_telegram() -> None:
+    """Envia os HTMLs de aprovados e reprovados do dia anterior para @ALFA_CON às 00:05."""
+    if not HABILITAR_V13_AUDITORIA_HTML:
+        return
+    ontem = datetime.now() - timedelta(days=1)
+    canal = CONFIRMATION_CHANNEL
+    for tipo in ("aprovados", "reprovados"):
+        arq_html = _v13_arquivo_html(tipo, ontem)
+        arq_json = _v13_arquivo_json(tipo, ontem)
+        # Garante que o HTML final está atualizado antes de enviar.
+        if arq_json.exists():
+            v13_gerar_html(tipo, ontem)
+        if not arq_html.exists():
+            log(f"⚠️ V13 envio HTML | arquivo não encontrado: {arq_html.name}")
+            continue
+        try:
+            await client.send_file(
+                canal,
+                str(arq_html),
+                caption=f"📋 COUTIPS {tipo.upper()} — {ontem.strftime('%d/%m/%Y')}",
+            )
+            log(f"📤 V13 HTML enviado | {arq_html.name} → {canal}")
+            await asyncio.sleep(2)
+        except Exception as e:
+            log(f"⚠️ V13 envio HTML erro | {arq_html.name} | {type(e).__name__}: {e}")
+
+
+async def v13_agendador() -> None:
+    """Loop que dispara o envio dos HTMLs todo dia às 00:05."""
+    log("🕐 V13 agendador iniciado — envio diário às 00:05")
+    while True:
+        try:
+            agora = datetime.now()
+            # Próxima execução às 00:05 do dia seguinte.
+            proximo = agora.replace(hour=0, minute=5, second=0, microsecond=0)
+            if agora >= proximo:
+                proximo += timedelta(days=1)
+            espera = (proximo - agora).total_seconds()
+            log(f"🕐 V13 próximo envio em {int(espera//3600)}h{int((espera%3600)//60)}m")
+            await asyncio.sleep(espera)
+            await v13_enviar_htmls_telegram()
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            log(f"⚠️ V13 agendador erro | {type(e).__name__}: {e}")
+            await asyncio.sleep(60)
+
+
+# =========================================================
 # DECISÃO / PROCESSAMENTO
 # =========================================================
 
@@ -2953,6 +3308,24 @@ async def processar_alerta(alerta: Alerta) -> None:
         log(f"⛔ {motivo} | {m.jogo}")
         await registrar_bloqueio_fluxo(m, motivo, score=0)
         return
+
+    # V014 — VOLUME_FT: porta exclusiva antes do score normal.
+    # Reprovados morrem silenciosamente — só CSV/log interno, sem canal de reprovados.
+    if HABILITAR_VOLUME_FT and eh_volume_ft(m.estrategia):
+        ok_vol, motivo_vol = filtro_volume_ft(m)
+        if not ok_vol:
+            m.fluxo_decisao = "VOLUME_FT_BLOQUEADO"
+            m.fluxo_motivo = motivo_vol
+            # Registra no CSV para rastreio interno. Sem envio para canais de reprovados.
+            decisao_py_vol = DecisaoPython(score=0, aprovado_pre_ia=False, status="REPROVADO", motivo=motivo_vol, detalhes={})
+            decisao_ia_vol = DecisaoIA(decisao="BLOQUEAR", confianca_original=0, confianca_corrigida=0, motivo="VOLUME_FT_FILTRO", protecao_ativa=False, protecao_motivo="SEM_PROTECAO")
+            registrar_csv(m, decisao_py_vol, decisao_ia_vol, 0, "REPROVADO", motivo_vol)
+            log(f"🔇 VOLUME_FT BLOQUEADO SILENCIOSO | {motivo_vol} | {m.jogo}")
+            return
+        # Passou o filtro: continua no fluxo normal do V13 como ALFA_FT.
+        log(f"🟢 VOLUME_FT FILTRO PASSOU | {motivo_vol} | {m.jogo}")
+        m.fluxo_decisao = "VOLUME_FT_APROVADO"  # V14 — preserva rastreio para auditoria futura
+        m.estrategia = "ALFA_FT"  # Mensagem pública sai como ALFA, não como VOLUME_FT.
 
     # BOT_FT CONFIRMAÇÃO: se existe gatilho anterior pendente, comparar obrigatoriamente.
     if HABILITAR_CONFIRMACAO_V2 and eh_confirmacao(m.estrategia) and eh_ft(m.estrategia):
@@ -3033,6 +3406,7 @@ async def processar_alerta(alerta: Alerta) -> None:
         log(f"⛔ BLOQUEADO IA CRITICA | IA={decisao_ia.confianca_corrigida}% | {m.jogo}")
         registrar_csv(m, decisao_py, decisao_ia, score_medio, "REPROVADO", motivo)
         await enviar_auditoria(m, decisao_py.score, decisao_ia.confianca_corrigida, score_medio, False, motivo)
+        v13_registrar(m, score_medio, False, motivo)  # V13
         ultimas_leituras_por_jogo[chave] = {"metricas": m, "score": decisao_py.score, "recebido_em": time.time()}
         return
 
@@ -3067,6 +3441,7 @@ async def processar_alerta(alerta: Alerta) -> None:
     motivo_final = "APROVADO" if aprovado else f"MÉDIA={score_medio}% < {corte}% OU trava_py={decisao_py.motivo}"
     registrar_csv(m, decisao_py, decisao_ia, score_medio, "APROVADO" if aprovado else "REPROVADO", motivo_final)
     await enviar_auditoria(m, decisao_py.score, decisao_ia.confianca_corrigida, score_medio, aprovado, motivo_final)
+    v13_registrar(m, score_medio, aprovado, motivo_final)  # V13
 
     ultimas_leituras_por_jogo[chave] = {"metricas": m, "score": decisao_py.score, "recebido_em": time.time()}
 
@@ -3182,6 +3557,8 @@ async def main() -> None:
 
     tarefa_envio = asyncio.create_task(trabalhador_fila_envio())
     asyncio.create_task(watchdog())
+    if HABILITAR_V13_AUDITORIA_HTML:
+        asyncio.create_task(v13_agendador())  # V13 — envio diário às 00:05
 
     @client.on(events.NewMessage(incoming=True))
     async def handler(event):
