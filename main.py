@@ -55,7 +55,7 @@ except Exception:  # pragma: no cover
 # VERSÃO / CONFIGURAÇÃO BASE
 # =========================================================
 
-VERSAO_COUTIPS = "ALFA_COUTIPS_2026_06_05_V17_PERSISTENCIA_CONTADORES_GRATIS"
+VERSAO_COUTIPS = "ALFA_COUTIPS_2026_06_05_V19_AUDITORIA_RESTRITA_EDIT_IGNORADO"
 
 load_dotenv()
 
@@ -97,6 +97,16 @@ AUDIT_HT_OK = os.getenv("AUDIT_HT_OK", "")
 AUDIT_HT_NO = os.getenv("AUDIT_HT_NO", "")
 AUDIT_FT_OK = os.getenv("AUDIT_FT_OK", "")
 AUDIT_FT_NO = os.getenv("AUDIT_FT_NO", "")
+
+# V019 — segurança do comando de auditoria.
+# Por padrão, somente comandos OUTGOING do próprio usuário são aceitos.
+# Se quiser liberar chat/user específico, configure AUDITORIA_CHAT_IDS com IDs separados por vírgula.
+AUDITORIA_CHAT_IDS_RAW = os.getenv("AUDITORIA_CHAT_IDS", "").strip()
+AUDITORIA_CHAT_IDS = {
+    int(x.strip())
+    for x in AUDITORIA_CHAT_IDS_RAW.split(",")
+    if x.strip().lstrip("-").isdigit()
+}
 
 MODO_TESTE = os.getenv("MODO_TESTE", "false").lower() == "true"
 
@@ -284,6 +294,7 @@ def logar_versao_inicial() -> None:
     log(f"📋 V15 comando auditoria: ATIVO | /auditoria ou 'auditoria' no canal interno")
     log(f"📤 V16 handler outgoing: ATIVO | exclusivo para comando auditoria")
     log(f"💾 V17 persistência contadores grátis: ATIVA | arquivo={_V17_ESTADO_FILE}")
+    log("🧱 V18 regra volume/grátis: favorito vencendo só passa em cenário EXTREMO")
     log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
 
@@ -2473,20 +2484,65 @@ def jogo_em_cooldown_gratis_v11(chave_jogo: str) -> bool:
     return ts > 0 and time.time() - ts < V11_FREE_COOLDOWN_JOGO_HORAS * 3600
 
 
-def favorito_vencendo_por_um_com_gol_antigo_v11(m: Metricas) -> Tuple[bool, str]:
+def favorito_vencendo_por_um_extremo_v18(m: Metricas, score: int = 0) -> Tuple[bool, str]:
+    """V18 — exceção rara para favorito vencendo por 1.
+
+    Regra oficial:
+    - padrão do grupo grátis e do VOLUME_FT: favorito empatando ou perdendo;
+    - se o favorito já vence, só pode passar vencendo por 1 e em cenário
+      EXTREMAMENTE absurdo;
+    - gol recente do favorito continua bloqueando, porque pode ser pressão
+      premiada;
+    - score 90+ é exigido quando a função recebe score já calculado
+      (grupo grátis); no VOLUME_FT, que roda antes do score, a prova vem
+      apenas dos dados brutos.
+    """
     fav = m.lado_favorito
     if fav not in {"CASA", "FORA"}:
         return False, "SEM_FAVORITO"
     if lado_vencendo(m) != fav:
         return False, "FAVORITO_NAO_VENCE"
     if diferenca_placar(m) != 1:
-        return False, "FAVORITO_NAO_VENCE_POR_1"
+        return False, "FAVORITO_VENCE_MAIS_DE_1"
+    if fav != m.lado_pressionante:
+        return False, "FAVORITO_VENCE_MAS_NAO_E_PRESSIONANTE"
     if m.ultimo_gol and m.ultimo_gol_lado == fav and minutos_desde_ultimo_gol(m) < V11_FREE_GOL_VANTAGEM_MIN:
         return False, f"GOL_VANTAGEM_RECENTE_{minutos_desde_ultimo_gol(m)}MIN"
-    return True, "FAVORITO_VENCE_1_GOL_ANTIGO"
+
+    d = dados_lado(m, fav)
+    ip = ip_lado(m, fav)
+    ap_diff = ap_diff_lado(m, fav)
+
+    pressao_absurda = (
+        d["u5"] >= 5
+        and d["u10"] >= 10
+        and ap_diff >= 25
+        and (ip["pico"] >= 24 or ip["c18"] >= 3 or ip["c22"] >= 2)
+    )
+    dominio_convertivel_absurdo = (
+        d["rb"] >= 3
+        or d["chance"] >= 12
+        or d["xg"] >= 0.60
+        or (d["rl"] >= 8 and d["cantos"] >= 4)
+    )
+    score_ok = score <= 0 or score >= 90
+
+    if pressao_absurda and dominio_convertivel_absurdo and score_ok:
+        return True, (
+            f"FAVORITO_VENCE_1_MAS_EXTREMO_V18|score={score}|"
+            f"ap_diff={ap_diff}|u5={d['u5']}|u10={d['u10']}|"
+            f"rb={d['rb']}|chance={d['chance']}|xg={d['xg']:.2f}|ip={ip['pico']}"
+        )
+
+    return False, (
+        f"FAVORITO_VENCE_1_SEM_EXTREMO_V18|score={score}|"
+        f"pressao_absurda={pressao_absurda}|dominio_absurdo={dominio_convertivel_absurdo}|"
+        f"ap_diff={ap_diff}|u5={d['u5']}|u10={d['u10']}|"
+        f"rb={d['rb']}|chance={d['chance']}|xg={d['xg']:.2f}|ip={ip['pico']}"
+    )
 
 
-def apto_contexto_grupo_gratuito_v11(m: Metricas) -> Tuple[bool, str]:
+def apto_contexto_grupo_gratuito_v11(m: Metricas, score: int = 0) -> Tuple[bool, str]:
     if not HABILITAR_V11_GRUPO_GRATUITO:
         return False, "V11_GRUPO_GRATUITO_DESATIVADO"
     if eh_confirmacao(m.estrategia):
@@ -2495,15 +2551,19 @@ def apto_contexto_grupo_gratuito_v11(m: Metricas) -> Tuple[bool, str]:
     if fav not in {"CASA", "FORA"}:
         return False, "SEM_FAVORITO"
     vencedor = lado_vencendo(m)
+
+    # Prioridade normal do grupo grátis: favorito perdendo ou empatando.
     if vencedor != fav and vencedor != "EMPATE":
         return True, "CENARIO_A_FAVORITO_PERDENDO"
     if vencedor == "EMPATE":
         return True, "CENARIO_B_FAVORITO_EMPATANDO"
-    ok_c, motivo_c = favorito_vencendo_por_um_com_gol_antigo_v11(m)
-    if ok_c:
-        return True, "CENARIO_C_" + motivo_c
-    return False, motivo_c
 
+    # V18 — favorito vencendo deixa de ser cenário comum.
+    # Só passa vencendo por 1 em cenário realmente absurdo.
+    ok_c, motivo_c = favorito_vencendo_por_um_extremo_v18(m, score=score)
+    if ok_c:
+        return True, "CENARIO_C_EXTREMO_" + motivo_c
+    return False, motivo_c
 
 def liga_australiana_v11(m: Metricas) -> bool:
     texto = remover_acentos(f"{m.competicao} {m.jogo}").lower()
@@ -2623,8 +2683,8 @@ def selo_alavancagem_v11(m: Metricas, score: int) -> Tuple[bool, str]:
     )
 
 
-def elegivel_grupo_gratuito_v11(m: Metricas, chave_jogo: str) -> Tuple[bool, str]:
-    ok_ctx, motivo_ctx = apto_contexto_grupo_gratuito_v11(m)
+def elegivel_grupo_gratuito_v11(m: Metricas, chave_jogo: str, score: int = 0) -> Tuple[bool, str]:
+    ok_ctx, motivo_ctx = apto_contexto_grupo_gratuito_v11(m, score=score)
     if not ok_ctx:
         return False, motivo_ctx
     if jogo_em_cooldown_gratis_v11(chave_jogo):
@@ -2958,20 +3018,34 @@ def timeout_confirmacao_segundos(m: Metricas) -> int:
 # Não toca: score, IA, CHAMA, ARCE, HT, FT principal, grupo grátis, alavancagem, V13 HTML.
 # =========================================================
 
-def _volume_ft_favorito_nao_vencendo(m: "Metricas") -> Tuple[bool, str]:
-    """Favorito deve estar empatando ou perdendo. Bloqueia se vencendo mesmo por 1."""
+def _volume_ft_contexto_placar_prioritario(m: "Metricas") -> Tuple[bool, str]:
+    """V18 — regra de placar do VOLUME_FT.
+
+    Prioridade do bot volume:
+    - favorito empatando ou perdendo = pode seguir para os próximos filtros;
+    - favorito vencendo = bloqueia, exceto se vencer por 1 em cenário EXTREMO;
+    - favorito vencendo por 2+ = bloqueio direto.
+    """
     fav = m.lado_favorito
     if fav not in {"CASA", "FORA"}:
         return False, "VOLUME_FT_SEM_FAVORITO_IDENTIFICADO"
     gc, gf = extrair_gols_placar(m.placar)
     if gc is None or gf is None:
         return False, "VOLUME_FT_PLACAR_INVALIDO"
+
     gols_fav = gc if fav == "CASA" else gf
     gols_adv = gf if fav == "CASA" else gc
-    if gols_fav > gols_adv:
-        return False, f"VOLUME_FT_FAVORITO_VENCENDO_{gols_fav}x{gols_adv}"
-    return True, "VOLUME_FT_FAVORITO_EMPATANDO_OU_PERDENDO"
 
+    if gols_fav <= gols_adv:
+        return True, "VOLUME_FT_FAVORITO_EMPATANDO_OU_PERDENDO"
+
+    if gols_fav - gols_adv > 1:
+        return False, f"VOLUME_FT_FAVORITO_VENCENDO_MAIS_DE_1_{gols_fav}x{gols_adv}"
+
+    ok_extremo, motivo_extremo = favorito_vencendo_por_um_extremo_v18(m, score=0)
+    if ok_extremo:
+        return True, "VOLUME_FT_FAVORITO_VENCE_1_EXTREMO|" + motivo_extremo
+    return False, "VOLUME_FT_FAVORITO_VENCE_1_BLOQUEADO|" + motivo_extremo
 
 def _volume_ft_gol_recente_ok(m: "Metricas") -> Tuple[bool, str]:
     """Só bloqueia gol recente se colocou o favorito vencendo.
@@ -3077,7 +3151,7 @@ def filtro_volume_ft(m: "Metricas") -> Tuple[bool, str]:
     """
     checks = [
         _volume_ft_minuto,
-        _volume_ft_favorito_nao_vencendo,
+        _volume_ft_contexto_placar_prioritario,
         _volume_ft_gol_recente_ok,
         _volume_ft_favorito_pressionando,
         _volume_ft_pressao_viva,
@@ -3472,7 +3546,7 @@ async def processar_alerta(alerta: Alerta) -> None:
             m.motivo_grupo_gratuito = "MODO_TESTE_ATIVO"
             m.destino_final = COMPLETE_CHANNEL
         else:
-            gratis_pre, gratis_motivo_pre = elegivel_grupo_gratuito_v11(m, chave)
+            gratis_pre, gratis_motivo_pre = elegivel_grupo_gratuito_v11(m, chave, score_medio)
             m.grupo_gratuito = "SIM" if gratis_pre else "NAO"
             m.motivo_grupo_gratuito = gratis_motivo_pre
             destinos_pre = [COMPLETE_CHANNEL]
@@ -3512,7 +3586,7 @@ async def processar_alerta(alerta: Alerta) -> None:
         m.grupo_gratuito = "NAO"
         m.motivo_grupo_gratuito = "MODO_TESTE_ATIVO"
     else:
-        gratis_ok, gratis_motivo = elegivel_grupo_gratuito_v11(m, chave)
+        gratis_ok, gratis_motivo = elegivel_grupo_gratuito_v11(m, chave, score_medio)
         m.motivo_grupo_gratuito = gratis_motivo
         if gratis_ok:
             mensagem_gratis = formatar_alerta_cliente(m, score_medio, alavancagem=False)
@@ -3543,18 +3617,41 @@ async def janela_decisao(chave: str) -> None:
     await processar_alerta(alerta["alerta"])
 
 
+def auditoria_autorizada(event: events.NewMessage.Event) -> bool:
+    """V019 — restringe o comando /auditoria.
+
+    Regra segura:
+    - mensagens OUTGOING do próprio usuário são aceitas;
+    - mensagens incoming só são aceitas se chat_id ou sender_id estiver em AUDITORIA_CHAT_IDS;
+    - se AUDITORIA_CHAT_IDS estiver vazio, nenhum incoming externo recebe HTML.
+    """
+    try:
+        if bool(getattr(event, "out", False)) or bool(getattr(event, "outgoing", False)):
+            return True
+        chat_id = int(getattr(event, "chat_id", 0) or 0)
+        sender_id = int(getattr(event, "sender_id", 0) or 0)
+        if AUDITORIA_CHAT_IDS and (chat_id in AUDITORIA_CHAT_IDS or sender_id in AUDITORIA_CHAT_IDS):
+            return True
+        return False
+    except Exception:
+        return False
+
+
 async def receber_mensagem(event: events.NewMessage.Event) -> None:
     try:
         texto = event.raw_text or ""
 
-        # V15 — comando /auditoria ou "auditoria" no @ALFA_CON.
-        # Envia os HTMLs do dia atual sob demanda. Só processa se vier do canal interno.
+        # V19 — comando /auditoria restrito.
+        # Por padrão, só comando OUTGOING do próprio usuário recebe HTML.
+        # Incoming externo só recebe se chat_id/sender_id estiver em AUDITORIA_CHAT_IDS.
         texto_lower = texto.strip().lower()
         if texto_lower in ("/auditoria", "auditoria"):
             chat_id = str(getattr(event, "chat_id", ""))
-            canal_interno = str(CONFIRMATION_CHANNEL).lstrip("@")
-            # Aceita do canal interno ou de qualquer conversa onde o bot está presente.
-            log(f"📋 V15 comando auditoria | chat_id={chat_id}")
+            sender_id = str(getattr(event, "sender_id", ""))
+            if not auditoria_autorizada(event):
+                log(f"⛔ V19 auditoria bloqueada | chat_id={chat_id} | sender_id={sender_id}")
+                return
+            log(f"📋 V19 comando auditoria autorizado | chat_id={chat_id} | sender_id={sender_id}")
             hoje = datetime.now()
             enviou_algo = False
             for tipo in ("aprovados", "reprovados"):
@@ -3642,7 +3739,9 @@ async def main() -> None:
 
     @client.on(events.MessageEdited(incoming=True))
     async def handler_edit(event):
-        await receber_mensagem(event)
+        # V19 — edições da CornerPro não reprocessam alerta.
+        # Evita duplicar CSV/HTML/OpenAI quando a mensagem original é corrigida.
+        return
 
     # V16 — handler outgoing exclusivo para comando auditoria.
     # Só processa se o texto for exatamente "auditoria" ou "/auditoria".
