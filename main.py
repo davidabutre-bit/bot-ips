@@ -55,7 +55,7 @@ except Exception:  # pragma: no cover
 # VERSÃO / CONFIGURAÇÃO BASE
 # =========================================================
 
-VERSAO_COUTIPS = "ALFA_COUTIPS_2026_06_05_V23_HTML_TURBO_AUDITORIA"
+VERSAO_COUTIPS = "ALFA_COUTIPS_2026_06_05_V24_AUDITORIA_CANAL_ID"
 
 load_dotenv()
 
@@ -297,6 +297,7 @@ def logar_versao_inicial() -> None:
     log("🧱 V18 regra volume/grátis: favorito vencendo só passa em cenário EXTREMO")
     log("🧭 V20 detector estratégia robusto: VOLUME_FT não cai mais como ALFA_FT/HT")
     log("🧱 V21 VOLUME_FT: favorito vencendo por 1+ só passa em cenário EXTREMO")
+    log(f"📡 V24 handler canal auditoria: ATIVO | IDs autorizados={AUDITORIA_CHAT_IDS}")
     log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
 
@@ -3913,19 +3914,25 @@ async def janela_decisao(chave: str) -> None:
 
 
 def auditoria_autorizada(event: events.NewMessage.Event) -> bool:
-    """V019 — restringe o comando /auditoria.
+    """V24 — restringe o comando /auditoria.
 
-    Regra segura:
-    - mensagens OUTGOING do próprio usuário são aceitas;
-    - mensagens incoming só são aceitas se chat_id ou sender_id estiver em AUDITORIA_CHAT_IDS;
-    - se AUDITORIA_CHAT_IDS estiver vazio, nenhum incoming externo recebe HTML.
+    Aceita:
+    - mensagens OUTGOING do próprio usuário;
+    - qualquer mensagem cujo chat_id, sender_id ou peer_id esteja em AUDITORIA_CHAT_IDS.
+    Posts de canal chegam sem sender_id — por isso checamos peer_id também.
     """
     try:
         if bool(getattr(event, "out", False)) or bool(getattr(event, "outgoing", False)):
             return True
         chat_id = int(getattr(event, "chat_id", 0) or 0)
         sender_id = int(getattr(event, "sender_id", 0) or 0)
-        if AUDITORIA_CHAT_IDS and (chat_id in AUDITORIA_CHAT_IDS or sender_id in AUDITORIA_CHAT_IDS):
+        # peer_id para posts de canal
+        peer = getattr(event, "peer_id", None)
+        peer_id = 0
+        if peer is not None:
+            peer_id = int(getattr(peer, "channel_id", 0) or getattr(peer, "user_id", 0) or getattr(peer, "chat_id", 0) or 0)
+        ids_evento = {chat_id, sender_id, peer_id} - {0}
+        if AUDITORIA_CHAT_IDS and ids_evento & AUDITORIA_CHAT_IDS:
             return True
         return False
     except Exception:
@@ -4038,9 +4045,9 @@ async def main() -> None:
         # Evita duplicar CSV/HTML/OpenAI quando a mensagem original é corrigida.
         return
 
-    # V16 — handler outgoing exclusivo para comando auditoria.
-    # Só processa se o texto for exatamente "auditoria" ou "/auditoria".
-    # Nenhuma outra mensagem outgoing é processada.
+    # V24 — handler para comando auditoria em canal.
+    # Escuta mensagens outgoing E posts de canal (sem filtro incoming/outgoing).
+    # auditoria_autorizada() garante que só o ID autorizado recebe os HTMLs.
     @client.on(events.NewMessage(outgoing=True))
     async def handler_outgoing(event):
         try:
@@ -4048,7 +4055,17 @@ async def main() -> None:
             if texto in ("auditoria", "/auditoria"):
                 await receber_mensagem(event)
         except Exception as e:
-            log(f"⚠️ V16 handler_outgoing erro | {type(e).__name__}: {e}")
+            log(f"⚠️ V24 handler_outgoing erro | {type(e).__name__}: {e}")
+
+    @client.on(events.NewMessage(incoming=False, outgoing=False))
+    async def handler_canal(event):
+        """V24 — captura posts de canal (neither incoming nor outgoing no Telethon)."""
+        try:
+            texto = (event.raw_text or "").strip().lower()
+            if texto in ("auditoria", "/auditoria"):
+                await receber_mensagem(event)
+        except Exception as e:
+            log(f"⚠️ V24 handler_canal erro | {type(e).__name__}: {e}")
 
     log("🚀 INICIANDO BOT")
     await client.start()
