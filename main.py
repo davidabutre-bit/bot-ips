@@ -55,7 +55,7 @@ except Exception:  # pragma: no cover
 # VERSÃO / CONFIGURAÇÃO BASE
 # =========================================================
 
-VERSAO_COUTIPS = "ALFA_COUTIPS_2026_06_05_V21_VOLUME_FT_FAVORITO_VENCENDO_EXTREMO"
+VERSAO_COUTIPS = "ALFA_COUTIPS_2026_06_05_V23_HTML_TURBO_AUDITORIA"
 
 load_dotenv()
 
@@ -3392,7 +3392,19 @@ def v13_registrar(m: "Metricas", score_medio: int, aprovado: bool, motivo: str) 
 
 
 def v13_gerar_html(tipo: str, dt: Optional[datetime] = None) -> Path:
-    """Gera HTML diário a partir do JSON. Retorna o caminho do arquivo gerado."""
+    """Gera HTML diário interativo a partir do JSON.
+
+    V22 — restaura o padrão oficial de auditoria COUTIPS:
+    - botões GREEN / RED por jogo;
+    - marcação salva no próprio navegador via localStorage;
+    - contadores de marcados/greens/reds/pendentes;
+    - exportação JSON e CSV das marcações;
+    - link CornerPro preservado.
+
+    Observação: como o HTML é aberto localmente no navegador/Telegram, a marcação
+    fica salva no aparelho/navegador usado para auditar, não volta automaticamente
+    para o Railway. Para enviar resultado, usar os botões de exportação.
+    """
     dt = dt or datetime.now()
     arq_json = _v13_arquivo_json(tipo, dt)
     arq_html = _v13_arquivo_html(tipo, dt)
@@ -3407,59 +3419,182 @@ def v13_gerar_html(tipo: str, dt: Optional[datetime] = None) -> Path:
     cor = "#00c853" if tipo == "aprovados" else "#e53935"
     data_fmt = dt.strftime("%d/%m/%Y")
     total = len(registros)
+    storage_key = f"coutips_auditoria_{tipo}_{dt.strftime('%Y_%m_%d')}"
 
     linhas_html = []
-    for r in registros:
-        link = r.get("cornerpro", "")
-        link_tag = f'<a href="{html.escape(link)}" target="_blank">🔗 CornerPro</a>' if link else "—"
-        motivo_txt = f'<div class="motivo">{html.escape(str(r.get("motivo","") or ""))}</div>' if r.get("motivo") else ""
+    for i, r in enumerate(registros):
+        link = str(r.get("cornerpro", "") or "")
+        link_tag = f'<a href="{html.escape(link)}" target="_blank" rel="noopener">🔗 CornerPro</a>' if link else "—"
+        motivo_txt = f'<div class="motivo">{html.escape(str(r.get("motivo", "") or ""))}</div>' if r.get("motivo") else ""
+        bot = html.escape(str(r.get("bot", "") or ""))
+        jogo = html.escape(str(r.get("jogo", "") or ""))
+        minuto = html.escape(str(r.get("minuto", "") or ""))
+        placar = html.escape(str(r.get("placar", "") or ""))
+        score = html.escape(str(r.get("score", "") or ""))
+        liga = html.escape(str(r.get("liga", "") or ""))
+        uid_base = f"{r.get('bot','')}|{r.get('jogo','')}|{r.get('minuto','')}|{r.get('placar','')}|{r.get('score','')}|{i}"
+        uid = html.escape(remover_acentos(uid_base).lower())
         linhas_html.append(f"""
-        <div class="item">
-          <span class="badge">{html.escape(str(r.get("bot","") or ""))}</span>
-          <strong>{html.escape(str(r.get("jogo","") or ""))}</strong>
-          &nbsp;|&nbsp;⏱ {r.get("minuto","")}' &nbsp;|&nbsp; 📊 {html.escape(str(r.get("placar","") or ""))}
-          &nbsp;|&nbsp; Score: <b>{r.get("score","")}%</b>
-          &nbsp;|&nbsp; Liga: {html.escape(str(r.get("liga","") or ""))}
-          &nbsp;|&nbsp; {link_tag}
+        <div class="item" data-id="{uid}" data-bot="{bot}" data-jogo="{jogo}" data-minuto="{minuto}" data-placar="{placar}" data-score="{score}" data-liga="{liga}" data-cornerpro="{html.escape(link)}">
+          <div class="topline">
+            <span class="badge">{bot}</span>
+            <strong>{jogo}</strong>
+          </div>
+          <div class="meta">⏱ {minuto}' &nbsp;|&nbsp; 📊 {placar} &nbsp;|&nbsp; Score: <b>{score}%</b> &nbsp;|&nbsp; Liga: {liga} &nbsp;|&nbsp; {link_tag}</div>
           {motivo_txt}
+          <div class="actions">
+            <button type="button" class="btn green" onclick="marcarResultado('{uid}', 'GREEN')">✅ GREEN</button>
+            <button type="button" class="btn red" onclick="marcarResultado('{uid}', 'RED')">❌ RED</button>
+            <button type="button" class="btn clear" onclick="limparResultado('{uid}')">↩ LIMPAR</button>
+            <span class="status" id="status-{uid}">PENDENTE</span>
+          </div>
         </div>""")
 
-    corpo = "\n".join(linhas_html) if linhas_html else "<p style='color:#888'>Nenhum registro ainda.</p>"
+    corpo = "\n".join(linhas_html) if linhas_html else "<p class='vazio'>Nenhum registro ainda.</p>"
 
     conteudo = f"""<!DOCTYPE html>
 <html lang="pt-BR">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<meta name="viewport" content="width=device-width,initial-scale=1.0,user-scalable=no">
 <title>COUTIPS {titulo} — {data_fmt}</title>
 <style>
   *{{box-sizing:border-box;margin:0;padding:0}}
-  body{{font-family:system-ui,sans-serif;background:#0d0d0d;color:#e0e0e0;padding:16px}}
-  h1{{color:{cor};font-size:1.2rem;margin-bottom:4px}}
-  .sub{{color:#888;font-size:0.8rem;margin-bottom:14px}}
-  .item{{background:#181818;border-left:4px solid {cor};border-radius:6px;
-         padding:10px 12px;margin:6px 0;font-size:0.85rem;line-height:1.6}}
-  .badge{{display:inline-block;background:#1e3a5f;color:#90caf9;
-          padding:1px 7px;border-radius:10px;font-size:0.72rem;font-weight:700;margin-right:6px}}
-  .motivo{{color:#ff8a65;font-size:0.78rem;margin-top:3px}}
+  body{{font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0d0d0d;color:#e0e0e0;padding:16px;padding-bottom:90px}}
+  h1{{color:{cor};font-size:1.25rem;margin-bottom:4px}}
+  .sub{{color:#999;font-size:0.85rem;margin-bottom:12px}}
+  .toolbar{{position:sticky;top:0;z-index:20;background:#101010;border:1px solid #272727;border-radius:10px;padding:10px;margin-bottom:12px;box-shadow:0 8px 20px rgba(0,0,0,.35)}}
+  .stats{{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px}}
+  .pill{{background:#1b1b1b;border:1px solid #333;border-radius:999px;padding:5px 9px;font-size:.78rem;color:#ddd}}
+  .pill.green{{border-color:#00c853;color:#69f0ae}}
+  .pill.red{{border-color:#e53935;color:#ff8a80}}
+  .pill.pending{{border-color:#ffb300;color:#ffd54f}}
+  .item{{background:#181818;border-left:4px solid {cor};border-radius:8px;padding:11px 12px;margin:8px 0;font-size:0.88rem;line-height:1.55}}
+  .item.green-marked{{box-shadow:0 0 0 1px rgba(0,200,83,.5);border-left-color:#00c853}}
+  .item.red-marked{{box-shadow:0 0 0 1px rgba(229,57,53,.55);border-left-color:#e53935}}
+  .topline{{display:flex;align-items:center;gap:7px;flex-wrap:wrap;margin-bottom:3px}}
+  .badge{{display:inline-block;background:#1e3a5f;color:#90caf9;padding:2px 8px;border-radius:10px;font-size:0.72rem;font-weight:800}}
+  .meta{{color:#ddd}}
+  .motivo{{color:#ff8a65;font-size:0.8rem;margin-top:4px;word-break:break-word}}
   a{{color:#ffb300;text-decoration:none}}
   a:hover{{text-decoration:underline}}
+  .actions{{display:flex;gap:7px;align-items:center;flex-wrap:wrap;margin-top:10px}}
+  .btn{{border:0;border-radius:8px;padding:8px 10px;font-weight:800;font-size:.78rem;cursor:pointer;color:#fff}}
+  .btn.green{{background:#0b8f3a}}
+  .btn.red{{background:#b3261e}}
+  .btn.clear{{background:#333;color:#ddd}}
+  .btn.export{{background:#263238;color:#fff;border:1px solid #455a64}}
+  .status{{font-size:.78rem;font-weight:900;color:#ffb300;margin-left:2px}}
+  .status.green{{color:#69f0ae}}
+  .status.red{{color:#ff8a80}}
+  .vazio{{color:#888;margin-top:16px}}
 </style>
 </head>
 <body>
 <h1>📋 COUTIPS — {titulo}</h1>
 <div class="sub">{data_fmt} &nbsp;|&nbsp; {total} registro(s)</div>
+<div class="toolbar">
+  <div class="stats">
+    <span class="pill">Total: <b id="total">{total}</b></span>
+    <span class="pill green">GREEN: <b id="greens">0</b></span>
+    <span class="pill red">RED: <b id="reds">0</b></span>
+    <span class="pill pending">Pendentes: <b id="pendentes">{total}</b></span>
+  </div>
+  <div class="actions">
+    <button type="button" class="btn export" onclick="exportarJSON()">⬇ Exportar JSON</button>
+    <button type="button" class="btn export" onclick="exportarCSV()">⬇ Exportar CSV</button>
+  </div>
+</div>
 {corpo}
+<script>
+const STORAGE_KEY = {json.dumps(storage_key)};
+function carregar() {{
+  try {{ return JSON.parse(localStorage.getItem(STORAGE_KEY) || '{{}}'); }} catch(e) {{ return {{}}; }}
+}}
+function salvar(dados) {{
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(dados));
+}}
+function marcarResultado(id, resultado) {{
+  const dados = carregar();
+  dados[id] = resultado;
+  salvar(dados);
+  aplicarEstado();
+}}
+function limparResultado(id) {{
+  const dados = carregar();
+  delete dados[id];
+  salvar(dados);
+  aplicarEstado();
+}}
+function aplicarEstado() {{
+  const dados = carregar();
+  let greens = 0, reds = 0;
+  document.querySelectorAll('.item').forEach(item => {{
+    const id = item.dataset.id;
+    const res = dados[id];
+    const st = document.getElementById('status-' + id);
+    item.classList.remove('green-marked','red-marked');
+    st.classList.remove('green','red');
+    if (res === 'GREEN') {{
+      greens++; item.classList.add('green-marked'); st.textContent = '✅ GREEN'; st.classList.add('green');
+    }} else if (res === 'RED') {{
+      reds++; item.classList.add('red-marked'); st.textContent = '❌ RED'; st.classList.add('red');
+    }} else {{
+      st.textContent = 'PENDENTE';
+    }}
+  }});
+  const total = document.querySelectorAll('.item').length;
+  document.getElementById('greens').textContent = greens;
+  document.getElementById('reds').textContent = reds;
+  document.getElementById('pendentes').textContent = total - greens - reds;
+}}
+function coletarResultados() {{
+  const dados = carregar();
+  return Array.from(document.querySelectorAll('.item')).map(item => {{
+    const id = item.dataset.id;
+    return {{
+      id: id,
+      resultado: dados[id] || '',
+      bot: item.dataset.bot || '',
+      jogo: item.dataset.jogo || '',
+      minuto: item.dataset.minuto || '',
+      placar: item.dataset.placar || '',
+      score: item.dataset.score || '',
+      liga: item.dataset.liga || '',
+      cornerpro: item.dataset.cornerpro || ''
+    }};
+  }});
+}}
+function baixar(nome, conteudo, tipo) {{
+  const blob = new Blob([conteudo], {{type: tipo}});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = nome; document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+}}
+function exportarJSON() {{
+  baixar('coutips_{tipo}_{dt.strftime('%Y_%m_%d')}_resultados.json', JSON.stringify(coletarResultados(), null, 2), 'application/json;charset=utf-8');
+}}
+function csvEscape(v) {{
+  v = String(v ?? '');
+  return '"' + v.replaceAll('"', '""') + '"';
+}}
+function exportarCSV() {{
+  const rows = coletarResultados();
+  const header = ['resultado','bot','jogo','minuto','placar','score','liga','cornerpro'];
+  const csv = [header.join(',')].concat(rows.map(r => header.map(h => csvEscape(r[h])).join(','))).join('\n');
+  baixar('coutips_{tipo}_{dt.strftime('%Y_%m_%d')}_resultados.csv', csv, 'text/csv;charset=utf-8');
+}}
+aplicarEstado();
+</script>
 </body>
 </html>"""
 
     try:
         arq_html.write_text(conteudo, encoding="utf-8")
-        log(f"📄 V13 HTML gerado | {arq_html.name} | {total} registros")
+        log(f"📄 V22 HTML interativo gerado | {arq_html.name} | {total} registros")
     except Exception as e:
         log(f"⚠️ V13 gerar_html erro | {type(e).__name__}: {e}")
     return arq_html
-
 
 async def v13_enviar_htmls_telegram() -> None:
     """Envia os HTMLs de aprovados e reprovados do dia anterior para @ALFA_CON às 00:05."""
