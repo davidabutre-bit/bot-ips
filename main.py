@@ -55,7 +55,7 @@ except Exception:  # pragma: no cover
 # VERSÃO / CONFIGURAÇÃO BASE
 # =========================================================
 
-VERSAO_COUTIPS = "ALFA_COUTIPS_2026_06_05_V15_COMANDO_AUDITORIA"
+VERSAO_COUTIPS = "ALFA_COUTIPS_2026_06_05_V16_AUDITORIA_OUTGOING"
 
 load_dotenv()
 
@@ -246,6 +246,7 @@ def logar_versao_inicial() -> None:
     log(f"📄 V13 auditoria HTML automática: {'ATIVA' if HABILITAR_V13_AUDITORIA_HTML else 'DESATIVADA'} | dir={_data_dir()}")
     log(f"🔊 V14 VOLUME_FT: {'ATIVO' if HABILITAR_VOLUME_FT else 'DESATIVADO'}")
     log(f"📋 V15 comando auditoria: ATIVO | /auditoria ou 'auditoria' no canal interno")
+    log(f"📤 V16 handler outgoing: ATIVO | exclusivo para comando auditoria")
     log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
 
@@ -3599,6 +3600,18 @@ async def main() -> None:
     @client.on(events.MessageEdited(incoming=True))
     async def handler_edit(event):
         await receber_mensagem(event)
+
+    # V16 — handler outgoing exclusivo para comando auditoria.
+    # Só processa se o texto for exatamente "auditoria" ou "/auditoria".
+    # Nenhuma outra mensagem outgoing é processada.
+    @client.on(events.NewMessage(outgoing=True))
+    async def handler_outgoing(event):
+        try:
+            texto = (event.raw_text or "").strip().lower()
+            if texto in ("auditoria", "/auditoria"):
+                await receber_mensagem(event)
+        except Exception as e:
+            log(f"⚠️ V16 handler_outgoing erro | {type(e).__name__}: {e}")
 
     log("🚀 INICIANDO BOT")
     await client.start()
