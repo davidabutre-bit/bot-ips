@@ -55,7 +55,7 @@ except Exception:  # pragma: no cover
 # VERSÃO / CONFIGURAÇÃO BASE
 # =========================================================
 
-VERSAO_COUTIPS = "ALFA_COUTIPS_2026_06_05_V16_AUDITORIA_OUTGOING"
+VERSAO_COUTIPS = "ALFA_COUTIPS_2026_06_05_V17_PERSISTENCIA_CONTADORES_GRATIS"
 
 load_dotenv()
 
@@ -204,9 +204,45 @@ pendentes_confirmacao_ft: Dict[str, Dict[str, Any]] = {}
 tarefas_timeout_confirmacao_ft: Dict[str, asyncio.Task] = {}
 
 # V011 — estado do grupo grátis.
-# Contadores por janela não acumulam e reiniciam automaticamente pela data/janela.
+# V017 — contadores e cooldowns persistidos em JSON para sobreviver a restarts.
 v11_gratis_contadores: Dict[str, int] = {}
 v11_gratis_enviados_por_jogo: Dict[str, float] = {}
+
+_V17_ESTADO_FILE = "v17_gratis_estado.json"
+
+
+def _v17_estado_path() -> Path:
+    """Caminho do arquivo de estado persistente — usa /data ou fallback local."""
+    return _data_dir() / _V17_ESTADO_FILE
+
+
+def v17_carregar_estado() -> None:
+    """Carrega contadores e cooldowns do JSON ao iniciar/reiniciar."""
+    global v11_gratis_contadores, v11_gratis_enviados_por_jogo
+    try:
+        p = _v17_estado_path()
+        if not p.exists():
+            log("📂 V17 estado grátis: arquivo não encontrado, iniciando zerado")
+            return
+        dados = json.loads(p.read_text(encoding="utf-8"))
+        v11_gratis_contadores = {k: int(v) for k, v in dados.get("contadores", {}).items()}
+        v11_gratis_enviados_por_jogo = {k: float(v) for k, v in dados.get("cooldowns", {}).items()}
+        log(f"📂 V17 estado grátis carregado | contadores={len(v11_gratis_contadores)} | cooldowns={len(v11_gratis_enviados_por_jogo)}")
+    except Exception as e:
+        log(f"⚠️ V17 carregar_estado erro | {type(e).__name__}: {e}")
+
+
+def v17_salvar_estado() -> None:
+    """Persiste contadores e cooldowns imediatamente após cada envio."""
+    try:
+        dados = {
+            "contadores": dict(v11_gratis_contadores),
+            "cooldowns": dict(v11_gratis_enviados_por_jogo),
+            "atualizado_em": datetime.now().isoformat(),
+        }
+        _v17_estado_path().write_text(json.dumps(dados, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:
+        log(f"⚠️ V17 salvar_estado erro | {type(e).__name__}: {e}")
 
 
 # =========================================================
@@ -247,6 +283,7 @@ def logar_versao_inicial() -> None:
     log(f"🔊 V14 VOLUME_FT: {'ATIVO' if HABILITAR_VOLUME_FT else 'DESATIVADO'}")
     log(f"📋 V15 comando auditoria: ATIVO | /auditoria ou 'auditoria' no canal interno")
     log(f"📤 V16 handler outgoing: ATIVO | exclusivo para comando auditoria")
+    log(f"💾 V17 persistência contadores grátis: ATIVA | arquivo={_V17_ESTADO_FILE}")
     log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
 
@@ -355,10 +392,14 @@ def limpar_memoria_interna() -> None:
             locks_por_jogo.pop(k, None)
 
     # V011 — limpeza do cooldown do grupo grátis.
+    removidos = 0
     for k in list(v11_gratis_enviados_por_jogo.keys()):
         ts = float(v11_gratis_enviados_por_jogo.get(k, 0) or 0)
         if agora - ts > V11_FREE_COOLDOWN_JOGO_HORAS * 3600:
             v11_gratis_enviados_por_jogo.pop(k, None)
+            removidos += 1
+    if removidos > 0:
+        v17_salvar_estado()  # V17 — persiste após limpeza de expirados
 
     # Pendências FT precisam durar mais que a janela curta, pois aguardam confirmação até ~81/82.
     for k in list(pendentes_confirmacao_ft.keys()):
@@ -2424,6 +2465,7 @@ def marcar_envio_gratis_v11(chave_jogo: str) -> None:
     chave_janela = chave_contador_gratis_v11(janela)
     v11_gratis_contadores[chave_janela] = int(v11_gratis_contadores.get(chave_janela, 0)) + 1
     v11_gratis_enviados_por_jogo[chave_jogo] = time.time()
+    v17_salvar_estado()  # V17 — persiste imediatamente após envio real confirmado
 
 
 def jogo_em_cooldown_gratis_v11(chave_jogo: str) -> bool:
@@ -3587,6 +3629,7 @@ async def main() -> None:
     global tarefa_envio
     logar_versao_inicial()
     garantir_csv()
+    v17_carregar_estado()  # V17 — carrega contadores e cooldowns do disco ao iniciar
 
     tarefa_envio = asyncio.create_task(trabalhador_fila_envio())
     asyncio.create_task(watchdog())
