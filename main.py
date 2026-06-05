@@ -55,7 +55,7 @@ except Exception:  # pragma: no cover
 # VERSÃO / CONFIGURAÇÃO BASE
 # =========================================================
 
-VERSAO_COUTIPS = "ALFA_COUTIPS_2026_06_04_V14_VOLUME_FT"
+VERSAO_COUTIPS = "ALFA_COUTIPS_2026_06_05_V15_COMANDO_AUDITORIA"
 
 load_dotenv()
 
@@ -245,6 +245,7 @@ def logar_versao_inicial() -> None:
     log(f"➕ V12_2 bônus HT super favorito vencendo por 1: {'ATIVO' if HABILITAR_HT_BONUS_SUPER_FAV_VENCENDO else 'DESATIVADO'}")
     log(f"📄 V13 auditoria HTML automática: {'ATIVA' if HABILITAR_V13_AUDITORIA_HTML else 'DESATIVADA'} | dir={_data_dir()}")
     log(f"🔊 V14 VOLUME_FT: {'ATIVO' if HABILITAR_VOLUME_FT else 'DESATIVADO'}")
+    log(f"📋 V15 comando auditoria: ATIVO | /auditoria ou 'auditoria' no canal interno")
     log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
 
@@ -3502,6 +3503,37 @@ async def janela_decisao(chave: str) -> None:
 async def receber_mensagem(event: events.NewMessage.Event) -> None:
     try:
         texto = event.raw_text or ""
+
+        # V15 — comando /auditoria ou "auditoria" no @ALFA_CON.
+        # Envia os HTMLs do dia atual sob demanda. Só processa se vier do canal interno.
+        texto_lower = texto.strip().lower()
+        if texto_lower in ("/auditoria", "auditoria"):
+            chat_id = str(getattr(event, "chat_id", ""))
+            canal_interno = str(CONFIRMATION_CHANNEL).lstrip("@")
+            # Aceita do canal interno ou de qualquer conversa onde o bot está presente.
+            log(f"📋 V15 comando auditoria | chat_id={chat_id}")
+            hoje = datetime.now()
+            enviou_algo = False
+            for tipo in ("aprovados", "reprovados"):
+                arq_json = _v13_arquivo_json(tipo, hoje)
+                arq_html = _v13_arquivo_html(tipo, hoje)
+                if arq_json.exists():
+                    v13_gerar_html(tipo, hoje)
+                if arq_html.exists():
+                    try:
+                        await client.send_file(
+                            event.chat_id,
+                            str(arq_html),
+                            caption=f"📋 COUTIPS {tipo.upper()} — {hoje.strftime('%d/%m/%Y')} (sob demanda)",
+                        )
+                        enviou_algo = True
+                        await asyncio.sleep(1)
+                    except Exception as e:
+                        log(f"⚠️ V15 envio auditoria erro | {tipo} | {e}")
+            if not enviou_algo:
+                await client.send_message(event.chat_id, "📋 Nenhum registro de auditoria para hoje ainda.")
+            return
+
         if not mensagem_valida(texto):
             return
 
