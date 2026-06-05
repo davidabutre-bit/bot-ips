@@ -55,7 +55,7 @@ except Exception:  # pragma: no cover
 # VERSÃO / CONFIGURAÇÃO BASE
 # =========================================================
 
-VERSAO_COUTIPS = "ALFA_COUTIPS_2026_06_05_V19_AUDITORIA_RESTRITA_EDIT_IGNORADO"
+VERSAO_COUTIPS = "ALFA_COUTIPS_2026_06_05_V21_VOLUME_FT_FAVORITO_VENCENDO_EXTREMO"
 
 load_dotenv()
 
@@ -295,6 +295,8 @@ def logar_versao_inicial() -> None:
     log(f"📤 V16 handler outgoing: ATIVO | exclusivo para comando auditoria")
     log(f"💾 V17 persistência contadores grátis: ATIVA | arquivo={_V17_ESTADO_FILE}")
     log("🧱 V18 regra volume/grátis: favorito vencendo só passa em cenário EXTREMO")
+    log("🧭 V20 detector estratégia robusto: VOLUME_FT não cai mais como ALFA_FT/HT")
+    log("🧱 V21 VOLUME_FT: favorito vencendo por 1+ só passa em cenário EXTREMO")
     log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
 
@@ -522,52 +524,111 @@ class Alerta:
 # DETECÇÃO / PARSER
 # =========================================================
 
-def detectar_estrategia(texto: str) -> str:
-    """Detecta estratégias antigas e novas da CornerPro.
+def contem_volume_ft_bruto(texto: str) -> bool:
+    """Detector defensivo de VOLUME_FT no texto bruto/cabeçalho.
 
-    Mantém compatibilidade com nomes históricos usados no projeto:
-    ARCE_HT, CHAMA_FT, BOT_HT/FT, HT/FT_PREMIUM, HT/FT_MODERADO,
-    IPS HT/FT, POS-70 e confirmações.
+    Aceita VOLUME_FT, VOLUME FT, VOLUME-FT, VOLUMEFT, BOT_VOLUME_FT.
+    Usado em duas camadas: detector principal e fail-safe antes do processamento.
     """
-    t = remover_acentos(texto).upper()
-    t = re.sub(r"\s+", " ", t)
+    raw = remover_acentos(texto or "").upper()
+    primeiros = raw[:350].replace("_", " ")
+    compacto = re.sub(r"[^A-Z0-9]+", "", primeiros)
+    return bool(
+        "VOLUMEFT" in compacto
+        or "BOTVOLUMEFT" in compacto
+        or re.search(r"\b(?:BOT\s*)?VOLUME\s*[-_ ]*\s*FT\b", primeiros)
+    )
 
-    # Confirmações sempre têm prioridade.
-    if "BOT_HT CONFIRMACAO" in t or "HT CONFIRMACAO" in t or "HT CONFIRMAÇÃO" in t or "ALFA HT CONFIRMACAO" in t:
-        return "ALFA_HT_CONFIRMACAO"
-    if "BOT_FT CONFIRMACAO" in t or "FT CONFIRMACAO" in t or "FT CONFIRMAÇÃO" in t or "ALFA FT CONFIRMACAO" in t:
-        return "ALFA_FT_CONFIRMACAO"
 
-    # V014 — radar interno VOLUME_FT. Detectado antes dos radares canônicos.
-    if "VOLUME_FT" in t:
+def detectar_estrategia(texto: str) -> str:
+    """Detecta a estratégia de forma robusta, priorizando a linha do bot.
+
+    V20 — correção crítica:
+    - normalizar() remove underscore, então VOLUME_FT podia virar VOLUMEFT;
+    - a presença de "Intervalo" no alerta podia empurrar fallback para HT;
+    - agora o detector lê primeiro a linha "Alerta Estratégia" e usa uma
+      versão compacta sem espaços/underscore/hífen para reconhecer variações.
+
+    Exemplos aceitos para Volume:
+    VOLUME_FT, VOLUME FT, VOLUME-FT, VOLUMEFT, BOT_VOLUME_FT, BOT VOLUME FT.
+    """
+    raw = remover_acentos(texto or "").upper()
+    raw = raw.replace("_", " ")
+    raw = re.sub(r"\s+", " ", raw)
+
+    # Usa primeiro a linha/cabeçalho da estratégia, para não confundir com
+    # "Intervalo", "1ºP", "2ºP" ou outros termos do corpo do alerta.
+    estrategia_txt = raw
+    m = re.search(
+        r"ALERTA\s+ESTRATEGIA\s*:\s*(.*?)(?:\s+JOGO\s*:|\s+COMPETICAO\s*:|\s+TEMPO\s*:|$)",
+        raw,
+        re.IGNORECASE,
+    )
+    if m and m.group(1).strip():
+        estrategia_txt = m.group(1).strip()
+
+    # Remove emojis/símbolos e deixa só letras/números para matching definitivo.
+    compacto = re.sub(r"[^A-Z0-9]+", "", estrategia_txt)
+    compacto_full = re.sub(r"[^A-Z0-9]+", "", raw)
+
+    # V20 — VOLUME_FT tem prioridade absoluta antes de HT/FT normal.
+    # Isso evita VOLUME_FT cair em ALFA_HT/ALFA_FT por causa de underscore removido
+    # ou por causa do texto "Intervalo" no corpo do alerta.
+    if contem_volume_ft_bruto(estrategia_txt) or contem_volume_ft_bruto(raw[:350]):
         return "VOLUME_FT"
 
+    # Confirmações têm prioridade depois de Volume.
+    if (
+        "BOTHTCONFIRMACAO" in compacto
+        or "HTCONFIRMACAO" in compacto
+        or "ALFAHTCONFIRMACAO" in compacto
+    ):
+        return "ALFA_HT_CONFIRMACAO"
+    if (
+        "BOTFTCONFIRMACAO" in compacto
+        or "FTCONFIRMACAO" in compacto
+        or "ALFAFTCONFIRMACAO" in compacto
+    ):
+        return "ALFA_FT_CONFIRMACAO"
+
     # Radares canônicos.
-    if "ARCE_HT" in t or "ARCE HT" in t or " ARCE " in t:
+    if "ARCEHT" in compacto or compacto == "ARCE":
         return "ARCE_HT"
-    if "CHAMA_FT" in t or "CHAMA FT" in t or " CHAMA " in t:
+    if "CHAMAFT" in compacto or compacto == "CHAMA":
         return "CHAMA_FT"
 
     # Nomes antigos/variações de HT.
     if (
-        "BOT_HT" in t or "BOT HT" in t or "HT_PREMIUM" in t or "HT PREMIUM" in t
-        or "HT_PREMIUN" in t or "HT_MODERADO" in t or "HT MODERADO" in t
-        or "IPS HT" in t or "ALFA HT" in t
-        or "PRIMEIRO TEMPO" in t or "1ºT" in t or "1T" in t
+        "BOTHT" in compacto
+        or "HTPREMIUM" in compacto
+        or "HTPREMIUN" in compacto
+        or "HTMODERADO" in compacto
+        or "IPSHT" in compacto
+        or "ALFAHT" in compacto
+        or "PRIMEIROTEMPO" in compacto
+        or compacto in {"HT", "1T"}
     ):
         return "ALFA_HT"
 
     # Nomes antigos/variações de FT.
     if (
-        "BOT_FT" in t or "BOT FT" in t or "FT_PREMIUM" in t or "FT PREMIUM" in t
-        or "FT_PREMIUN" in t or "FT_MODERADO" in t or "FT MODERADO" in t
-        or "IPS FT" in t or "POS-70" in t or "POS 70" in t or "PÓS-70" in t
-        or "ALFA FT" in t or "SEGUNDO TEMPO" in t or "2ºT" in t or "2T" in t
+        "BOTFT" in compacto
+        or "FTPREMIUM" in compacto
+        or "FTPREMIUN" in compacto
+        or "FTMODERADO" in compacto
+        or "IPSFT" in compacto
+        or "POS70" in compacto
+        or "ALFAFT" in compacto
+        or "SEGUNDOTEMPO" in compacto
+        or compacto in {"FT", "2T"}
     ):
         return "ALFA_FT"
 
-    # Fallback: sinais com intervalo costumam ser HT; caso contrário FT.
-    if "INTERVALO" in t and "SEGUNDO TEMPO" not in t:
+    # Fallback por período só no texto completo, como último recurso.
+    # Não usa "Intervalo" para forçar HT se o minuto depois corrigir para FT.
+    if "SEGUNDOTEMPO" in compacto_full or "2T" in compacto_full:
+        return "ALFA_FT"
+    if "PRIMEIROTEMPO" in compacto_full or "1T" in compacto_full:
         return "ALFA_HT"
     return "ALFA_FT"
 
@@ -3018,13 +3079,105 @@ def timeout_confirmacao_segundos(m: Metricas) -> int:
 # Não toca: score, IA, CHAMA, ARCE, HT, FT principal, grupo grátis, alavancagem, V13 HTML.
 # =========================================================
 
+def volume_ft_favorito_vencendo_extremo_v21(m: "Metricas") -> Tuple[bool, str]:
+    """V21 — exceção raríssima do VOLUME_FT para favorito já vencendo.
+
+    Regra oficial do bot Volume:
+    - favorito empatando ou perdendo segue para os filtros normais;
+    - favorito vencendo por 1 ou mais gols só passa se o jogo estiver
+      EXTREMAMENTE vivo e o favorito ainda estiver amassando agora;
+    - AP acumulado não basta; precisa pressão recente + finalização real + IP +
+      domínio do lado certo.
+
+    Esta função é usada somente na porta VOLUME_FT. Não altera score geral,
+    ALFA_FT, CHAMA_FT, HT, IA nem grupo grátis.
+    """
+    fav = m.lado_favorito
+    if fav not in {"CASA", "FORA"}:
+        return False, "V21_SEM_FAVORITO"
+    if lado_vencendo(m) != fav:
+        return False, "V21_FAVORITO_NAO_VENCE"
+    if fav != m.lado_pressionante:
+        return False, "V21_FAVORITO_VENCE_MAS_NAO_E_PRESSIONANTE"
+
+    gc, gf = extrair_gols_placar(m.placar)
+    if gc is None or gf is None:
+        return False, "V21_PLACAR_INVALIDO"
+    gols_fav = gc if fav == "CASA" else gf
+    gols_adv = gf if fav == "CASA" else gc
+    diff = gols_fav - gols_adv
+    if diff <= 0:
+        return False, "V21_FAVORITO_NAO_ESTA_VENCENDO"
+
+    # Gol de vantagem recente do favorito tende a ser pressão premiada.
+    if m.ultimo_gol and m.ultimo_gol_lado == fav and minutos_desde_ultimo_gol(m) < V11_FREE_GOL_VANTAGEM_MIN:
+        return False, f"V21_GOL_VANTAGEM_RECENTE_{minutos_desde_ultimo_gol(m)}MIN"
+
+    d = dados_lado(m, fav)
+    op = lado_oposto(fav)
+    od = dados_lado(m, op)
+    ip = ip_lado(m, fav)
+    ap_diff = ap_diff_lado(m, fav)
+
+    # O favorito precisa estar melhor AGORA, não só no acumulado.
+    recente_dominante = d["u5"] > od["u5"] and d["u10"] > od["u10"]
+
+    if diff == 1:
+        pressao_absurda = (
+            d["u5"] >= 6
+            and d["u10"] >= 12
+            and ap_diff >= 30
+            and recente_dominante
+            and (ip["pico"] >= 26 or ip["c18"] >= 3 or ip["c22"] >= 2)
+        )
+        dominio_convertivel_absurdo = (
+            d["rb"] >= 3
+            or d["chance"] >= 14
+            or d["xg"] >= 0.70
+            or (d["rl"] >= 9 and d["cantos"] >= 4)
+        )
+    else:
+        # Vencendo por 2+ precisa ser ainda mais raro. Só libera quando parece
+        # massacre vivo/colapso do adversário, não placar confortável.
+        pressao_absurda = (
+            d["u5"] >= 7
+            and d["u10"] >= 14
+            and ap_diff >= 38
+            and recente_dominante
+            and (ip["pico"] >= 28 or ip["c18"] >= 4 or ip["c22"] >= 3)
+        )
+        dominio_convertivel_absurdo = (
+            d["rb"] >= 4
+            or d["chance"] >= 17
+            or d["xg"] >= 0.90
+            or (d["rl"] >= 11 and d["cantos"] >= 5)
+        )
+
+    if pressao_absurda and dominio_convertivel_absurdo:
+        return True, (
+            f"V21_FAVORITO_VENCENDO_{diff}_MAS_EXTREMO|"
+            f"ap_diff={ap_diff}|u5={d['u5']}x{od['u5']}|u10={d['u10']}x{od['u10']}|"
+            f"rb={d['rb']}|rl={d['rl']}|cantos={d['cantos']}|chance={d['chance']}|"
+            f"xg={d['xg']:.2f}|ip={ip['pico']}|diff={diff}"
+        )
+
+    return False, (
+        f"V21_FAVORITO_VENCENDO_{diff}_SEM_EXTREMO|"
+        f"pressao_absurda={pressao_absurda}|dominio_absurdo={dominio_convertivel_absurdo}|"
+        f"recente_dominante={recente_dominante}|ap_diff={ap_diff}|"
+        f"u5={d['u5']}x{od['u5']}|u10={d['u10']}x{od['u10']}|"
+        f"rb={d['rb']}|rl={d['rl']}|cantos={d['cantos']}|chance={d['chance']}|"
+        f"xg={d['xg']:.2f}|ip={ip['pico']}|diff={diff}"
+    )
+
+
 def _volume_ft_contexto_placar_prioritario(m: "Metricas") -> Tuple[bool, str]:
-    """V18 — regra de placar do VOLUME_FT.
+    """V21 — regra de placar do VOLUME_FT.
 
     Prioridade do bot volume:
     - favorito empatando ou perdendo = pode seguir para os próximos filtros;
-    - favorito vencendo = bloqueia, exceto se vencer por 1 em cenário EXTREMO;
-    - favorito vencendo por 2+ = bloqueio direto.
+    - favorito vencendo por 1+ = bloqueia, exceto em cenário EXTREMO real;
+    - válido somente para VOLUME_FT, sem alterar score geral.
     """
     fav = m.lado_favorito
     if fav not in {"CASA", "FORA"}:
@@ -3039,13 +3192,10 @@ def _volume_ft_contexto_placar_prioritario(m: "Metricas") -> Tuple[bool, str]:
     if gols_fav <= gols_adv:
         return True, "VOLUME_FT_FAVORITO_EMPATANDO_OU_PERDENDO"
 
-    if gols_fav - gols_adv > 1:
-        return False, f"VOLUME_FT_FAVORITO_VENCENDO_MAIS_DE_1_{gols_fav}x{gols_adv}"
-
-    ok_extremo, motivo_extremo = favorito_vencendo_por_um_extremo_v18(m, score=0)
+    ok_extremo, motivo_extremo = volume_ft_favorito_vencendo_extremo_v21(m)
     if ok_extremo:
-        return True, "VOLUME_FT_FAVORITO_VENCE_1_EXTREMO|" + motivo_extremo
-    return False, "VOLUME_FT_FAVORITO_VENCE_1_BLOQUEADO|" + motivo_extremo
+        return True, "VOLUME_FT_FAVORITO_VENCENDO_EXTREMO|" + motivo_extremo
+    return False, "VOLUME_FT_FAVORITO_VENCENDO_BLOQUEADO|" + motivo_extremo
 
 def _volume_ft_gol_recente_ok(m: "Metricas") -> Tuple[bool, str]:
     """Só bloqueia gol recente se colocou o favorito vencendo.
@@ -3404,6 +3554,16 @@ async def registrar_bloqueio_fluxo(m: Metricas, motivo: str, decisao: str = "REP
 async def processar_alerta(alerta: Alerta) -> None:
     m = alerta.metricas
     chave = alerta.chave_jogo
+
+    # V20 — fail-safe definitivo: se o texto bruto diz VOLUME_FT, mas qualquer
+    # etapa anterior classificou como ALFA_HT/ALFA_FT, força VOLUME_FT antes
+    # de passar pelo score. Isso impede que Volume caia no fluxo normal.
+    if contem_volume_ft_bruto(m.texto_bruto) and m.estrategia != "VOLUME_FT":
+        antigo = m.estrategia
+        m.estrategia = "VOLUME_FT"
+        m.parser_observacoes.append(f"V20_FORCE_VOLUME_FT:{antigo}->VOLUME_FT")
+        preencher_contexto_calculado(m)
+        log(f"🧭 V20 FORCE_VOLUME_FT | {antigo}->VOLUME_FT | {m.jogo} | {m.tempo}'")
 
     # =====================================================
     # V007 — bloqueios e roteamentos antes do score/IA
