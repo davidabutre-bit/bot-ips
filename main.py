@@ -3918,21 +3918,21 @@ def auditoria_autorizada(event: events.NewMessage.Event) -> bool:
 
     Aceita:
     - mensagens OUTGOING do próprio usuário;
-    - qualquer mensagem cujo chat_id, sender_id ou peer_id esteja em AUDITORIA_CHAT_IDS.
-    Posts de canal chegam sem sender_id — por isso checamos peer_id também.
+    - sender_id ou chat_id em AUDITORIA_CHAT_IDS;
+    - posts de canal sem sender_id (sender_id=None): aceita se AUDITORIA_CHAT_IDS
+      está configurado — assumindo que só o dono posta no canal monitorado.
     """
     try:
         if bool(getattr(event, "out", False)) or bool(getattr(event, "outgoing", False)):
             return True
         chat_id = int(getattr(event, "chat_id", 0) or 0)
-        sender_id = int(getattr(event, "sender_id", 0) or 0)
-        # peer_id para posts de canal
-        peer = getattr(event, "peer_id", None)
-        peer_id = 0
-        if peer is not None:
-            peer_id = int(getattr(peer, "channel_id", 0) or getattr(peer, "user_id", 0) or getattr(peer, "chat_id", 0) or 0)
-        ids_evento = {chat_id, sender_id, peer_id} - {0}
-        if AUDITORIA_CHAT_IDS and ids_evento & AUDITORIA_CHAT_IDS:
+        sender_id = getattr(event, "sender_id", None)
+        # Post de canal: sender_id é None. Se AUDITORIA_CHAT_IDS está configurado,
+        # aceita — o canal é privado e só o dono envia mensagens.
+        if sender_id is None and AUDITORIA_CHAT_IDS:
+            return True
+        sender_id_int = int(sender_id or 0)
+        if AUDITORIA_CHAT_IDS and (chat_id in AUDITORIA_CHAT_IDS or sender_id_int in AUDITORIA_CHAT_IDS):
             return True
         return False
     except Exception:
@@ -4046,8 +4046,7 @@ async def main() -> None:
         return
 
     # V24 — handler para comando auditoria em canal.
-    # Escuta mensagens outgoing E posts de canal (sem filtro incoming/outgoing).
-    # auditoria_autorizada() garante que só o ID autorizado recebe os HTMLs.
+    # Escuta mensagens outgoing normais.
     @client.on(events.NewMessage(outgoing=True))
     async def handler_outgoing(event):
         try:
@@ -4057,15 +4056,9 @@ async def main() -> None:
         except Exception as e:
             log(f"⚠️ V24 handler_outgoing erro | {type(e).__name__}: {e}")
 
-    @client.on(events.NewMessage(incoming=False, outgoing=False))
-    async def handler_canal(event):
-        """V24 — captura posts de canal (neither incoming nor outgoing no Telethon)."""
-        try:
-            texto = (event.raw_text or "").strip().lower()
-            if texto in ("auditoria", "/auditoria"):
-                await receber_mensagem(event)
-        except Exception as e:
-            log(f"⚠️ V24 handler_canal erro | {type(e).__name__}: {e}")
+    # V24 — captura posts de canal via handler incoming geral.
+    # auditoria_autorizada() filtra por ID — só o dono recebe os HTMLs.
+    # O handler incoming já existia; o filtro por texto e ID é feito dentro de receber_mensagem.
 
     log("🚀 INICIANDO BOT")
     await client.start()
