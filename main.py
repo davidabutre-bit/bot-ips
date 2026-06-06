@@ -55,7 +55,7 @@ except Exception:  # pragma: no cover
 # VERSÃO / CONFIGURAÇÃO BASE
 # =========================================================
 
-VERSAO_COUTIPS = "ALFA_COUTIPS_2026_06_05_V24_AUDITORIA_CANAL_ID"
+VERSAO_COUTIPS = "ALFA_COUTIPS_2026_06_06_V25_FIXES_LINK_HTML_HT_ALAVANCAGEM"
 
 load_dotenv()
 
@@ -298,6 +298,7 @@ def logar_versao_inicial() -> None:
     log("🧭 V20 detector estratégia robusto: VOLUME_FT não cai mais como ALFA_FT/HT")
     log("🧱 V21 VOLUME_FT: favorito vencendo por 1+ só passa em cenário EXTREMO")
     log(f"📡 V24 handler canal auditoria: ATIVO | IDs autorizados={AUDITORIA_CHAT_IDS}")
+    log("🔧 V25 fixes: link CornerPro, botões HTML, HT duplicado, alavancagem HT restrita")
     log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
 
@@ -909,11 +910,14 @@ def extrair_ultimos_cantos_lados(texto: str) -> List[Tuple[int, str]]:
 def extrair_links(texto: str) -> Tuple[str, str]:
     bet365 = ""
     corner = ""
-    for link in re.findall(r"https?://[^\s*]+", texto, re.IGNORECASE):
+    # V25 — separa links colados antes do regex (ex: "rnkjghttps://")
+    texto_sep = re.sub(r"(https?://)", r" \1", texto)
+    for link in re.findall(r"https?://[^\s]+", texto_sep, re.IGNORECASE):
+        link = link.strip().rstrip(".")
         if "bet365" in link.lower() and not bet365:
-            bet365 = link.strip()
+            bet365 = link
         if "cornerprobet" in link.lower() and "/analysis/" in link.lower() and not corner:
-            corner = link.strip()
+            corner = link
     return bet365, corner
 
 
@@ -2728,10 +2732,20 @@ def selo_alavancagem_v11(m: Metricas, score: int) -> Tuple[bool, str]:
     pilares_ok, pilares_motivo = tres_pilares_estilo_v11(m, lado)
 
     if eh_ht(m.estrategia):
+        # V25 — HT: alavancagem só se favorito estiver PERDENDO (não empatando)
+        # e for massacre extremo. Contexto de desespero real.
+        gc, gf = extrair_gols_placar(m.placar)
+        if gc is None or gf is None:
+            return False, "HT_PLACAR_INVALIDO"
+        gols_fav = gc if fav == "CASA" else gf
+        gols_adv = gf if fav == "CASA" else gc
+        if gols_fav >= gols_adv:
+            return False, f"HT_FAVORITO_NAO_PERDE | {m.placar}"
         massacre_ok, massacre_motivo = massacre_contextual_ht(m, lado, pos_gol_recente=False)
-        if massacre_ok and (pilares_ok or d["rb"] >= 3 or ip["pico"] >= 26):
-            return True, "HT_MASSACRE_ALFA|" + massacre_motivo + "|" + pilares_motivo
-        return False, "HT_SEM_MASSACRE_ALFA|" + massacre_motivo + "|" + pilares_motivo
+        # Exige massacre E pilares — critério mais rígido que antes.
+        if massacre_ok and pilares_ok:
+            return True, "HT_MASSACRE_ALFA_FAV_PERDENDO|" + massacre_motivo + "|" + pilares_motivo
+        return False, "HT_SEM_CONDICAO_ALAVANCAGEM|" + massacre_motivo + "|" + pilares_motivo
 
     pressao_extrema = pressao_extrema_lado(m, lado) or (d["u5"] >= 5 and d["u10"] >= 10 and ip["pico"] >= 22)
     dominio_convertivel = d["rb"] >= 2 or d["chance"] >= 10 or d["xg"] >= 0.50
@@ -3655,6 +3669,10 @@ def chave_alerta_unica(texto: str) -> str:
     tempo = extrair_tempo(limpo)
     resultado = extrair_resultado(limpo)
     estrategia = detectar_estrategia(limpo)
+    # V25 — HT: chave sem minuto para bloquear mesmo jogo em minutos diferentes.
+    # FT mantém minuto na chave porque tem bot de confirmação (dois alertas válidos).
+    if eh_ht(estrategia):
+        return f"{normalizar_chave_jogo(jogo)}|{estrategia}|{resultado}"
     return f"{normalizar_chave_jogo(jogo)}|{estrategia}|{tempo}|{resultado}"
 
 
