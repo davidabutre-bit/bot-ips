@@ -55,7 +55,7 @@ except Exception:  # pragma: no cover
 # VERSÃO / CONFIGURAÇÃO BASE
 # =========================================================
 
-VERSAO_COUTIPS = "ALFA_COUTIPS_2026_06_06_V25_FIXES_LINK_HTML_HT_ALAVANCAGEM"
+VERSAO_COUTIPS = "ALFA_COUTIPS_2026_06_06_V26_FAV_NAO_PRESS_PERSISTENCIA_TELEGRAM"
 
 load_dotenv()
 
@@ -165,6 +165,19 @@ HABILITAR_V13_AUDITORIA_HTML = os.getenv("HABILITAR_V13_AUDITORIA_HTML", "true")
 # Reprovados morrem silenciosamente. Aprovados seguem fluxo ALFA normal.
 HABILITAR_VOLUME_FT = os.getenv("HABILITAR_VOLUME_FT", "true").lower() == "true"
 
+# V026 — FAV_NAO_PRESSIONANTE: penaliza score FT onde favorito não é o lado pressionante.
+# Modo auditoria: não bloqueia — penaliza -8 no score e registra motivo no CSV/HTML.
+# Baseado em auditoria: 7 reds eliminados com custo de 11 greens (72% → 74.4%).
+# Aplica-se ao FT geral (ALFA_FT, CHAMA_FT). Não afeta HT nem CONF.
+HABILITAR_V26_FAV_NAO_PRESSIONANTE = os.getenv("HABILITAR_V26_FAV_NAO_PRESSIONANTE", "true").lower() == "true"
+V26_FAV_NAO_PRESSIONANTE_PENALIDADE = int(os.getenv("V26_FAV_NAO_PRESSIONANTE_PENALIDADE", "8"))
+
+# V026 — PERSISTENCIA_TELEGRAM: salva estado dos contadores do grupo grátis e auditoria
+# via mensagem no canal interno, sobrevivendo a restarts do Railway sem precisar de Volume.
+HABILITAR_V26_PERSISTENCIA_TELEGRAM = os.getenv("HABILITAR_V26_PERSISTENCIA_TELEGRAM", "true").lower() == "true"
+# Tag usada para identificar mensagens de estado no canal interno.
+V26_ESTADO_TAG = "#COUTIPS_ESTADO_V26"
+
 # V012 — camadas cirúrgicas: grupo grátis, ALAVANCAGEM, Austrália especial e HT-2.
 # Mantém score, funil, IA e parser centrais preservados.
 HABILITAR_V11_GRUPO_GRATUITO = os.getenv("HABILITAR_V11_GRUPO_GRATUITO", "true").lower() == "true"
@@ -256,6 +269,63 @@ def v17_salvar_estado() -> None:
 
 
 # =========================================================
+# V026 — PERSISTÊNCIA VIA TELEGRAM
+# Salva estado dos contadores no canal interno como backup.
+# Sobrevive a restarts mesmo sem Volume /data no Railway.
+# Lê a última mensagem com tag V26_ESTADO_TAG ao iniciar.
+# =========================================================
+
+_v26_msg_estado_id: Optional[int] = None  # ID da mensagem de estado no Telegram
+
+
+async def v26_salvar_estado_telegram() -> None:
+    """Salva estado dos contadores como mensagem no canal interno."""
+    if not HABILITAR_V26_PERSISTENCIA_TELEGRAM:
+        return
+    global _v26_msg_estado_id
+    try:
+        dados = {
+            "contadores": dict(v11_gratis_contadores),
+            "cooldowns": dict(v11_gratis_enviados_por_jogo),
+            "atualizado_em": datetime.now().isoformat(),
+        }
+        texto = f"{V26_ESTADO_TAG}\n{json.dumps(dados, ensure_ascii=False)}"
+        if _v26_msg_estado_id:
+            try:
+                await client.edit_message(CONFIRMATION_CHANNEL, _v26_msg_estado_id, texto)
+                return
+            except Exception:
+                pass  # Se não conseguir editar, envia nova
+        msg = await client.send_message(CONFIRMATION_CHANNEL, texto)
+        _v26_msg_estado_id = msg.id
+        log(f"💾 V26 estado salvo no Telegram | msg_id={_v26_msg_estado_id}")
+    except Exception as e:
+        log(f"⚠️ V26 salvar_estado_telegram erro | {type(e).__name__}: {e}")
+
+
+async def v26_carregar_estado_telegram() -> None:
+    """Lê o último estado salvo no canal interno ao iniciar."""
+    if not HABILITAR_V26_PERSISTENCIA_TELEGRAM:
+        return
+    global v11_gratis_contadores, v11_gratis_enviados_por_jogo, _v26_msg_estado_id
+    try:
+        async for msg in client.iter_messages(CONFIRMATION_CHANNEL, limit=50):
+            if msg.text and V26_ESTADO_TAG in msg.text:
+                linhas = msg.text.split("\n", 1)
+                if len(linhas) < 2:
+                    continue
+                dados = json.loads(linhas[1])
+                v11_gratis_contadores = {k: int(v) for k, v in dados.get("contadores", {}).items()}
+                v11_gratis_enviados_por_jogo = {k: float(v) for k, v in dados.get("cooldowns", {}).items()}
+                _v26_msg_estado_id = msg.id
+                log(f"📂 V26 estado carregado do Telegram | msg_id={msg.id} | contadores={len(v11_gratis_contadores)} | cooldowns={len(v11_gratis_enviados_por_jogo)}")
+                return
+        log("📂 V26 estado Telegram: nenhuma mensagem encontrada, iniciando zerado")
+    except Exception as e:
+        log(f"⚠️ V26 carregar_estado_telegram erro | {type(e).__name__}: {e}")
+
+
+# =========================================================
 # LOG / UTILITÁRIOS
 # =========================================================
 
@@ -299,6 +369,8 @@ def logar_versao_inicial() -> None:
     log("🧱 V21 VOLUME_FT: favorito vencendo por 1+ só passa em cenário EXTREMO")
     log(f"📡 V24 handler canal auditoria: ATIVO | IDs autorizados={AUDITORIA_CHAT_IDS}")
     log("🔧 V25 fixes: link CornerPro, botões HTML, HT duplicado, alavancagem HT restrita")
+    log(f"🚫 V26 FAV_NAO_PRESSIONANTE FT: {'ATIVO' if HABILITAR_V26_FAV_NAO_PRESSIONANTE else 'DESATIVADO'}")
+    log(f"💾 V26 persistência Telegram: {'ATIVA' if HABILITAR_V26_PERSISTENCIA_TELEGRAM else 'DESATIVADA'} | tag={V26_ESTADO_TAG}")
     log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
 
@@ -2542,7 +2614,8 @@ def marcar_envio_gratis_v11(chave_jogo: str) -> None:
     chave_janela = chave_contador_gratis_v11(janela)
     v11_gratis_contadores[chave_janela] = int(v11_gratis_contadores.get(chave_janela, 0)) + 1
     v11_gratis_enviados_por_jogo[chave_jogo] = time.time()
-    v17_salvar_estado()  # V17 — persiste imediatamente após envio real confirmado
+    v17_salvar_estado()  # V17 — persiste no disco
+    asyncio.create_task(v26_salvar_estado_telegram())  # V26 — persiste no Telegram como backup
 
 
 def jogo_em_cooldown_gratis_v11(chave_jogo: str) -> bool:
@@ -3759,6 +3832,21 @@ async def processar_alerta(alerta: Alerta) -> None:
         m.fluxo_decisao = "VOLUME_FT_APROVADO"  # V14 — preserva rastreio para auditoria futura
         m.estrategia = "ALFA_FT"  # Mensagem pública sai como ALFA, não como VOLUME_FT.
 
+    # V026 — FAV_NAO_PRESSIONANTE: penaliza score FT onde favorito não é o lado pressionante.
+    # Modo auditoria: não bloqueia — registra motivo e aplica penalidade no score.
+    # O score ainda pode aprovar dependendo da margem. Permite observar antes de decidir.
+    if HABILITAR_V26_FAV_NAO_PRESSIONANTE and eh_ft(m.estrategia) and not eh_confirmacao(m.estrategia):
+        fav_v26 = m.lado_favorito
+        press_v26 = m.lado_pressionante
+        if fav_v26 in {"CASA", "FORA"} and press_v26 in {"CASA", "FORA"} and fav_v26 != press_v26:
+            motivo_nao_press = f"V26_FAV_NAO_PRESSIONANTE_PENALIDADE={V26_FAV_NAO_PRESSIONANTE_PENALIDADE} | fav={fav_v26} press={press_v26}"
+            log(f"⚠️ V26 FAV_NAO_PRESSIONANTE | penalidade=-{V26_FAV_NAO_PRESSIONANTE_PENALIDADE} | {m.jogo} | {motivo_nao_press}")
+            # Registra na flag de observação da métrica para rastreio no CSV.
+            m.fluxo_motivo = (m.fluxo_motivo or "") + f" | {motivo_nao_press}"
+            # A penalidade é aplicada no score Python antes da IA.
+            # Usamos um atributo auxiliar que calcular_score_python considera.
+            m.penalidade_v26_fav_nao_press = V26_FAV_NAO_PRESSIONANTE_PENALIDADE
+
     # BOT_FT CONFIRMAÇÃO: se existe gatilho anterior pendente, comparar obrigatoriamente.
     if HABILITAR_CONFIRMACAO_V2 and eh_confirmacao(m.estrategia) and eh_ft(m.estrategia):
         pendente = pendentes_confirmacao_ft.pop(chave, None)
@@ -3843,6 +3931,14 @@ async def processar_alerta(alerta: Alerta) -> None:
         return
 
     score_medio = clamp((decisao_py.score + decisao_ia.confianca_corrigida) / 2)
+
+    # V026 — aplicar penalidade FAV_NAO_PRESSIONANTE no score_medio.
+    penalidade_v26 = getattr(m, 'penalidade_v26_fav_nao_press', 0)
+    if penalidade_v26:
+        score_medio_original = score_medio
+        score_medio = max(0, score_medio - penalidade_v26)
+        log(f"📉 V26 penalidade aplicada | score {score_medio_original}% → {score_medio}% | -{penalidade_v26} | {m.jogo}")
+
     corte = corte_por_estrategia(m.estrategia)
     aprovado = score_medio >= corte and decisao_py.status != "REPROVADO"
 
@@ -4046,7 +4142,7 @@ async def main() -> None:
     global tarefa_envio
     logar_versao_inicial()
     garantir_csv()
-    v17_carregar_estado()  # V17 — carrega contadores e cooldowns do disco ao iniciar
+    v17_carregar_estado()  # V17 — carrega do disco (fallback local)
 
     tarefa_envio = asyncio.create_task(trabalhador_fila_envio())
     asyncio.create_task(watchdog())
@@ -4081,6 +4177,8 @@ async def main() -> None:
     log("🚀 INICIANDO BOT")
     await client.start()
     log("✅ TELEGRAM CONECTADO COM SUCESSO")
+    # V26 — carrega estado do Telegram após conexão (backup que sobrevive a restarts)
+    await v26_carregar_estado_telegram()
     log(f"🤖 OpenAI {'ATIVA' if OPENAI_HABILITADO and OPENAI_API_KEY else 'DESATIVADA'} ({OPENAI_MODEL})")
     log(f"📡 Canais ativos: principal={TARGET_CHANNEL} | confirmação={CONFIRMATION_CHANNEL}")
     await client.run_until_disconnected()
