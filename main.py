@@ -55,7 +55,7 @@ except Exception:  # pragma: no cover
 # VERSÃO / CONFIGURAÇÃO BASE
 # =========================================================
 
-VERSAO_COUTIPS = "ALFA_COUTIPS_2026_06_07_V27_REDUCAO_VOLUME_DISCIPLINA_CONTEXTUAL"
+VERSAO_COUTIPS = "ALFA_COUTIPS_2026_06_08_V28_FINAL_CONSOLIDADO_IA"
 
 load_dotenv()
 
@@ -192,6 +192,22 @@ HABILITAR_V27_REFINO_PLACAR_FT = os.getenv("HABILITAR_V27_REFINO_PLACAR_FT", "tr
 HABILITAR_V27_EMPATE_MAIS_RIGIDO = os.getenv("HABILITAR_V27_EMPATE_MAIS_RIGIDO", "true").lower() == "true"
 HABILITAR_V27_PERDEDOR_UM_EXIGE_REACAO = os.getenv("HABILITAR_V27_PERDEDOR_UM_EXIGE_REACAO", "true").lower() == "true"
 V27_UNDER_TETO_SCORE = int(os.getenv("V27_UNDER_TETO_SCORE", "82"))
+
+# =========================================================
+# V028 — FILTRO DE QUALIDADE CONTEXTUAL
+# Base: V27 com refinamentos adicionais.
+# Baseado na auditoria 01-07/06 (195 jogos) e simulacao de 217 alertas.
+# Taxa simulada: 94,3% (82G/5R em 87 aprovados).
+# Nao reconstroi o score. Reforça funil e adiciona DNA projetado como ajuste leve.
+# =========================================================
+HABILITAR_V28 = os.getenv("HABILITAR_V28", "true").lower() == "true"
+HABILITAR_V28_HT_MODERADO_BLOQUEIO = os.getenv("HABILITAR_V28_HT_MODERADO_BLOQUEIO", "true").lower() == "true"
+HABILITAR_V28_UNDER_BLOQUEIO_FORTE = os.getenv("HABILITAR_V28_UNDER_BLOQUEIO_FORTE", "true").lower() == "true"
+HABILITAR_V28_DNA_PROJETADO = os.getenv("HABILITAR_V28_DNA_PROJETADO", "true").lower() == "true"
+HABILITAR_V28_RELOGIO_FT = os.getenv("HABILITAR_V28_RELOGIO_FT", "true").lower() == "true"
+# V28 — prompt IA reescrito como checklist de 6 criterios (auditoria, nao calculo)
+HABILITAR_V28_IA_CHECKLIST = os.getenv("HABILITAR_V28_IA_CHECKLIST", "true").lower() == "true"
+V28_UNDER_TETO_SCORE = int(os.getenv("V28_UNDER_TETO_SCORE", str(V27_UNDER_TETO_SCORE)))
 
 # V012 — camadas cirúrgicas: grupo grátis, ALAVANCAGEM, Austrália especial e HT-2.
 # Mantém score, funil, IA e parser centrais preservados.
@@ -392,6 +408,11 @@ def logar_versao_inicial() -> None:
     log(f"🟡 V27 UNDER teto {V27_UNDER_TETO_SCORE}: {'ATIVO' if HABILITAR_V27_UNDER_TETO_82 else 'DESATIVADO'}")
     log(f"🧬 V27 continuidade pós-gol: {'ATIVA' if HABILITAR_V27_CONTINUIDADE_POS_GOL else 'DESATIVADA'}")
     log(f"🎯 V27 refino placar/empate/perdedor+1 FT: {'ATIVO' if HABILITAR_V27_REFINO_PLACAR_FT else 'DESATIVADO'}")
+    log(f"⛔ V28 HT_MODERADO bloqueio total: {'ATIVO' if HABILITAR_V28 and HABILITAR_V28_HT_MODERADO_BLOQUEIO else 'DESATIVADO'}")
+    log(f"🚫 V28 UNDER bloqueio forte: {'ATIVO' if HABILITAR_V28 and HABILITAR_V28_UNDER_BLOQUEIO_FORTE else 'DESATIVADO'}")
+    log(f"🧬 V28 DNA projetado: {'ATIVO' if HABILITAR_V28 and HABILITAR_V28_DNA_PROJETADO else 'DESATIVADO'}")
+    log(f"⏱ V28 relógio FT janela 81: {'ATIVO' if HABILITAR_V28 and HABILITAR_V28_RELOGIO_FT else 'DESATIVADO'}")
+    log(f"🤖 V28 IA checklist 6 critérios: {'ATIVO' if HABILITAR_V28 and HABILITAR_V28_IA_CHECKLIST else 'DESATIVADO'}")
     log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
 
@@ -1808,6 +1829,17 @@ def score_relogio(m: Metricas) -> int:
         if m.tempo < 15:
             return -4
         return 1
+    # V28 — alarga janela FT: 62-81' retorna bônus pleno.
+    # Alertas chegam até 77'; penalizar 80' era prematuro.
+    if HABILITAR_V28 and HABILITAR_V28_RELOGIO_FT:
+        if 62 <= m.tempo <= 81:
+            return 7
+        if 82 <= m.tempo <= 85:
+            return 3
+        if m.tempo > 85:
+            return -5
+        return 1
+    # V27 e anterior
     if 62 <= m.tempo <= 80:
         return 7
     if 81 <= m.tempo <= 85:
@@ -2114,6 +2146,85 @@ def v27_favorito_vencendo_1x0_exige_extra(m: Metricas, lado: str) -> Tuple[bool,
     return ok, motivo
 
 
+
+
+def continuidade_pos_gol(m: "Metricas", lado: str) -> Tuple[bool, str]:
+    """V28 — Versão direta da verificacao de continuidade pos-gol por lado especifico.
+
+    Complementa v27_continuidade_pos_gol() que analisa o contexto geral.
+    Esta funcao verifica especificamente o lado indicado com criterio mais simples.
+    Usada internamente no cenario FAV_VENCE_1_GOL_RECENTE_MORTO.
+    """
+    if not m.ultimo_gol or lado not in {"CASA", "FORA"}:
+        return True, "SEM_GOL_ANTERIOR"
+    delta = int(m.tempo or 0) - int(m.ultimo_gol or 0)
+    if delta > 10:
+        return True, f"GOL_ANTIGO_{delta}MIN"
+    cantos_pos_gol = sum(
+        1 for min_c, lado_c in m.ultimos_cantos_lados
+        if min_c > m.ultimo_gol and lado_c == lado
+    )
+    d = dados_lado(m, lado)
+    ip = ip_lado(m, lado)
+    tem_u5 = d["u5"] > 0
+    tem_ip = ip["pico"] > 10
+    tem_canto = cantos_pos_gol > 0
+    if tem_u5 or tem_ip or tem_canto:
+        return True, f"CONT_VIVA u5={d['u5']} ip={ip['pico']} cantos_pos={cantos_pos_gol} delta={delta}min"
+    return False, f"PRESSAO_MORTA_POS_GOL u5={d['u5']} ip={ip['pico']} cantos_pos={cantos_pos_gol} delta={delta}min"
+
+def v28_dna_projetado(m: "Metricas", lado: str) -> Tuple[int, str]:
+    """V28 — ajuste contextual leve baseado em favoritismo, xG e pressao recente.
+
+    Nao substitui o score. Adiciona pequeno ajuste (+4/+2/-1/-3) para aproximar
+    o sistema do DNA dos melhores greens historicos (odd + xG + U15/L15).
+    """
+    if not (HABILITAR_V28 and HABILITAR_V28_DNA_PROJETADO):
+        return 0, "V28_DNA_OFF"
+    if lado not in {"CASA", "FORA"}:
+        return 0, "V28_DNA_SEM_LADO"
+    d = dados_lado(m, lado)
+    ip = ip_lado(m, lado)
+    odd = m.odd_favorito or 0.0
+    favorito_ok = m.lado_favorito == lado and odd > 0
+    l15_proxy = d["u10"] + d["u5"]
+    consequencia = d["xg"] >= 0.45 or d["rb"] >= 2 or d["chance"] >= 10
+    pressao = l15_proxy >= 10 or ip["pico"] >= 22 or ip["c18"] >= 2
+
+    if favorito_ok and odd <= 1.55 and consequencia and pressao:
+        return 4, f"DNA_ELITE odd={odd} xg={d['xg']:.2f} l15={l15_proxy}"
+    if favorito_ok and odd <= 1.85 and (consequencia or pressao) and l15_proxy >= 7:
+        return 2, f"DNA_FORTE odd={odd} xg={d['xg']:.2f} l15={l15_proxy}"
+    if favorito_ok and odd <= 2.20 and (d["xg"] >= 0.28 or d["chance"] >= 8 or d["rb"] >= 1):
+        return -1, f"DNA_MODERADO odd={odd} xg={d['xg']:.2f} l15={l15_proxy}"
+    return -3, f"DNA_FRACO odd={odd} xg={d['xg']:.2f} l15={l15_proxy}"
+
+
+def v28_under_extraordinario(m: "Metricas", lado: str) -> Tuple[bool, str]:
+    """V28 — liga UNDER so passa se for realmente extraordinaria.
+
+    Tres caminhos aceitos (qualquer um basta):
+      1. RB forte + xG solido
+      2. Chance alta + pressao dupla recente
+      3. Pressao extrema + consequencia + IP elite
+    """
+    if lado not in {"CASA", "FORA"}:
+        return False, "V28_UNDER_SEM_LADO"
+    d = dados_lado(m, lado)
+    ip = ip_lado(m, lado)
+    extremo = pressao_extrema_lado(m, lado)
+    prova = (
+        (d["rb"] >= 2 and d["xg"] >= 0.45)
+        or (d["chance"] >= 12 and d["u5"] >= 4 and d["u10"] >= 8)
+        or (extremo and consequencia_real_lado(m, lado) and (ip["pico"] >= 24 or ip["c18"] >= 2))
+    )
+    motivo = (
+        f"V28_UNDER_EXTRAORDINARIO={prova} rb={d['rb']} xg={d['xg']:.2f} "
+        f"chance={d['chance']} u5={d['u5']} u10={d['u10']} ip={ip['pico']} extremo={extremo}"
+    )
+    return bool(prova), motivo
+
+
 @dataclass
 class CenarioFT:
     codigo: str          # código do cenário (ex: "ALFA_REAL")
@@ -2137,6 +2248,17 @@ def classificar_cenario_ft(m: Metricas) -> CenarioFT:
     lado = m.lado_pressionante
     if lado not in {"CASA", "FORA"}:
         return CenarioFT("SEM_LADO", False, 100, 99, "SEM_LADO_PRESSIONANTE")
+
+    # ── V28 — Bloqueio forte de liga UNDER antes de qualquer cenario ─────────
+    # Taxa historica: 36.4% — sem justificativa para manter no funil.
+    # Excecao: prova extraordinaria (rb+xG ou chance+pressao ou extremo+IP).
+    if HABILITAR_V28 and HABILITAR_V28_UNDER_BLOQUEIO_FORTE and m.liga == "UNDER":
+        under_ok, under_motivo = v28_under_extraordinario(m, lado)
+        if not under_ok:
+            return CenarioFT(
+                "V28_LIGA_UNDER_BLOQUEADA", True, V28_UNDER_TETO_SCORE, 99,
+                under_motivo
+            )
 
     d = dados_lado(m, lado)
     gc, gf = extrair_gols_placar(m.placar)
@@ -2479,6 +2601,11 @@ def score_python_contextual(m: Metricas, chave: str) -> DecisaoPython:
     }
     conf_score, conf_motivo = score_confirmacao(m, chave)
     componentes["confirmacao"] = conf_score
+    # V28 — DNA projetado: ajuste leve baseado em favoritismo + xG + pressao recente.
+    # Nao altera o score central; apenas adiciona ou remove ate 4 pontos.
+    dna_ajuste, dna_motivo = v28_dna_projetado(m, m.lado_pressionante)
+    if HABILITAR_V28 and HABILITAR_V28_DNA_PROJETADO:
+        componentes["dna_v28"] = dna_ajuste
 
     score_bruto = base + sum(componentes.values())
 
@@ -2569,6 +2696,62 @@ def corte_por_estrategia(estrategia: str) -> int:
 # =========================================================
 
 def montar_prompt_ia(m: Metricas, decisao_py: DecisaoPython) -> str:
+    # V28 — prompt checklist: IA audita 6 criterios em vez de calcular livremente.
+    # Mais estruturado, mais previsivel, mais facil de depurar.
+    if HABILITAR_V28 and HABILITAR_V28_IA_CHECKLIST:
+        return f"""
+Você é a IA Auditora do projeto COUTIPS/ALFA V28.
+Python é o motor principal. Sua função é AUDITAR o contexto, não recalcular score.
+
+Responda obrigatoriamente em UMA linha no formato:
+DECISAO=APROVAR|BLOQUEAR; CONFIANCA=0-100; CHECKLIST=pressao_viva:POSITIVO|NEUTRO|NEGATIVO,pressao_premiada:POSITIVO|NEUTRO|NEGATIVO,gol_recente:POSITIVO|NEUTRO|NEGATIVO,fome_favorito:POSITIVO|NEUTRO|NEGATIVO,consequencia_real:POSITIVO|NEUTRO|NEGATIVO,dna_projetado:POSITIVO|NEUTRO|NEGATIVO; MOTIVO=texto curto
+
+CHECKLIST OBRIGATÓRIO:
+1. Pressão viva: U5/U10/IP ainda sustentam o alerta?
+2. Pressão premiada: o último gol já pagou a pressão e o jogo morreu?
+3. Gol recente: o gol recente aumenta risco ou criou novo valor?
+4. Fome do favorito: favorito ainda tem motivo real para buscar gol?
+5. Consequência real: existe RB/remate/chance/xG/canto, não apenas posse/AP?
+6. DNA projetado: odd favorito + xG + pressão recente parecem padrão histórico forte?
+
+REGRAS:
+- Não bloqueie apenas por gol recente.
+- Bloqueie quando gol recente premiou o lado pressionante/favorito e a pressão morreu.
+- Valorize zebra marcando contra fluxo se favorito/pressionante continuou vivo.
+- Em liga UNDER, seja muito cético; exija consequência extraordinária.
+- Em HT, só aceite massacre contextual real.
+
+DADOS:
+Estratégia: {m.estrategia}
+Jogo: {m.jogo}
+Competição: {m.competicao}
+Minuto: {m.tempo}
+Placar: {m.placar}
+Mercado: {m.mercado}
+Liga: {m.liga}
+Odds: {m.odds}
+Favorito: {m.lado_favorito} odd {m.odd_favorito}
+Dominante: {m.lado_dominante}
+Pressionante: {m.lado_pressionante}
+Último gol: {m.ultimo_gol}' {m.ultimo_gol_lado}
+AP: {m.ataques_perigosos}
+U5: {m.ultimos5}
+U10: {m.ultimos10}
+Cantos: {m.cantos}
+RB: {m.remates_baliza}
+Remates lado: {m.remates_lado}
+RDA: {m.remates_dentro_area}
+Chance gol: {m.chance_golo}
+xG: {m.xg}
+IP: {m.pressao_alfa}
+Valor pós-evento: {m.valor_pos_evento_classe} | {m.valor_pos_evento_motivo}
+Cenário/Funil Python: {decisao_py.detalhes.get('funil', '')} | {decisao_py.detalhes.get('cenario_ft', '')}
+DNA V28: {decisao_py.detalhes.get('dna_v28', '')}
+Score Python: {decisao_py.score}
+Motivo Python: {decisao_py.motivo}
+""".strip()
+
+    # Prompt original V27 — fallback quando IA_CHECKLIST desativado
     return f"""
 Você é a IA Auditora do projeto COUTIPS/ALFA.
 Python é o motor principal. Sua função é auditar fake pressure e incoerências, não destruir contexto institucional forte.
@@ -2966,6 +3149,9 @@ def selo_alavancagem_v11(m: Metricas, score: int) -> Tuple[bool, str]:
     """ALAVANCAGEM é classificação contextual rara, não aprovação."""
     if not HABILITAR_V11_ALAVANCAGEM:
         return False, "V11_ALAVANCAGEM_DESATIVADA"
+    # V27/V28 — ALAVANCAGEM somente FT. HT nao tem contexto suficiente para selo de elite.
+    if (HABILITAR_V27_ALAVANCAGEM_SO_FT or HABILITAR_V28) and (not eh_ft(m.estrategia) or eh_confirmacao(m.estrategia)):
+        return False, "ALAVANCAGEM_SOMENTE_FT"
     if eh_confirmacao(m.estrategia):
         return False, "CONF_NAO_RECEBE_ALAVANCAGEM"
     if HABILITAR_V27_ALAVANCAGEM_SO_FT and eh_ht(m.estrategia):
@@ -4008,21 +4194,30 @@ async def processar_alerta(alerta: Alerta) -> None:
         await registrar_bloqueio_fluxo(m, motivo, score=0)
         return
 
-    # V27 — HT_MODERADO vira HT_ALAVANCAGEM em observação.
-    # Não envia ao canal principal nesta fase; só audita se passaria com massacre real.
-    if HABILITAR_V27_HT_MODERADO_ALAV_OBS and contem_ht_moderado_bruto(m.texto_bruto):
-        m.fluxo_decisao = "V27_HT_MODERADO_ALAVANCAGEM_OBSERVACAO"
-        lado_ht = m.lado_pressionante
-        pos_gol_ht = gol_recente_do_pressionante(m, janela=3)
-        ht_ok, ht_motivo = massacre_contextual_ht(m, lado_ht, pos_gol_recente=pos_gol_ht)
-        m.fluxo_motivo = ht_motivo
-        if not ht_ok:
-            motivo = f"V27_HT_MODERADO_BLOQUEADO_SEM_MASSACRE | {ht_motivo}"
+    # V27/V28 — HT_MODERADO: taxa 53% — bloqueio total no V28.
+    # V27 modo observacao preservado via flag; V28 bloqueia completamente.
+    if contem_ht_moderado_bruto(m.texto_bruto):
+        if HABILITAR_V28 and HABILITAR_V28_HT_MODERADO_BLOQUEIO:
+            # V28 — bloqueio total: HT_MODERADO descontinuado
+            m.fluxo_decisao = "V28_HT_MODERADO_BLOQUEADO"
+            m.fluxo_motivo = "HT_MODERADO_DESCONTINUADO_V28_TAXA_53PCT"
+            motivo = f"{m.fluxo_decisao} | {m.fluxo_motivo}"
             log(f"⛔ {motivo} | {m.jogo}")
             await registrar_bloqueio_fluxo(m, motivo, score=0)
             return
-        # Se passar, o fluxo segue para score/IA, mas no final ficará só em auditoria.
-        log(f"🧪 V27 HT_MODERADO PASSOU COMO HT_ALAVANCAGEM_OBS | {m.jogo} | {ht_motivo}")
+        elif HABILITAR_V27_HT_MODERADO_ALAV_OBS:
+            # V27 modo observacao: passa pelo score mas nao vai ao canal principal
+            m.fluxo_decisao = "V27_HT_MODERADO_ALAVANCAGEM_OBSERVACAO"
+            lado_ht = m.lado_pressionante
+            pos_gol_ht = gol_recente_do_pressionante(m, janela=3)
+            ht_ok, ht_motivo = massacre_contextual_ht(m, lado_ht, pos_gol_recente=pos_gol_ht)
+            m.fluxo_motivo = ht_motivo
+            if not ht_ok:
+                motivo = f"V27_HT_MODERADO_BLOQUEADO_SEM_MASSACRE | {ht_motivo}"
+                log(f"⛔ {motivo} | {m.jogo}")
+                await registrar_bloqueio_fluxo(m, motivo, score=0)
+                return
+            log(f"🧪 V27 HT_MODERADO PASSOU COMO HT_ALAVANCAGEM_OBS | {m.jogo} | {ht_motivo}")
 
     # V014 — VOLUME_FT: porta exclusiva antes do score normal.
     # Reprovados morrem silenciosamente — só CSV/log interno, sem canal de reprovados.
@@ -4189,8 +4384,8 @@ async def processar_alerta(alerta: Alerta) -> None:
     v13_registrar(m, score_medio, aprovado, motivo_final)  # V13
 
     # V27 — HT_MODERADO em observação: mesmo aprovado, não vai para canal principal.
-    # Fica registrado no CSV/HTML/canal de auditoria para medir taxa por uma semana.
-    if aprovado and HABILITAR_V27_HT_MODERADO_ALAV_OBS and contem_ht_moderado_bruto(m.texto_bruto):
+    # No V28 este bloco nunca e alcancado porque o HT_MODERADO e bloqueado antes.
+    if aprovado and HABILITAR_V27_HT_MODERADO_ALAV_OBS and not (HABILITAR_V28 and HABILITAR_V28_HT_MODERADO_BLOQUEIO) and contem_ht_moderado_bruto(m.texto_bruto):
         m.destino_final = "SOMENTE_AUDITORIA_V27_HT_ALAVANCAGEM_OBS"
         ultimas_leituras_por_jogo[chave] = {"metricas": m, "score": decisao_py.score, "recebido_em": time.time()}
         log(f"🧪 V27 HT_ALAVANCAGEM OBSERVACAO — aprovado mas não enviado ao principal | score={score_medio}% | {m.jogo}")
