@@ -55,7 +55,7 @@ except Exception:  # pragma: no cover
 # VERSÃO / CONFIGURAÇÃO BASE
 # =========================================================
 
-VERSAO_COUTIPS = "ALFA_COUTIPS_2026_06_06_V26_FAV_NAO_PRESS_PERSISTENCIA_TELEGRAM"
+VERSAO_COUTIPS = "ALFA_COUTIPS_2026_06_07_V27_REDUCAO_VOLUME_DISCIPLINA_CONTEXTUAL"
 
 load_dotenv()
 
@@ -177,6 +177,21 @@ V26_FAV_NAO_PRESSIONANTE_PENALIDADE = int(os.getenv("V26_FAV_NAO_PRESSIONANTE_PE
 HABILITAR_V26_PERSISTENCIA_TELEGRAM = os.getenv("HABILITAR_V26_PERSISTENCIA_TELEGRAM", "true").lower() == "true"
 # Tag usada para identificar mensagens de estado no canal interno.
 V26_ESTADO_TAG = "#COUTIPS_ESTADO_V26"
+
+# =========================================================
+# V027 — REDUÇÃO DE VOLUME / DISCIPLINA CONTEXTUAL
+# Camada cirúrgica pós-auditoria de 195 jogos.
+# Não altera o núcleo do score; aplica portões/limites com rollback por flag.
+# =========================================================
+HABILITAR_V27_POS70_OFF = os.getenv("HABILITAR_V27_POS70_OFF", "true").lower() == "true"
+HABILITAR_V27_ALAVANCAGEM_SO_FT = os.getenv("HABILITAR_V27_ALAVANCAGEM_SO_FT", "true").lower() == "true"
+HABILITAR_V27_HT_MODERADO_ALAV_OBS = os.getenv("HABILITAR_V27_HT_MODERADO_ALAV_OBS", "true").lower() == "true"
+HABILITAR_V27_UNDER_TETO_82 = os.getenv("HABILITAR_V27_UNDER_TETO_82", "true").lower() == "true"
+HABILITAR_V27_CONTINUIDADE_POS_GOL = os.getenv("HABILITAR_V27_CONTINUIDADE_POS_GOL", "true").lower() == "true"
+HABILITAR_V27_REFINO_PLACAR_FT = os.getenv("HABILITAR_V27_REFINO_PLACAR_FT", "true").lower() == "true"
+HABILITAR_V27_EMPATE_MAIS_RIGIDO = os.getenv("HABILITAR_V27_EMPATE_MAIS_RIGIDO", "true").lower() == "true"
+HABILITAR_V27_PERDEDOR_UM_EXIGE_REACAO = os.getenv("HABILITAR_V27_PERDEDOR_UM_EXIGE_REACAO", "true").lower() == "true"
+V27_UNDER_TETO_SCORE = int(os.getenv("V27_UNDER_TETO_SCORE", "82"))
 
 # V012 — camadas cirúrgicas: grupo grátis, ALAVANCAGEM, Austrália especial e HT-2.
 # Mantém score, funil, IA e parser centrais preservados.
@@ -371,6 +386,12 @@ def logar_versao_inicial() -> None:
     log("🔧 V25 fixes: link CornerPro, botões HTML, HT duplicado, alavancagem HT restrita")
     log(f"🚫 V26 FAV_NAO_PRESSIONANTE FT: {'ATIVO' if HABILITAR_V26_FAV_NAO_PRESSIONANTE else 'DESATIVADO'}")
     log(f"💾 V26 persistência Telegram: {'ATIVA' if HABILITAR_V26_PERSISTENCIA_TELEGRAM else 'DESATIVADA'} | tag={V26_ESTADO_TAG}")
+    log(f"🧹 V27 POS70 OFF: {'ATIVO' if HABILITAR_V27_POS70_OFF else 'DESATIVADO'}")
+    log(f"🔺 V27 ALAVANCAGEM só FT: {'ATIVA' if HABILITAR_V27_ALAVANCAGEM_SO_FT else 'DESATIVADA'}")
+    log(f"💎 V27 HT_MODERADO→HT_ALAVANCAGEM observação: {'ATIVO' if HABILITAR_V27_HT_MODERADO_ALAV_OBS else 'DESATIVADO'}")
+    log(f"🟡 V27 UNDER teto {V27_UNDER_TETO_SCORE}: {'ATIVO' if HABILITAR_V27_UNDER_TETO_82 else 'DESATIVADO'}")
+    log(f"🧬 V27 continuidade pós-gol: {'ATIVA' if HABILITAR_V27_CONTINUIDADE_POS_GOL else 'DESATIVADA'}")
+    log(f"🎯 V27 refino placar/empate/perdedor+1 FT: {'ATIVO' if HABILITAR_V27_REFINO_PLACAR_FT else 'DESATIVADO'}")
     log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
 
@@ -612,6 +633,30 @@ def contem_volume_ft_bruto(texto: str) -> bool:
         or "BOTVOLUMEFT" in compacto
         or re.search(r"\b(?:BOT\s*)?VOLUME\s*[-_ ]*\s*FT\b", primeiros)
     )
+
+
+def contem_pos70_bruto(texto: str) -> bool:
+    """V27 — identifica alertas POS70/Pós 70 antes do score.
+
+    POS70 foi considerado redundante na auditoria operacional. A flag
+    HABILITAR_V27_POS70_OFF permite desligar essa porta sem mexer nos demais FT.
+    """
+    raw = remover_acentos(texto or "").upper()
+    primeiros = raw[:350].replace("_", " ")
+    compacto = re.sub(r"[^A-Z0-9]+", "", primeiros)
+    return bool(
+        "POS70" in compacto
+        or "POSSETENTA" in compacto
+        or re.search(r"\bPOS\s*[-_ ]*70\b", primeiros)
+        or re.search(r"\bP[OÓ]S\s*70\b", primeiros)
+    )
+
+
+def contem_ht_moderado_bruto(texto: str) -> bool:
+    """V27 — identifica HT_MODERADO para transformá-lo em HT_ALAVANCAGEM em observação."""
+    raw = remover_acentos(texto or "").upper()[:350].replace("_", " ")
+    compacto = re.sub(r"[^A-Z0-9]+", "", raw)
+    return "HTMODERADO" in compacto or bool(re.search(r"\bHT\s*[-_ ]*MODERADO\b", raw))
 
 
 def detectar_estrategia(texto: str) -> str:
@@ -1948,6 +1993,127 @@ def finalização_minima_lado(m: Metricas, lado: str) -> bool:
 _XGL_MIN_PERDEDOR_REAGINDO = 0.50
 
 
+def v27_continuidade_pos_gol(m: Metricas) -> Tuple[bool, str]:
+    """V27 — valida se o jogo continuou vivo depois de gol recente.
+
+    Resolve o problema central visto na auditoria: dados acumulados bons antes
+    do gol continuarem inflando o alerta quando, depois do gol, o jogo morreu.
+    Como não temos timeline perfeita pós-gol, usamos sinais disponíveis:
+    - U5/U10 do lado pressionante;
+    - remate/pressão recente;
+    - canto posterior ao gol;
+    - IP ainda forte.
+    """
+    if not HABILITAR_V27_CONTINUIDADE_POS_GOL:
+        return True, "V27_CONT_POS_GOL_OFF"
+    if not eh_ft(m.estrategia):
+        return True, "V27_CONT_POS_GOL_NAO_FT"
+    if not m.ultimo_gol or m.ultimo_gol_lado not in {"CASA", "FORA"}:
+        return True, "V27_SEM_GOL_RECENTE"
+    delta = minutos_desde_ultimo_gol(m)
+    if delta < -1 or delta > 8:
+        return True, f"V27_GOL_FORA_JANELA_{delta}MIN"
+
+    lado = m.lado_pressionante if m.lado_pressionante in {"CASA", "FORA"} else m.ultimo_gol_lado
+    d = dados_lado(m, lado)
+    ip = ip_lado(m, lado)
+    cantos_pos_gol = [ev for ev in m.ultimos_cantos_lados if ev[0] >= m.ultimo_gol and ev[1] == lado]
+    gol_lado_vencedor = ultimo_gol_deixou_lado_vencendo(m) or ultimo_gol_aumentou_vantagem(m)
+    gol_do_press = m.ultimo_gol_lado == m.lado_pressionante
+    gol_do_fav = m.ultimo_gol_lado == m.lado_favorito
+
+    # Só endurece de verdade quando o gol recente é do lado que podia esfriar o jogo:
+    # pressionante/favorito/vencedor. Gol contra fluxo pode abrir o jogo.
+    if not (gol_lado_vencedor or gol_do_press or gol_do_fav):
+        return True, "V27_GOL_NAO_PREMIOU_PRESSIONANTE"
+
+    provas = 0
+    if d["u5"] >= 3:
+        provas += 1
+    if d["u10"] >= 7:
+        provas += 1
+    if d["rb"] >= 1 or d["rl"] >= 3 or d["chance"] >= 8 or d["xg"] >= 0.28:
+        provas += 1
+    if cantos_pos_gol:
+        provas += 1
+    if ip["pico"] >= 20 or ip["c18"] >= 1:
+        provas += 1
+
+    if delta <= 3:
+        # Gol muito recente: exige mais cuidado porque odds/ritmo podem estar instáveis.
+        ok = provas >= 3
+    else:
+        ok = provas >= 2
+
+    motivo = (
+        f"V27_CONT_POS_GOL provas={provas} delta={delta} lado={lado} "
+        f"u5={d['u5']} u10={d['u10']} rb={d['rb']} rl={d['rl']} "
+        f"chance={d['chance']} xg={d['xg']:.2f} cantos_pos={len(cantos_pos_gol)} "
+        f"ip={ip['pico']} gol_vencedor={gol_lado_vencedor} gol_press={gol_do_press} gol_fav={gol_do_fav}"
+    )
+    return ok, motivo if ok else "BLOQUEIO_" + motivo
+
+
+def v27_empate_tem_prova_suficiente(m: Metricas, lado: str) -> Tuple[bool, str]:
+    """V27 — empate FT precisa de 2 de 4 provas reais."""
+    if not HABILITAR_V27_EMPATE_MAIS_RIGIDO:
+        return True, "V27_EMPATE_OFF"
+    if lado_vencendo(m) != "EMPATE" or not eh_ft(m.estrategia):
+        return True, "V27_NAO_EMPATE_FT"
+    d = dados_lado(m, lado)
+    provas = [
+        d["rb"] >= 2,
+        d["chance"] >= 10,
+        d["xg"] >= 0.40,
+        pressao_extrema_lado(m, lado),
+    ]
+    total = sum(1 for x in provas if x)
+    ok = total >= 2
+    motivo = f"V27_EMPATE_PROVAS={total}/4 rb={d['rb']} chance={d['chance']} xg={d['xg']:.2f} extrema={pressao_extrema_lado(m,lado)}"
+    return ok, motivo
+
+
+def v27_perdedor_um_tem_reacao(m: Metricas, lado: str) -> Tuple[bool, str]:
+    """V27 — lado perdendo por 1 só passa se há reação viva + consequência."""
+    if not HABILITAR_V27_PERDEDOR_UM_EXIGE_REACAO:
+        return True, "V27_PERDEDOR_UM_OFF"
+    if not eh_ft(m.estrategia):
+        return True, "V27_NAO_FT"
+    if diferenca_placar(m) != 1 or lado_vencendo(m) in {"EMPATE", "DESCONHECIDO"}:
+        return True, "V27_NAO_PERDE_1"
+    if lado != lado_perdendo(m):
+        return True, "V27_LADO_NAO_E_PERDEDOR"
+    d = dados_lado(m, lado)
+    pressao_dupla = d["u5"] >= 3 and d["u10"] >= 6
+    reacao_viva = pressao_dupla or (pressao_viva_lado(m, lado) and consequencia_real_lado(m, lado))
+    motivo = f"V27_PERDEDOR_1 reacao={reacao_viva} u5={d['u5']} u10={d['u10']} consequencia={consequencia_real_lado(m,lado)}"
+    return bool(reacao_viva), motivo
+
+
+def v27_favorito_vencendo_1x0_exige_extra(m: Metricas, lado: str) -> Tuple[bool, str]:
+    """V27 — 1x0/0x1 no FT é tratado como vantagem curta potencialmente morta.
+
+    2x1/3x2 não são endurecidos aqui porque já carregam evidência de jogo aberto.
+    """
+    if not HABILITAR_V27_REFINO_PLACAR_FT:
+        return True, "V27_PLACAR_OFF"
+    if not eh_ft(m.estrategia):
+        return True, "V27_NAO_FT"
+    total = total_gols_placar(m)
+    if total != 1 or diferenca_placar(m) != 1 or lado != lado_vencendo(m):
+        return True, "V27_NAO_1X0_VENCEDOR"
+    d = dados_lado(m, lado)
+    ip = ip_lado(m, lado)
+    ok = (
+        d["u5"] >= 5
+        and d["u10"] >= 9
+        and (d["rb"] >= 2 or d["chance"] >= 10 or d["xg"] >= 0.45)
+        and (ip["pico"] >= 22 or ip["c18"] >= 2)
+    )
+    motivo = f"V27_1X0_EXTRA ok={ok} u5={d['u5']} u10={d['u10']} rb={d['rb']} chance={d['chance']} xg={d['xg']:.2f} ip={ip['pico']}"
+    return ok, motivo
+
+
 @dataclass
 class CenarioFT:
     codigo: str          # código do cenário (ex: "ALFA_REAL")
@@ -1983,6 +2149,23 @@ def classificar_cenario_ft(m: Metricas) -> CenarioFT:
     fav = m.lado_favorito
 
     xgl_lado = d.get("xgl", 0.0)
+
+    # ── V27: continuidade pós-gol e refino contextual antes dos cenários clássicos ──
+    cont_ok, cont_motivo = v27_continuidade_pos_gol(m)
+    if not cont_ok:
+        return CenarioFT("V27_SEM_CONTINUIDADE_POS_GOL", True, 78, 99, cont_motivo)
+
+    empate_ok, empate_motivo = v27_empate_tem_prova_suficiente(m, lado)
+    if not empate_ok:
+        return CenarioFT("V27_EMPATE_SEM_PROVA_EXTRA", True, 80, 99, empate_motivo)
+
+    perdedor_ok, perdedor_motivo = v27_perdedor_um_tem_reacao(m, lado)
+    if not perdedor_ok:
+        return CenarioFT("V27_PERDEDOR_1_SEM_REACAO", True, 80, 99, perdedor_motivo)
+
+    placar_ok, placar_motivo = v27_favorito_vencendo_1x0_exige_extra(m, lado)
+    if not placar_ok:
+        return CenarioFT("V27_1X0_SEM_PROVA_EXTRA", True, 80, 4, placar_motivo)
 
     # ── CENÁRIO 1: Jogo morto FT ─────────────────────────────────────────────
     # Lógica trazida do código antigo (4.436 linhas): jogo realmente morto
@@ -2785,6 +2968,8 @@ def selo_alavancagem_v11(m: Metricas, score: int) -> Tuple[bool, str]:
         return False, "V11_ALAVANCAGEM_DESATIVADA"
     if eh_confirmacao(m.estrategia):
         return False, "CONF_NAO_RECEBE_ALAVANCAGEM"
+    if HABILITAR_V27_ALAVANCAGEM_SO_FT and eh_ht(m.estrategia):
+        return False, "V27_ALAVANCAGEM_HT_DESATIVADA_SOMENTE_FT"
     lado = m.lado_pressionante
     fav = m.lado_favorito
     if lado not in {"CASA", "FORA"} or fav not in {"CASA", "FORA"}:
@@ -3814,6 +3999,31 @@ async def processar_alerta(alerta: Alerta) -> None:
         await registrar_bloqueio_fluxo(m, motivo, score=0)
         return
 
+    # V27 — POS70 OFF: bot redundante após auditoria. Bloqueia antes do score.
+    if HABILITAR_V27_POS70_OFF and contem_pos70_bruto(m.texto_bruto):
+        m.fluxo_decisao = "V27_POS70_DESATIVADO"
+        m.fluxo_motivo = "POS70_OFF_REDUCAO_VOLUME_REDUNDANCIA"
+        motivo = f"{m.fluxo_decisao} | {m.fluxo_motivo}"
+        log(f"🔇 {motivo} | {m.jogo}")
+        await registrar_bloqueio_fluxo(m, motivo, score=0)
+        return
+
+    # V27 — HT_MODERADO vira HT_ALAVANCAGEM em observação.
+    # Não envia ao canal principal nesta fase; só audita se passaria com massacre real.
+    if HABILITAR_V27_HT_MODERADO_ALAV_OBS and contem_ht_moderado_bruto(m.texto_bruto):
+        m.fluxo_decisao = "V27_HT_MODERADO_ALAVANCAGEM_OBSERVACAO"
+        lado_ht = m.lado_pressionante
+        pos_gol_ht = gol_recente_do_pressionante(m, janela=3)
+        ht_ok, ht_motivo = massacre_contextual_ht(m, lado_ht, pos_gol_recente=pos_gol_ht)
+        m.fluxo_motivo = ht_motivo
+        if not ht_ok:
+            motivo = f"V27_HT_MODERADO_BLOQUEADO_SEM_MASSACRE | {ht_motivo}"
+            log(f"⛔ {motivo} | {m.jogo}")
+            await registrar_bloqueio_fluxo(m, motivo, score=0)
+            return
+        # Se passar, o fluxo segue para score/IA, mas no final ficará só em auditoria.
+        log(f"🧪 V27 HT_MODERADO PASSOU COMO HT_ALAVANCAGEM_OBS | {m.jogo} | {ht_motivo}")
+
     # V014 — VOLUME_FT: porta exclusiva antes do score normal.
     # Reprovados morrem silenciosamente — só CSV/log interno, sem canal de reprovados.
     if HABILITAR_VOLUME_FT and eh_volume_ft(m.estrategia):
@@ -3939,6 +4149,13 @@ async def processar_alerta(alerta: Alerta) -> None:
         score_medio = max(0, score_medio - penalidade_v26)
         log(f"📉 V26 penalidade aplicada | score {score_medio_original}% → {score_medio}% | -{penalidade_v26} | {m.jogo}")
 
+    # V27 — teto forte para liga UNDER em qualquer fluxo aprovado.
+    if HABILITAR_V27_UNDER_TETO_82 and m.liga == "UNDER" and score_medio > V27_UNDER_TETO_SCORE:
+        score_under_original = score_medio
+        score_medio = V27_UNDER_TETO_SCORE
+        m.fluxo_motivo = (m.fluxo_motivo or "") + f" | V27_UNDER_TETO_{V27_UNDER_TETO_SCORE}:{score_under_original}->{score_medio}"
+        log(f"🟡 V27 UNDER teto aplicado | score {score_under_original}% → {score_medio}% | {m.jogo}")
+
     corte = corte_por_estrategia(m.estrategia)
     aprovado = score_medio >= corte and decisao_py.status != "REPROVADO"
 
@@ -3970,6 +4187,14 @@ async def processar_alerta(alerta: Alerta) -> None:
     registrar_csv(m, decisao_py, decisao_ia, score_medio, "APROVADO" if aprovado else "REPROVADO", motivo_final)
     await enviar_auditoria(m, decisao_py.score, decisao_ia.confianca_corrigida, score_medio, aprovado, motivo_final)
     v13_registrar(m, score_medio, aprovado, motivo_final)  # V13
+
+    # V27 — HT_MODERADO em observação: mesmo aprovado, não vai para canal principal.
+    # Fica registrado no CSV/HTML/canal de auditoria para medir taxa por uma semana.
+    if aprovado and HABILITAR_V27_HT_MODERADO_ALAV_OBS and contem_ht_moderado_bruto(m.texto_bruto):
+        m.destino_final = "SOMENTE_AUDITORIA_V27_HT_ALAVANCAGEM_OBS"
+        ultimas_leituras_por_jogo[chave] = {"metricas": m, "score": decisao_py.score, "recebido_em": time.time()}
+        log(f"🧪 V27 HT_ALAVANCAGEM OBSERVACAO — aprovado mas não enviado ao principal | score={score_medio}% | {m.jogo}")
+        return
 
     ultimas_leituras_por_jogo[chave] = {"metricas": m, "score": decisao_py.score, "recebido_em": time.time()}
 
