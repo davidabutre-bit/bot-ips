@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-COUTIPS / ALFA — GOAT V008 CONSOLIDADO
-Base consolidada a partir dos três V7: ChatGPT + Claude + DeepSeek
+COUTIPS / ALFA — DC01
+Base DC01 gerada sobre V28 SNIPER V2 + HTMLFIX + auditoria visual
 
 Objetivo:
 - Manter o score central preservado.
@@ -56,7 +56,7 @@ except Exception:  # pragma: no cover
 # VERSÃO / CONFIGURAÇÃO BASE
 # =========================================================
 
-VERSAO_COUTIPS = "ALFA_COUTIPS_2026_06_08_V28_SNIPER_V2"
+VERSAO_COUTIPS = "DC01_COUTIPS_ALFA_2026_06_09"
 
 load_dotenv()
 
@@ -207,6 +207,15 @@ HABILITAR_V28_UNDER_BLOQUEIO_FORTE = os.getenv("HABILITAR_V28_UNDER_BLOQUEIO_FOR
 HABILITAR_V28_DNA_PROJETADO = os.getenv("HABILITAR_V28_DNA_PROJETADO", "true").lower() == "true"
 HABILITAR_V28_RELOGIO_FT = os.getenv("HABILITAR_V28_RELOGIO_FT", "true").lower() == "true"
 V28_UNDER_TETO_SCORE = int(os.getenv("V28_UNDER_TETO_SCORE", str(V27_UNDER_TETO_SCORE)))
+
+# =========================================================
+# DC01 — CHAMA_FT PLACAR ELÁSTICO
+# Camada exclusiva para CHAMA_FT quando a diferença do placar é 3+ gols.
+# Não altera score central, VOLUME, SNIPER, ARCE, IA ou grupo grátis.
+# Estados possíveis: MORTO -> bloqueia | MEIO_TERMO -> confirmação | CAOS -> aprova.
+# =========================================================
+HABILITAR_DC01_CHAMA_PLACAR_ELASTICO = os.getenv("HABILITAR_DC01_CHAMA_PLACAR_ELASTICO", "true").lower() == "true"
+DC01_CHAMA_DIF_MIN_PLACAR_ELASTICO = int(os.getenv("DC01_CHAMA_DIF_MIN_PLACAR_ELASTICO", "3"))
 
 # V012 — camadas cirúrgicas: grupo grátis, ALAVANCAGEM, Austrália especial e HT-2.
 # Mantém score, funil, IA e parser centrais preservados.
@@ -411,6 +420,7 @@ def logar_versao_inicial() -> None:
     log(f"🚫 V28 UNDER bloqueio forte: {'ATIVO' if HABILITAR_V28 and HABILITAR_V28_UNDER_BLOQUEIO_FORTE else 'DESATIVADO'}")
     log(f"🧬 V28 DNA projetado: {'ATIVO' if HABILITAR_V28 and HABILITAR_V28_DNA_PROJETADO else 'DESATIVADO'}")
     log(f"⏱ V28 relógio FT janela 81: {'ATIVO' if HABILITAR_V28 and HABILITAR_V28_RELOGIO_FT else 'DESATIVADO'}")
+    log(f"🧱 DC01 CHAMA placar elástico 3+: {'ATIVO' if HABILITAR_DC01_CHAMA_PLACAR_ELASTICO else 'DESATIVADO'}")
     log("🎯 SNIPER V2: ATIVO | leitura separada, pressão premiada/gol contra fluxo/necessidade")
     log("🏷️ Auditoria visual: ⚡ ARCE HT | 1T / 🔥 CHAMA FT | 2T / 📊 VOLUME FT | 2T / 🎯 SNIPER | 2T")
     log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
@@ -3545,6 +3555,121 @@ def timeout_confirmacao_segundos(m: Metricas) -> int:
     return max(120, min(600, (82 - tempo + 1) * 60))
 
 # =========================================================
+# DC01 — CHAMA_FT PLACAR ELÁSTICO
+# Regra pequena e isolada para jogos praticamente definidos.
+# Só roda para CHAMA_FT + diferença >= 3 gols.
+# Não mexe no score, IA, VOLUME, SNIPER, ARCE ou grupo grátis.
+# =========================================================
+
+def dc01_chama_placar_elastico(m: "Metricas") -> Tuple[str, str]:
+    """Classifica CHAMA_FT com diferença de 3+ gols em MORTO/MEIO_TERMO/CAOS/APROVAR.
+
+    Retorno:
+      - NAO_APLICA: qualquer coisa fora do alvo da regra.
+      - BLOQUEAR: placar elástico realmente morto.
+      - CONFIRMAR: existe vida, mas não o suficiente para entrada direta.
+      - APROVAR: caos vivo/ataque contra contra-ataque validado.
+
+    Filosofia DC01:
+    - Austrália/liga aberta ajuda como contexto, mas não salva jogo morto.
+    - Perdedor pressionando fraco em 3+ gols não basta.
+    - Perdedor pressionando forte + vencedor vivo = cenário de transição/caos.
+    - Vencedor amassando em placar elástico, principalmente com gol recente, vai para confirmação.
+    """
+    if not HABILITAR_DC01_CHAMA_PLACAR_ELASTICO:
+        return "NAO_APLICA", "DC01_CHAMA_PLACAR_FLAG_OFF"
+    if m.estrategia != "CHAMA_FT":
+        return "NAO_APLICA", f"DC01_NAO_CHAMA_FT_{m.estrategia}"
+    if not eh_ft(m.estrategia) or eh_confirmacao(m.estrategia):
+        return "NAO_APLICA", "DC01_NAO_FT_OU_CONFIRMACAO"
+
+    dif = diferenca_placar(m)
+    if dif < DC01_CHAMA_DIF_MIN_PLACAR_ELASTICO:
+        return "NAO_APLICA", f"DC01_DIF_{dif}_ABAIXO_{DC01_CHAMA_DIF_MIN_PLACAR_ELASTICO}"
+
+    vencedor = lado_vencendo(m)
+    perdedor = lado_perdendo(m)
+    lado = m.lado_pressionante
+    if vencedor not in {"CASA", "FORA"} or perdedor not in {"CASA", "FORA"}:
+        return "NAO_APLICA", "DC01_PLACAR_SEM_VENCEDOR_PERDEDOR"
+    if lado not in {"CASA", "FORA"}:
+        return "BLOQUEAR", "DC01_CHAMA_PLACAR_ELASTICO_SEM_LADO_PRESSIONANTE"
+
+    d_perd = dados_lado(m, perdedor)
+    d_venc = dados_lado(m, vencedor)
+    ip_perd = ip_lado(m, perdedor)
+    ip_venc = ip_lado(m, vencedor)
+
+    perdedor_ja_marcou = gols_lado(m, perdedor)[0] > 0
+    delta_gol = minutos_desde_ultimo_gol(m)
+    gol_recente_vencedor = bool(m.ultimo_gol_lado == vencedor and -1 <= delta_gol <= 8)
+
+    # Pressão forte do perdedor: não basta IP 12/14 em placar elástico.
+    perdedor_pressao_forte = (
+        (ip_perd["c18"] >= 3 or ip_perd["c22"] >= 2 or ip_perd["pico"] >= 24)
+        and (d_perd["u5"] >= 3 or d_perd["u10"] >= 7)
+        and (d_perd["chance"] >= 6 or d_perd["rb"] >= 1 or d_perd["rl"] >= 2 or d_perd["xg"] >= 0.20)
+    )
+    perdedor_pressao_absurda = (
+        (ip_perd["c18"] >= 5 or ip_perd["c22"] >= 3 or ip_perd["pico"] >= 28)
+        and (d_perd["u5"] >= 5 or d_perd["u10"] >= 10)
+    )
+
+    # Vencedor vivo: sinais mínimos de contra-ataque/resposta nos últimos 10.
+    vencedor_vivo = (
+        d_venc["u5"] >= 1
+        or d_venc["u10"] >= 3
+        or d_venc["rb"] >= 1
+        or d_venc["rl"] >= 2
+        or d_venc["chance"] >= 5
+        or d_venc["xg"] >= 0.20
+        or ip_venc["pico"] >= 15
+        or ip_venc["c15"] >= 1
+    )
+    vencedor_extremo = pressao_extrema_lado(m, vencedor) or (
+        (ip_venc["pico"] >= 24 or ip_venc["c18"] >= 2)
+        and (d_venc["u5"] >= 4 or d_venc["u10"] >= 8)
+        and (d_venc["rb"] >= 2 or d_venc["chance"] >= 10 or d_venc["rl"] >= 5)
+    )
+
+    ambos_mortos = (
+        d_perd["u5"] <= 1 and d_perd["u10"] <= 3 and d_perd["rb"] == 0 and d_perd["rl"] <= 1 and ip_perd["pico"] < 15
+        and d_venc["u5"] <= 1 and d_venc["u10"] <= 3 and d_venc["rb"] == 0 and d_venc["rl"] <= 1 and ip_venc["pico"] < 15
+    )
+
+    resumo = (
+        f"dif={dif}|press={lado}|vencedor={vencedor}|perdedor={perdedor}|"
+        f"perd_u5={d_perd['u5']} u10={d_perd['u10']} rb={d_perd['rb']} rl={d_perd['rl']} chance={d_perd['chance']} xg={d_perd['xg']:.2f} "
+        f"ip={ip_perd['pico']}/c18={ip_perd['c18']}/c22={ip_perd['c22']}|"
+        f"venc_u5={d_venc['u5']} u10={d_venc['u10']} rb={d_venc['rb']} rl={d_venc['rl']} chance={d_venc['chance']} xg={d_venc['xg']:.2f} "
+        f"ip={ip_venc['pico']}/c18={ip_venc['c18']}|"
+        f"perd_marcou={perdedor_ja_marcou}|gol_rec_venc={gol_recente_vencedor}|delta_gol={delta_gol}"
+    )
+
+    if ambos_mortos:
+        return "BLOQUEAR", "DC01_CHAMA_PLACAR_ELASTICO_MORTO | " + resumo
+
+    # Perdedor gera o alerta: só aprova direto se for pressão forte/absurda E o vencedor ainda responde.
+    if lado == perdedor:
+        if perdedor_pressao_absurda and vencedor_vivo:
+            return "APROVAR", "DC01_CHAMA_PLACAR_ELASTICO_CAOS_PERDEDOR_ABSURDO_VENCEDOR_VIVO | " + resumo
+        if perdedor_pressao_forte and vencedor_vivo:
+            return "APROVAR", "DC01_CHAMA_PLACAR_ELASTICO_CAOS_PERDEDOR_FORTE_VENCEDOR_VIVO | " + resumo
+        if perdedor_pressao_forte or vencedor_vivo or perdedor_ja_marcou:
+            return "CONFIRMAR", "DC01_CHAMA_PLACAR_ELASTICO_MEIO_TERMO_PERDEDOR | " + resumo
+        return "BLOQUEAR", "DC01_CHAMA_PLACAR_ELASTICO_PERDEDOR_PRESSAO_MORNA_VENCEDOR_MORTO | " + resumo
+
+    # Vencedor gera o alerta: em placar elástico não liberar fácil, principalmente se acabou de marcar.
+    if lado == vencedor:
+        if vencedor_extremo and not gol_recente_vencedor and d_venc["u5"] >= 4 and d_venc["u10"] >= 8:
+            return "APROVAR", "DC01_CHAMA_PLACAR_ELASTICO_VENCEDOR_EXTREMO_SEM_GOL_RECENTE | " + resumo
+        if vencedor_vivo or vencedor_extremo:
+            return "CONFIRMAR", "DC01_CHAMA_PLACAR_ELASTICO_VENCEDOR_VIVO_EXIGE_CONFIRMACAO | " + resumo
+        return "BLOQUEAR", "DC01_CHAMA_PLACAR_ELASTICO_VENCEDOR_SATISFEITO | " + resumo
+
+    return "CONFIRMAR", "DC01_CHAMA_PLACAR_ELASTICO_LADO_DIVERGENTE_MEIO_TERMO | " + resumo
+
+# =========================================================
 # SNIPER V2 — LEITURA SEPARADA FT
 # Módulo isolado: não altera CHAMA, VOLUME, ARCE, score central nem IA V28.
 # Filosofia: favorito forte + necessidade + pressão madura no fim do jogo.
@@ -4039,9 +4164,9 @@ def v13_gerar_html(tipo: str, dt: Optional[datetime] = None) -> Path:
           <div class="meta">⏱ {minuto}' &nbsp;|&nbsp; 📊 {placar} &nbsp;|&nbsp; Score: <b>{score}%</b> &nbsp;|&nbsp; Liga: {liga} &nbsp;|&nbsp; {link_tag}</div>
           {motivo_txt}
           <div class="actions">
-            <button type="button" class="btn green" data-action="GREEN" data-id="{uid}">✅ GREEN</button>
-            <button type="button" class="btn red" data-action="RED" data-id="{uid}">❌ RED</button>
-            <button type="button" class="btn clear" data-action="CLEAR" data-id="{uid}">↩ LIMPAR</button>
+            <button type="button" class="btn green" data-action="GREEN" data-id="{uid}" onclick="marcarResultado('{uid}', 'GREEN'); return false;">✅ GREEN</button>
+            <button type="button" class="btn red" data-action="RED" data-id="{uid}" onclick="marcarResultado('{uid}', 'RED'); return false;">❌ RED</button>
+            <button type="button" class="btn clear" data-action="CLEAR" data-id="{uid}" onclick="limparResultado('{uid}'); return false;">↩ LIMPAR</button>
             <span class="status" id="status-{uid}">PENDENTE</span>
           </div>
         </div>""")
@@ -4183,6 +4308,7 @@ function exportarCSV() {{
 document.addEventListener('click', function(e) {{
   const btn = e.target.closest('button[data-action][data-id]');
   if (!btn) return;
+  e.preventDefault();
   const id = btn.dataset.id;
   const action = btn.dataset.action;
   if (action === 'GREEN' || action === 'RED') {{
@@ -4191,6 +4317,7 @@ document.addEventListener('click', function(e) {{
     limparResultado(id);
   }}
 }});
+document.addEventListener('DOMContentLoaded', aplicarEstado);
 aplicarEstado();
 </script>
 </body>
@@ -4409,6 +4536,34 @@ async def processar_alerta(alerta: Alerta) -> None:
         log(f"🟢 VOLUME_FT FILTRO PASSOU | {motivo_vol} | {m.jogo}")
         m.fluxo_decisao = "VOLUME_FT_APROVADO"  # V14 — preserva rastreio para auditoria futura
         m.estrategia = "ALFA_FT"  # Mensagem pública sai como ALFA, não como VOLUME_FT.
+
+    # DC01 — CHAMA_FT com placar elástico: regra isolada antes do score/IA.
+    # Estados: BLOQUEAR -> morre; CONFIRMAR -> espera BOT_FT CONFIRMAÇÃO; APROVAR -> segue fluxo normal.
+    acao_dc01, motivo_dc01 = dc01_chama_placar_elastico(m)
+    if acao_dc01 == "BLOQUEAR":
+        m.fluxo_decisao = "DC01_CHAMA_PLACAR_ELASTICO_BLOQUEADO"
+        m.fluxo_motivo = motivo_dc01
+        log(f"⛔ DC01 CHAMA PLACAR ELÁSTICO BLOQUEADO | {m.jogo} | {motivo_dc01}")
+        await registrar_bloqueio_fluxo(m, f"{m.fluxo_decisao} | {motivo_dc01}", score=0)
+        ultimas_leituras_por_jogo[chave] = {"metricas": m, "score": 0, "recebido_em": time.time()}
+        return
+    if acao_dc01 == "CONFIRMAR":
+        m.fluxo_decisao = "DC01_CHAMA_PLACAR_ELASTICO_AGUARDANDO_CONFIRMACAO"
+        m.fluxo_motivo = motivo_dc01
+        pendentes_confirmacao_ft[chave] = {"metricas": m, "recebido_em": time.time(), "motivo": motivo_dc01}
+        timeout_s = timeout_confirmacao_segundos(m)
+        tarefa_antiga = tarefas_timeout_confirmacao_ft.pop(chave, None)
+        if tarefa_antiga and not tarefa_antiga.done():
+            tarefa_antiga.cancel()
+        tarefas_timeout_confirmacao_ft[chave] = asyncio.create_task(cancelar_pendente_confirmacao_ft_depois(chave, timeout_s))
+        log(f"⏳ DC01 CHAMA PLACAR ELÁSTICO → CONFIRMAÇÃO | timeout={timeout_s}s | {m.jogo} | {motivo_dc01}")
+        await registrar_bloqueio_fluxo(m, f"AGUARDANDO_CONFIRMACAO_DC01 | {motivo_dc01}", decisao="AGUARDANDO", score=0)
+        ultimas_leituras_por_jogo[chave] = {"metricas": m, "score": 0, "recebido_em": time.time()}
+        return
+    if acao_dc01 == "APROVAR":
+        m.fluxo_decisao = "DC01_CHAMA_PLACAR_ELASTICO_APROVADO_PARA_SCORE"
+        m.fluxo_motivo = (m.fluxo_motivo or "") + f" | {motivo_dc01}"
+        log(f"✅ DC01 CHAMA PLACAR ELÁSTICO PASSOU | {m.jogo} | {motivo_dc01}")
 
     # V026 — FAV_NAO_PRESSIONANTE: penaliza score FT onde favorito não é o lado pressionante.
     # Modo auditoria: não bloqueia — registra motivo e aplica penalidade no score.
