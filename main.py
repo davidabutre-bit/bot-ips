@@ -44,6 +44,7 @@ import httpx
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
 from telethon.errors import FloodWaitError
+from telethon.sessions import StringSession
 
 try:
     from telethon.errors.common import TypeNotFoundError
@@ -76,7 +77,7 @@ try:
 except ValueError as exc:
     raise RuntimeError("API_ID inválido — precisa ser número inteiro.") from exc
 
-SESSION_NAME = os.getenv("SESSION_NAME", "coutips_v2_session")
+SESSION_STRING = os.getenv("SESSION_STRING", "").strip()
 
 TARGET_CHANNEL = (
     os.getenv("TARGET_CHANNEL")
@@ -254,7 +255,11 @@ V11_TZ_OFFSET_HORAS = int(os.getenv("V11_TZ_OFFSET_HORAS", "-4"))
 # não apenas com rótulo errado. Rótulo errado corrigível segue normalmente.
 PARSER_CONFIANCA_CRITICA = int(os.getenv("PARSER_CONFIANCA_CRITICA", "2"))
 
-client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
+client = TelegramClient(
+    StringSession(SESSION_STRING),
+    API_ID,
+    API_HASH
+)
 
 
 # =========================================================
