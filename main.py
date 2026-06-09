@@ -56,7 +56,7 @@ except Exception:  # pragma: no cover
 # VERSÃO / CONFIGURAÇÃO BASE
 # =========================================================
 
-VERSAO_COUTIPS = "DC01_COUTIPS_ALFA_2026_06_09"
+VERSAO_COUTIPS = "DC01_1_COUTIPS_ALFA_2026_06_09"
 
 load_dotenv()
 
@@ -216,6 +216,16 @@ V28_UNDER_TETO_SCORE = int(os.getenv("V28_UNDER_TETO_SCORE", str(V27_UNDER_TETO_
 # =========================================================
 HABILITAR_DC01_CHAMA_PLACAR_ELASTICO = os.getenv("HABILITAR_DC01_CHAMA_PLACAR_ELASTICO", "true").lower() == "true"
 DC01_CHAMA_DIF_MIN_PLACAR_ELASTICO = int(os.getenv("DC01_CHAMA_DIF_MIN_PLACAR_ELASTICO", "3"))
+
+# =========================================================
+# DC01.1 — FILOSOFIA DA NECESSIDADE
+# Ajuste final: SNIPER só aceita favorito em necessidade real.
+# ARCE/HT com placar largo só passa se ainda existir jogo vivo/ameaça real.
+# =========================================================
+HABILITAR_DC01_1_SNIPER_NECESSIDADE = os.getenv("HABILITAR_DC01_1_SNIPER_NECESSIDADE", "true").lower() == "true"
+HABILITAR_DC01_1_HT_PLACAR_LARGO_NECESSIDADE = os.getenv("HABILITAR_DC01_1_HT_PLACAR_LARGO_NECESSIDADE", "true").lower() == "true"
+DC01_1_HT_DIF_MIN_PLACAR_LARGO = int(os.getenv("DC01_1_HT_DIF_MIN_PLACAR_LARGO", "3"))
+
 
 # V012 — camadas cirúrgicas: grupo grátis, ALAVANCAGEM, Austrália especial e HT-2.
 # Mantém score, funil, IA e parser centrais preservados.
@@ -421,6 +431,8 @@ def logar_versao_inicial() -> None:
     log(f"🧬 V28 DNA projetado: {'ATIVO' if HABILITAR_V28 and HABILITAR_V28_DNA_PROJETADO else 'DESATIVADO'}")
     log(f"⏱ V28 relógio FT janela 81: {'ATIVO' if HABILITAR_V28 and HABILITAR_V28_RELOGIO_FT else 'DESATIVADO'}")
     log(f"🧱 DC01 CHAMA placar elástico 3+: {'ATIVO' if HABILITAR_DC01_CHAMA_PLACAR_ELASTICO else 'DESATIVADO'}")
+    log(f"🎯 DC01.1 SNIPER necessidade real: {'ATIVO' if HABILITAR_DC01_1_SNIPER_NECESSIDADE else 'DESATIVADO'}")
+    log(f"⚡ DC01.1 HT placar largo com necessidade: {'ATIVO' if HABILITAR_DC01_1_HT_PLACAR_LARGO_NECESSIDADE else 'DESATIVADO'}")
     log("🎯 SNIPER V2: ATIVO | leitura separada, pressão premiada/gol contra fluxo/necessidade")
     log("🏷️ Auditoria visual: ⚡ ARCE HT | 1T / 🔥 CHAMA FT | 2T / 📊 VOLUME FT | 2T / 🎯 SNIPER | 2T")
     log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
@@ -2553,6 +2565,12 @@ def funil_obrigatorio_hibrido(m: Metricas) -> Tuple[bool, int, str, Dict[str, An
     if eh_ht(m.estrategia):
         # V007 — HT/AHT é camada premium. Não buscamos volume.
         # Só passa com massacre contextual real. Se houve gol recente, a régua sobe.
+        ht_morto, ht_motivo_dc01_1 = dc01_1_ht_placar_largo_sem_necessidade(m, lado)
+        detalhes["dc01_1_ht_placar_largo"] = ht_morto
+        detalhes["dc01_1_ht_placar_largo_motivo"] = ht_motivo_dc01_1
+        if ht_morto:
+            return False, 78, "FUNIL_DC01_1_HT_PLACAR_LARGO_SEM_NECESSIDADE | " + ht_motivo_dc01_1, detalhes
+
         if m.lado_favorito != lado and m.odd_favorito and m.odd_favorito > 1.60:
             return False, 80, f"FUNIL_HT_ZEBRA_DOMINANDO_ODD={m.odd_favorito:.2f}", detalhes
 
@@ -3728,6 +3746,152 @@ def sniper_gol_contra_fluxo(m: "Metricas") -> Tuple[bool, str]:
     return False, "SNIPER_SEM_GOL_CONTRA_FLUXO"
 
 
+
+def dc01_1_zebra_ameaca_real(m: "Metricas", zebra: str) -> Tuple[bool, str]:
+    """DC01.1 — mede se a zebra está viva o bastante para manter necessidade.
+
+    Usada principalmente quando o favorito já vence por 1 no SNIPER.
+    Não basta o favorito estar pressionando; a zebra precisa ameaçar o empate.
+    """
+    if zebra not in {"CASA", "FORA"}:
+        return False, "ZEBRA_INVALIDA"
+    d = dados_lado(m, zebra)
+    ip = ip_lado(m, zebra)
+    provas = 0
+    motivos = []
+    if d["rb"] >= 1:
+        provas += 1; motivos.append(f"RB={d['rb']}")
+    if d["rl"] >= 2:
+        provas += 1; motivos.append(f"RL={d['rl']}")
+    if d["cantos"] >= 1:
+        provas += 1; motivos.append(f"CANTOS={d['cantos']}")
+    if d["u5"] >= 2 or d["u10"] >= 4:
+        provas += 1; motivos.append(f"U5={d['u5']}_U10={d['u10']}")
+    if d["chance"] >= 5 or d["xg"] >= 0.20:
+        provas += 1; motivos.append(f"CHANCE={d['chance']}_XG={d['xg']:.2f}")
+    if ip["pico"] >= 16 or ip["c15"] >= 1:
+        provas += 1; motivos.append(f"IP={ip['pico']}_C15={ip['c15']}")
+
+    ok = provas >= 2
+    return ok, f"ZEBRA_AMEACA_PROVAS={provas}/6|" + "|".join(motivos)
+
+
+def dc01_1_sniper_necessidade_real(m: "Metricas") -> Tuple[bool, str]:
+    """DC01.1 — identidade final do SNIPER.
+
+    SNIPER é bot de necessidade, não de simples pressão.
+    - Favorito perdendo: cenário natural.
+    - Favorito empatando: cenário natural.
+    - Favorito vencendo por 1: só se a zebra estiver viva e ameaçando.
+    - Favorito vencendo por 2+: bloqueia.
+    """
+    if not HABILITAR_DC01_1_SNIPER_NECESSIDADE:
+        return True, "DC01_1_SNIPER_NECESSIDADE_OFF"
+    if not eh_sniper_ft(m.estrategia):
+        return True, "NAO_SNIPER"
+
+    fav = m.lado_favorito
+    if fav not in {"CASA", "FORA"}:
+        return False, "SNIPER_NECESSIDADE_SEM_FAVORITO"
+
+    vencedor = lado_vencendo(m)
+    diff = diferenca_placar(m)
+
+    if vencedor == "EMPATE":
+        return True, "SNIPER_NECESSIDADE_FAVORITO_EMPATANDO"
+    if vencedor != fav:
+        return True, "SNIPER_NECESSIDADE_FAVORITO_PERDENDO"
+
+    # Favorito já vence: só passa por 1 e com ameaça real da zebra.
+    if diff >= 2:
+        return False, f"SNIPER_SEM_NECESSIDADE_FAVORITO_VENCE_{diff}"
+
+    zebra = lado_oposto(fav)
+    zebra_ok, zebra_motivo = dc01_1_zebra_ameaca_real(m, zebra)
+    if not zebra_ok:
+        return False, "SNIPER_FAVORITO_VENCE_1_SEM_AMEACA_DA_ZEBRA | " + zebra_motivo
+
+    return True, "SNIPER_FAVORITO_VENCE_1_MAS_ZEBRA_VIVA | " + zebra_motivo
+
+
+def dc01_1_ht_adversario_tem_vida(m: "Metricas", adversario: str) -> Tuple[bool, str]:
+    """DC01.1 — avalia se o time que está apanhando no HT ainda ameaça.
+
+    A ideia não é bloquear 3x0 automaticamente. É bloquear 3x0 morto:
+    favorito muito superior, zebra sem remate, sem canto, sem AP recente e sem IP.
+    """
+    if adversario not in {"CASA", "FORA"}:
+        return False, "ADVERSARIO_INVALIDO"
+    d = dados_lado(m, adversario)
+    ip = ip_lado(m, adversario)
+    provas = 0
+    motivos = []
+    if d["rb"] >= 1:
+        provas += 1; motivos.append(f"RB={d['rb']}")
+    if d["rl"] >= 2:
+        provas += 1; motivos.append(f"RL={d['rl']}")
+    if d["cantos"] >= 1:
+        provas += 1; motivos.append(f"CANTOS={d['cantos']}")
+    if d["u5"] >= 2 or d["u10"] >= 4:
+        provas += 1; motivos.append(f"U5={d['u5']}_U10={d['u10']}")
+    if d["chance"] >= 4 or d["xg"] >= 0.15:
+        provas += 1; motivos.append(f"CHANCE={d['chance']}_XG={d['xg']:.2f}")
+    if ip["pico"] >= 14 or ip["c10"] >= 2:
+        provas += 1; motivos.append(f"IP={ip['pico']}_C10={ip['c10']}")
+    return provas >= 2, f"ADVERSARIO_VIDA_PROVAS={provas}/6|" + "|".join(motivos)
+
+
+def dc01_1_ht_placar_largo_sem_necessidade(m: "Metricas", lado: str) -> Tuple[bool, str]:
+    """DC01.1 — ARCE/HT: 3x0 no 1T só passa se ainda houver necessidade.
+
+    Não mata placar largo por si só. Bloqueia apenas quando:
+    - HT;
+    - diferença >= 3;
+    - o lado pressionante é o vencedor;
+    - odds muito desequilibradas OU adversário totalmente morto;
+    - adversário não mostra ameaça mínima.
+    """
+    if not HABILITAR_DC01_1_HT_PLACAR_LARGO_NECESSIDADE:
+        return False, "DC01_1_HT_PLACAR_LARGO_OFF"
+    if not eh_ht(m.estrategia):
+        return False, "NAO_HT"
+    diff = diferenca_placar(m)
+    if diff < DC01_1_HT_DIF_MIN_PLACAR_LARGO:
+        return False, f"HT_DIF_{diff}_MENOR_QUE_LIMITE"
+    vencedor = lado_vencendo(m)
+    if vencedor not in {"CASA", "FORA"}:
+        return False, "HT_SEM_VENCEDOR"
+    if lado != vencedor:
+        return False, "HT_LADO_ANALISADO_NAO_E_VENCEDOR"
+
+    adversario = lado_oposto(vencedor)
+    adv_vivo, adv_motivo = dc01_1_ht_adversario_tem_vida(m, adversario)
+    odds_muito_desequilibradas = bool(m.odd_favorito and m.odd_favorito <= 1.25)
+
+    d_v = dados_lado(m, vencedor)
+    ip_v = ip_lado(m, vencedor)
+    massacre_fora_da_curva = (
+        d_v["u5"] >= 7
+        and d_v["u10"] >= 14
+        and (d_v["rb"] >= 4 or d_v["chance"] >= 15 or d_v["xg"] >= 0.80)
+        and (ip_v["pico"] >= 28 or ip_v["c18"] >= 3 or ip_v["c22"] >= 2)
+    )
+
+    # Se o adversário está vivo, o jogo ainda tem ameaça e pode seguir.
+    if adv_vivo:
+        return False, "HT_PLACAR_LARGO_MAS_ADVERSARIO_VIVO | " + adv_motivo
+
+    # Se o adversário não está vivo, só preserva massacre realmente fora da curva.
+    if massacre_fora_da_curva and not odds_muito_desequilibradas:
+        return False, "HT_PLACAR_LARGO_MAS_MASSACRE_FORA_DA_CURVA | " + adv_motivo
+
+    return True, (
+        f"HT_PLACAR_LARGO_SEM_NECESSIDADE | diff={diff}|odd_fav={m.odd_favorito}|"
+        f"vencedor={vencedor}|adversario={adversario}|{adv_motivo}|"
+        f"massacre_fora_curva={massacre_fora_da_curva}|odds_muito_desequilibradas={odds_muito_desequilibradas}"
+    )
+
+
 def filtro_sniper_ft_v2(m: "Metricas") -> Tuple[bool, str]:
     """Porta própria do 🎯 SNIPER.
 
@@ -3750,6 +3914,10 @@ def filtro_sniper_ft_v2(m: "Metricas") -> Tuple[bool, str]:
         return False, f"SNIPER_ODD_FAVORITO_ACIMA_1_60 | odd={m.odd_favorito}"
     if press != fav:
         return False, f"SNIPER_FAVORITO_NAO_PRESSIONANTE | fav={fav} press={press}"
+
+    necessidade_ok, necessidade_motivo = dc01_1_sniper_necessidade_real(m)
+    if not necessidade_ok:
+        return False, necessidade_motivo
 
     classe_placar, motivo_placar = sniper_contexto_placar(m)
     if classe_placar == "MORTO":
@@ -4114,16 +4282,12 @@ def v13_registrar(m: "Metricas", score_medio: int, aprovado: bool, motivo: str) 
 def v13_gerar_html(tipo: str, dt: Optional[datetime] = None) -> Path:
     """Gera HTML diário interativo a partir do JSON.
 
-    V22 — restaura o padrão oficial de auditoria COUTIPS:
-    - botões GREEN / RED por jogo;
-    - marcação salva no próprio navegador via localStorage;
-    - contadores de marcados/greens/reds/pendentes;
-    - exportação JSON e CSV das marcações;
-    - link CornerPro preservado.
-
-    Observação: como o HTML é aberto localmente no navegador/Telegram, a marcação
-    fica salva no aparelho/navegador usado para auditar, não volta automaticamente
-    para o Railway. Para enviar resultado, usar os botões de exportação.
+    DC01.1 HTMLFIX:
+    - remove dependência de onclick inline;
+    - usa addEventListener direto nos botões após DOMContentLoaded;
+    - localStorage tem fallback em memória caso o navegador/WebView bloqueie;
+    - botões sempre dão feedback visual imediato;
+    - guarda/exporta GREEN/RED.
     """
     dt = dt or datetime.now()
     arq_json = _v13_arquivo_json(tipo, dt)
@@ -4138,25 +4302,26 @@ def v13_gerar_html(tipo: str, dt: Optional[datetime] = None) -> Path:
     titulo = "APROVADOS" if tipo == "aprovados" else "REPROVADOS"
     cor = "#00c853" if tipo == "aprovados" else "#e53935"
     data_fmt = dt.strftime("%d/%m/%Y")
+    data_key = dt.strftime("%Y_%m_%d")
     total = len(registros)
-    storage_key = f"coutips_auditoria_{tipo}_{dt.strftime('%Y_%m_%d')}"
+    storage_key = f"coutips_auditoria_{tipo}_{data_key}"
 
     linhas_html = []
     for i, r in enumerate(registros):
         link = str(r.get("cornerpro", "") or "")
-        link_tag = f'<a href="{html.escape(link)}" target="_blank" rel="noopener">🔗 CornerPro</a>' if link else "—"
+        link_safe = html.escape(link, quote=True)
+        link_tag = f'<a href="{link_safe}" target="_blank" rel="noopener noreferrer">🔗 CornerPro</a>' if link else "—"
         motivo_txt = f'<div class="motivo">{html.escape(str(r.get("motivo", "") or ""))}</div>' if r.get("motivo") else ""
-        bot = html.escape(str(r.get("bot", "") or ""))
-        jogo = html.escape(str(r.get("jogo", "") or ""))
-        minuto = html.escape(str(r.get("minuto", "") or ""))
-        placar = html.escape(str(r.get("placar", "") or ""))
-        score = html.escape(str(r.get("score", "") or ""))
-        liga = html.escape(str(r.get("liga", "") or ""))
+        bot = html.escape(str(r.get("bot", "") or ""), quote=True)
+        jogo = html.escape(str(r.get("jogo", "") or ""), quote=True)
+        minuto = html.escape(str(r.get("minuto", "") or ""), quote=True)
+        placar = html.escape(str(r.get("placar", "") or ""), quote=True)
+        score = html.escape(str(r.get("score", "") or ""), quote=True)
+        liga = html.escape(str(r.get("liga", "") or ""), quote=True)
         uid_base = f"{r.get('bot','')}|{r.get('jogo','')}|{r.get('minuto','')}|{r.get('placar','')}|{r.get('score','')}|{i}"
-        # UID curto e seguro para HTML/JS. Evita aspas, espaços e acentos quebrando botões.
         uid = hashlib.sha1(uid_base.encode("utf-8", errors="ignore")).hexdigest()[:16]
         linhas_html.append(f"""
-        <div class="item" data-id="{uid}" data-bot="{bot}" data-jogo="{jogo}" data-minuto="{minuto}" data-placar="{placar}" data-score="{score}" data-liga="{liga}" data-cornerpro="{html.escape(link, quote=True)}">
+        <article class="item" data-id="{uid}" data-bot="{bot}" data-jogo="{jogo}" data-minuto="{minuto}" data-placar="{placar}" data-score="{score}" data-liga="{liga}" data-cornerpro="{link_safe}">
           <div class="topline">
             <span class="badge">{bot}</span>
             <strong>{jogo}</strong>
@@ -4164,12 +4329,12 @@ def v13_gerar_html(tipo: str, dt: Optional[datetime] = None) -> Path:
           <div class="meta">⏱ {minuto}' &nbsp;|&nbsp; 📊 {placar} &nbsp;|&nbsp; Score: <b>{score}%</b> &nbsp;|&nbsp; Liga: {liga} &nbsp;|&nbsp; {link_tag}</div>
           {motivo_txt}
           <div class="actions">
-            <button type="button" class="btn green" data-action="GREEN" data-id="{uid}" onclick="marcarResultado('{uid}', 'GREEN'); return false;">✅ GREEN</button>
-            <button type="button" class="btn red" data-action="RED" data-id="{uid}" onclick="marcarResultado('{uid}', 'RED'); return false;">❌ RED</button>
-            <button type="button" class="btn clear" data-action="CLEAR" data-id="{uid}" onclick="limparResultado('{uid}'); return false;">↩ LIMPAR</button>
+            <button type="button" class="btn green js-result" data-action="GREEN" data-id="{uid}">✅ GREEN</button>
+            <button type="button" class="btn red js-result" data-action="RED" data-id="{uid}">❌ RED</button>
+            <button type="button" class="btn clear js-result" data-action="CLEAR" data-id="{uid}">↩ LIMPAR</button>
             <span class="status" id="status-{uid}">PENDENTE</span>
           </div>
-        </div>""")
+        </article>""")
 
     corpo = "\n".join(linhas_html) if linhas_html else "<p class='vazio'>Nenhum registro ainda.</p>"
 
@@ -4190,9 +4355,9 @@ def v13_gerar_html(tipo: str, dt: Optional[datetime] = None) -> Path:
   .pill.green{{border-color:#00c853;color:#69f0ae}}
   .pill.red{{border-color:#e53935;color:#ff8a80}}
   .pill.pending{{border-color:#ffb300;color:#ffd54f}}
-  .item{{background:#181818;border-left:4px solid {cor};border-radius:8px;padding:11px 12px;margin:8px 0;font-size:0.88rem;line-height:1.55}}
-  .item.green-marked{{box-shadow:0 0 0 1px rgba(0,200,83,.5);border-left-color:#00c853}}
-  .item.red-marked{{box-shadow:0 0 0 1px rgba(229,57,53,.55);border-left-color:#e53935}}
+  .item{{background:#181818;border-left:4px solid {cor};border-radius:8px;padding:11px 12px;margin:8px 0;font-size:0.88rem;line-height:1.55;position:relative}}
+  .item.green-marked{{box-shadow:0 0 0 1px rgba(0,200,83,.5);border-left-color:#00c853;background:#102116}}
+  .item.red-marked{{box-shadow:0 0 0 1px rgba(229,57,53,.55);border-left-color:#e53935;background:#241111}}
   .topline{{display:flex;align-items:center;gap:7px;flex-wrap:wrap;margin-bottom:3px}}
   .badge{{display:inline-block;background:#1e3a5f;color:#90caf9;padding:2px 8px;border-radius:10px;font-size:0.72rem;font-weight:800}}
   .meta{{color:#ddd}}
@@ -4200,7 +4365,8 @@ def v13_gerar_html(tipo: str, dt: Optional[datetime] = None) -> Path:
   a{{color:#ffb300;text-decoration:none}}
   a:hover{{text-decoration:underline}}
   .actions{{display:flex;gap:7px;align-items:center;flex-wrap:wrap;margin-top:10px}}
-  .btn{{border:0;border-radius:8px;padding:8px 10px;font-weight:800;font-size:.78rem;cursor:pointer;color:#fff}}
+  .btn{{border:0;border-radius:8px;padding:10px 12px;font-weight:900;font-size:.82rem;cursor:pointer;color:#fff;touch-action:manipulation;user-select:none;pointer-events:auto}}
+  .btn:active{{transform:scale(.97)}}
   .btn.green{{background:#0b8f3a}}
   .btn.red{{background:#b3261e}}
   .btn.clear{{background:#333;color:#ddd}}
@@ -4209,6 +4375,7 @@ def v13_gerar_html(tipo: str, dt: Optional[datetime] = None) -> Path:
   .status.green{{color:#69f0ae}}
   .status.red{{color:#ff8a80}}
   .vazio{{color:#888;margin-top:16px}}
+  .debug{{margin-top:8px;color:#777;font-size:.72rem}}
 </style>
 </head>
 <body>
@@ -4222,110 +4389,159 @@ def v13_gerar_html(tipo: str, dt: Optional[datetime] = None) -> Path:
     <span class="pill pending">Pendentes: <b id="pendentes">{total}</b></span>
   </div>
   <div class="actions">
-    <button type="button" class="btn export" onclick="exportarJSON()">⬇ Exportar JSON</button>
-    <button type="button" class="btn export" onclick="exportarCSV()">⬇ Exportar CSV</button>
+    <button type="button" class="btn export" id="btnExportJson">⬇ Exportar JSON</button>
+    <button type="button" class="btn export" id="btnExportCsv">⬇ Exportar CSV</button>
   </div>
+  <div class="debug" id="debug">HTMLFIX DC01.1 carregando...</div>
 </div>
 {corpo}
 <script>
-const STORAGE_KEY = {json.dumps(storage_key)};
-function carregar() {{
-  try {{ return JSON.parse(localStorage.getItem(STORAGE_KEY) || '{{}}'); }} catch(e) {{ return {{}}; }}
-}}
-function salvar(dados) {{
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(dados));
-}}
-function marcarResultado(id, resultado) {{
-  const dados = carregar();
-  dados[id] = resultado;
-  salvar(dados);
-  aplicarEstado();
-}}
-function limparResultado(id) {{
-  const dados = carregar();
-  delete dados[id];
-  salvar(dados);
-  aplicarEstado();
-}}
-function aplicarEstado() {{
-  const dados = carregar();
-  let greens = 0, reds = 0;
-  document.querySelectorAll('.item').forEach(item => {{
-    const id = item.dataset.id;
-    const res = dados[id];
-    const st = document.getElementById('status-' + id);
-    item.classList.remove('green-marked','red-marked');
-    st.classList.remove('green','red');
-    if (res === 'GREEN') {{
-      greens++; item.classList.add('green-marked'); st.textContent = '✅ GREEN'; st.classList.add('green');
-    }} else if (res === 'RED') {{
-      reds++; item.classList.add('red-marked'); st.textContent = '❌ RED'; st.classList.add('red');
-    }} else {{
-      st.textContent = 'PENDENTE';
-    }}
-  }});
-  const total = document.querySelectorAll('.item').length;
-  document.getElementById('greens').textContent = greens;
-  document.getElementById('reds').textContent = reds;
-  document.getElementById('pendentes').textContent = total - greens - reds;
-}}
-function coletarResultados() {{
-  const dados = carregar();
-  return Array.from(document.querySelectorAll('.item')).map(item => {{
-    const id = item.dataset.id;
-    return {{
-      id: id,
-      resultado: dados[id] || '',
-      bot: item.dataset.bot || '',
-      jogo: item.dataset.jogo || '',
-      minuto: item.dataset.minuto || '',
-      placar: item.dataset.placar || '',
-      score: item.dataset.score || '',
-      liga: item.dataset.liga || '',
-      cornerpro: item.dataset.cornerpro || ''
-    }};
-  }});
-}}
-function baixar(nome, conteudo, tipo) {{
-  const blob = new Blob([conteudo], {{type: tipo}});
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url; a.download = nome; document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
-}}
-function exportarJSON() {{
-  baixar('coutips_{tipo}_{dt.strftime('%Y_%m_%d')}_resultados.json', JSON.stringify(coletarResultados(), null, 2), 'application/json;charset=utf-8');
-}}
-function csvEscape(v) {{
-  v = String(v ?? '');
-  return '"' + v.replaceAll('"', '""') + '"';
-}}
-function exportarCSV() {{
-  const rows = coletarResultados();
-  const header = ['resultado','bot','jogo','minuto','placar','score','liga','cornerpro'];
-  const csv = [header.join(',')].concat(rows.map(r => header.map(h => csvEscape(r[h])).join(','))).join('\n');
-  baixar('coutips_{tipo}_{dt.strftime('%Y_%m_%d')}_resultados.csv', csv, 'text/csv;charset=utf-8');
-}}
-document.addEventListener('click', function(e) {{
-  const btn = e.target.closest('button[data-action][data-id]');
-  if (!btn) return;
-  e.preventDefault();
-  const id = btn.dataset.id;
-  const action = btn.dataset.action;
-  if (action === 'GREEN' || action === 'RED') {{
-    marcarResultado(id, action);
-  }} else if (action === 'CLEAR') {{
-    limparResultado(id);
+(function() {{
+  'use strict';
+  const STORAGE_KEY = {json.dumps(storage_key)};
+  let memoria = {{}};
+
+  function debug(msg) {{
+    const el = document.getElementById('debug');
+    if (el) el.textContent = msg;
   }}
-}});
-document.addEventListener('DOMContentLoaded', aplicarEstado);
-aplicarEstado();
+
+  function carregar() {{
+    try {{
+      const raw = window.localStorage ? localStorage.getItem(STORAGE_KEY) : null;
+      memoria = raw ? JSON.parse(raw) : memoria;
+      return Object.assign({{}}, memoria);
+    }} catch(e) {{
+      return Object.assign({{}}, memoria);
+    }}
+  }}
+
+  function salvar(dados) {{
+    memoria = Object.assign({{}}, dados);
+    try {{
+      if (window.localStorage) localStorage.setItem(STORAGE_KEY, JSON.stringify(memoria));
+    }} catch(e) {{
+      debug('HTMLFIX: localStorage bloqueado, usando memória da página.');
+    }}
+  }}
+
+  function setResultado(id, resultado) {{
+    const dados = carregar();
+    if (resultado === 'CLEAR') delete dados[id];
+    else dados[id] = resultado;
+    salvar(dados);
+    aplicarEstado();
+  }}
+
+  function aplicarEstado() {{
+    const dados = carregar();
+    let greens = 0, reds = 0;
+    document.querySelectorAll('.item').forEach(function(item) {{
+      const id = item.getAttribute('data-id');
+      const res = dados[id];
+      const st = document.getElementById('status-' + id);
+      item.classList.remove('green-marked','red-marked');
+      if (st) {{
+        st.classList.remove('green','red');
+        st.textContent = 'PENDENTE';
+      }}
+      if (res === 'GREEN') {{
+        greens++;
+        item.classList.add('green-marked');
+        if (st) {{ st.textContent = '✅ GREEN'; st.classList.add('green'); }}
+      }} else if (res === 'RED') {{
+        reds++;
+        item.classList.add('red-marked');
+        if (st) {{ st.textContent = '❌ RED'; st.classList.add('red'); }}
+      }}
+    }});
+    const total = document.querySelectorAll('.item').length;
+    const g = document.getElementById('greens');
+    const r = document.getElementById('reds');
+    const p = document.getElementById('pendentes');
+    if (g) g.textContent = greens;
+    if (r) r.textContent = reds;
+    if (p) p.textContent = total - greens - reds;
+    debug('HTMLFIX DC01.1 ativo — botões GREEN/RED clicáveis.');
+  }}
+
+  function coletarResultados() {{
+    const dados = carregar();
+    return Array.from(document.querySelectorAll('.item')).map(function(item) {{
+      const id = item.getAttribute('data-id') || '';
+      return {{
+        id: id,
+        resultado: dados[id] || '',
+        bot: item.getAttribute('data-bot') || '',
+        jogo: item.getAttribute('data-jogo') || '',
+        minuto: item.getAttribute('data-minuto') || '',
+        placar: item.getAttribute('data-placar') || '',
+        score: item.getAttribute('data-score') || '',
+        liga: item.getAttribute('data-liga') || '',
+        cornerpro: item.getAttribute('data-cornerpro') || ''
+      }};
+    }});
+  }}
+
+  function baixar(nome, conteudo, tipo) {{
+    const blob = new Blob([conteudo], {{type: tipo}});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = nome;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(function() {{ URL.revokeObjectURL(url); }}, 500);
+  }}
+
+  function csvEscape(v) {{
+    v = String(v == null ? '' : v);
+    return '"' + v.replace(/"/g, '""') + '"';
+  }}
+
+  document.addEventListener('click', function(e) {{
+    const btn = e.target.closest('.js-result');
+    if (!btn) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const id = btn.getAttribute('data-id');
+    const action = btn.getAttribute('data-action');
+    if (!id || !action) return;
+    setResultado(id, action);
+  }}, true);
+
+  document.getElementById('btnExportJson')?.addEventListener('click', function(e) {{
+    e.preventDefault();
+    baixar('coutips_{tipo}_{data_key}_resultados.json', JSON.stringify(coletarResultados(), null, 2), 'application/json;charset=utf-8');
+  }});
+
+  document.getElementById('btnExportCsv')?.addEventListener('click', function(e) {{
+    e.preventDefault();
+    const rows = coletarResultados();
+    const header = ['resultado','bot','jogo','minuto','placar','score','liga','cornerpro'];
+    const csv = [header.join(',')].concat(rows.map(function(r) {{
+      return header.map(function(h) {{ return csvEscape(r[h]); }}).join(',');
+    }})).join('\\n');
+    baixar('coutips_{tipo}_{data_key}_resultados.csv', csv, 'text/csv;charset=utf-8');
+  }});
+
+  window.marcarResultado = function(id, resultado) {{ setResultado(id, resultado); }};
+  window.limparResultado = function(id) {{ setResultado(id, 'CLEAR'); }};
+
+  if (document.readyState === 'loading') {{
+    document.addEventListener('DOMContentLoaded', aplicarEstado);
+  }} else {{
+    aplicarEstado();
+  }}
+}})();
 </script>
 </body>
 </html>"""
 
     try:
         arq_html.write_text(conteudo, encoding="utf-8")
-        log(f"📄 V22 HTML interativo gerado | {arq_html.name} | {total} registros")
+        log(f"📄 DC01.1 HTMLFIX interativo gerado | {arq_html.name} | {total} registros")
     except Exception as e:
         log(f"⚠️ V13 gerar_html erro | {type(e).__name__}: {e}")
     return arq_html
