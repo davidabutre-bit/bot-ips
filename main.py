@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import csv
 import html
+import hashlib
 import logging
 import os
 import re
@@ -55,7 +56,7 @@ except Exception:  # pragma: no cover
 # VERSÃO / CONFIGURAÇÃO BASE
 # =========================================================
 
-VERSAO_COUTIPS = "ALFA_COUTIPS_2026_06_08_V28_FINAL_CONSOLIDADO_IA"
+VERSAO_COUTIPS = "ALFA_COUTIPS_2026_06_08_V28_SNIPER_V2"
 
 load_dotenv()
 
@@ -205,8 +206,6 @@ HABILITAR_V28_HT_MODERADO_BLOQUEIO = os.getenv("HABILITAR_V28_HT_MODERADO_BLOQUE
 HABILITAR_V28_UNDER_BLOQUEIO_FORTE = os.getenv("HABILITAR_V28_UNDER_BLOQUEIO_FORTE", "true").lower() == "true"
 HABILITAR_V28_DNA_PROJETADO = os.getenv("HABILITAR_V28_DNA_PROJETADO", "true").lower() == "true"
 HABILITAR_V28_RELOGIO_FT = os.getenv("HABILITAR_V28_RELOGIO_FT", "true").lower() == "true"
-# V28 — prompt IA reescrito como checklist de 6 criterios (auditoria, nao calculo)
-HABILITAR_V28_IA_CHECKLIST = os.getenv("HABILITAR_V28_IA_CHECKLIST", "true").lower() == "true"
 V28_UNDER_TETO_SCORE = int(os.getenv("V28_UNDER_TETO_SCORE", str(V27_UNDER_TETO_SCORE)))
 
 # V012 — camadas cirúrgicas: grupo grátis, ALAVANCAGEM, Austrália especial e HT-2.
@@ -412,7 +411,8 @@ def logar_versao_inicial() -> None:
     log(f"🚫 V28 UNDER bloqueio forte: {'ATIVO' if HABILITAR_V28 and HABILITAR_V28_UNDER_BLOQUEIO_FORTE else 'DESATIVADO'}")
     log(f"🧬 V28 DNA projetado: {'ATIVO' if HABILITAR_V28 and HABILITAR_V28_DNA_PROJETADO else 'DESATIVADO'}")
     log(f"⏱ V28 relógio FT janela 81: {'ATIVO' if HABILITAR_V28 and HABILITAR_V28_RELOGIO_FT else 'DESATIVADO'}")
-    log(f"🤖 V28 IA checklist 6 critérios: {'ATIVO' if HABILITAR_V28 and HABILITAR_V28_IA_CHECKLIST else 'DESATIVADO'}")
+    log("🎯 SNIPER V2: ATIVO | leitura separada, pressão premiada/gol contra fluxo/necessidade")
+    log("🏷️ Auditoria visual: ⚡ ARCE HT | 1T / 🔥 CHAMA FT | 2T / 📊 VOLUME FT | 2T / 🎯 SNIPER | 2T")
     log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
 
@@ -680,6 +680,16 @@ def contem_ht_moderado_bruto(texto: str) -> bool:
     return "HTMODERADO" in compacto or bool(re.search(r"\bHT\s*[-_ ]*MODERADO\b", raw))
 
 
+def contem_sniper_bruto(texto: str) -> bool:
+    """SNIPER V2 — identifica o bot 🎯 SNIPER sem depender do emoji.
+
+    Aceita: SNIPER, SNIPER_FT, 🎯 SNIPER, BOT_SNIPER.
+    """
+    raw = remover_acentos(texto or "").upper()[:350].replace("_", " ")
+    compacto = re.sub(r"[^A-Z0-9]+", "", raw)
+    return "SNIPER" in compacto or bool(re.search(r"\b(?:BOT\s*)?SNIPER\s*[-_ ]*(?:FT|2T)?\b", raw))
+
+
 def detectar_estrategia(texto: str) -> str:
     """Detecta a estratégia de forma robusta, priorizando a linha do bot.
 
@@ -717,7 +727,11 @@ def detectar_estrategia(texto: str) -> str:
     if contem_volume_ft_bruto(estrategia_txt) or contem_volume_ft_bruto(raw[:350]):
         return "VOLUME_FT"
 
-    # Confirmações têm prioridade depois de Volume.
+    # SNIPER V2 — bot separado do FT genérico.
+    if contem_sniper_bruto(estrategia_txt) or contem_sniper_bruto(raw[:350]):
+        return "SNIPER_FT"
+
+    # Confirmações têm prioridade depois de Volume/Sniper.
     if (
         "BOTHTCONFIRMACAO" in compacto
         or "HTCONFIRMACAO" in compacto
@@ -777,7 +791,12 @@ def eh_ht(estrategia: str) -> bool:
 
 
 def eh_ft(estrategia: str) -> bool:
-    return estrategia in {"ALFA_FT", "ALFA_FT_CONFIRMACAO", "CHAMA_FT", "VOLUME_FT"}
+    return estrategia in {"ALFA_FT", "ALFA_FT_CONFIRMACAO", "CHAMA_FT", "VOLUME_FT", "SNIPER_FT"}
+
+
+def eh_sniper_ft(estrategia: str) -> bool:
+    """SNIPER V2 — leitura FT separada, sem interferir em CHAMA/VOLUME/ARCE."""
+    return estrategia == "SNIPER_FT"
 
 
 def eh_confirmacao(estrategia: str) -> bool:
@@ -2696,62 +2715,6 @@ def corte_por_estrategia(estrategia: str) -> int:
 # =========================================================
 
 def montar_prompt_ia(m: Metricas, decisao_py: DecisaoPython) -> str:
-    # V28 — prompt checklist: IA audita 6 criterios em vez de calcular livremente.
-    # Mais estruturado, mais previsivel, mais facil de depurar.
-    if HABILITAR_V28 and HABILITAR_V28_IA_CHECKLIST:
-        return f"""
-Você é a IA Auditora do projeto COUTIPS/ALFA V28.
-Python é o motor principal. Sua função é AUDITAR o contexto, não recalcular score.
-
-Responda obrigatoriamente em UMA linha no formato:
-DECISAO=APROVAR|BLOQUEAR; CONFIANCA=0-100; CHECKLIST=pressao_viva:POSITIVO|NEUTRO|NEGATIVO,pressao_premiada:POSITIVO|NEUTRO|NEGATIVO,gol_recente:POSITIVO|NEUTRO|NEGATIVO,fome_favorito:POSITIVO|NEUTRO|NEGATIVO,consequencia_real:POSITIVO|NEUTRO|NEGATIVO,dna_projetado:POSITIVO|NEUTRO|NEGATIVO; MOTIVO=texto curto
-
-CHECKLIST OBRIGATÓRIO:
-1. Pressão viva: U5/U10/IP ainda sustentam o alerta?
-2. Pressão premiada: o último gol já pagou a pressão e o jogo morreu?
-3. Gol recente: o gol recente aumenta risco ou criou novo valor?
-4. Fome do favorito: favorito ainda tem motivo real para buscar gol?
-5. Consequência real: existe RB/remate/chance/xG/canto, não apenas posse/AP?
-6. DNA projetado: odd favorito + xG + pressão recente parecem padrão histórico forte?
-
-REGRAS:
-- Não bloqueie apenas por gol recente.
-- Bloqueie quando gol recente premiou o lado pressionante/favorito e a pressão morreu.
-- Valorize zebra marcando contra fluxo se favorito/pressionante continuou vivo.
-- Em liga UNDER, seja muito cético; exija consequência extraordinária.
-- Em HT, só aceite massacre contextual real.
-
-DADOS:
-Estratégia: {m.estrategia}
-Jogo: {m.jogo}
-Competição: {m.competicao}
-Minuto: {m.tempo}
-Placar: {m.placar}
-Mercado: {m.mercado}
-Liga: {m.liga}
-Odds: {m.odds}
-Favorito: {m.lado_favorito} odd {m.odd_favorito}
-Dominante: {m.lado_dominante}
-Pressionante: {m.lado_pressionante}
-Último gol: {m.ultimo_gol}' {m.ultimo_gol_lado}
-AP: {m.ataques_perigosos}
-U5: {m.ultimos5}
-U10: {m.ultimos10}
-Cantos: {m.cantos}
-RB: {m.remates_baliza}
-Remates lado: {m.remates_lado}
-RDA: {m.remates_dentro_area}
-Chance gol: {m.chance_golo}
-xG: {m.xg}
-IP: {m.pressao_alfa}
-Valor pós-evento: {m.valor_pos_evento_classe} | {m.valor_pos_evento_motivo}
-Cenário/Funil Python: {decisao_py.detalhes.get('funil', '')} | {decisao_py.detalhes.get('cenario_ft', '')}
-DNA V28: {decisao_py.detalhes.get('dna_v28', '')}
-Score Python: {decisao_py.score}
-Motivo Python: {decisao_py.motivo}
-""".strip()
-
-    # Prompt original V27 — fallback quando IA_CHECKLIST desativado
     return f"""
 Você é a IA Auditora do projeto COUTIPS/ALFA.
 Python é o motor principal. Sua função é auditar fake pressure e incoerências, não destruir contexto institucional forte.
@@ -3228,6 +3191,28 @@ def canal_auditoria(m: Metricas, aprovado: bool) -> str:
     return AUDIT_FT_OK if aprovado else AUDIT_FT_NO
 
 
+def nome_visual_auditoria(m: Metricas) -> str:
+    """Rótulo visual técnico apenas para canais de auditoria.
+
+    Não altera parser, score, canal normal nem grupo grátis.
+    """
+    est = (m.estrategia or "").upper()
+    bruto = remover_acentos(m.texto_bruto or "").upper()[:350]
+    if "SNIPER" in est or "SNIPER" in bruto:
+        return "🎯 SNIPER | 2T"
+    if "ARCE" in est:
+        return "⚡ ARCE HT | 1T"
+    if "CHAMA" in est:
+        return "🔥 CHAMA FT | 2T"
+    if "VOLUME" in est:
+        return "📊 VOLUME FT | 2T"
+    if eh_ht(est):
+        return "💎 ALFA HT | 1T"
+    if eh_ft(est):
+        return "💎 ALFA FT | 2T"
+    return m.estrategia
+
+
 async def enviar_auditoria(m: Metricas, score_py: int, score_ia: int, score_medio: int, aprovado: bool, motivo: str) -> None:
     canal = canal_auditoria(m, aprovado)
     if not canal:
@@ -3235,7 +3220,7 @@ async def enviar_auditoria(m: Metricas, score_py: int, score_ia: int, score_medi
     status = "APROVADO" if aprovado else "REPROVADO"
     emoji = "✅" if aprovado else "❌"
     texto = (
-        f"{emoji} {status} | {m.estrategia}\n"
+        f"{emoji} {status} | {nome_visual_auditoria(m)}\n"
         f"🏟 {m.jogo}\n"
         f"⏱ {m.tempo}' | {m.placar}\n"
         f"📊 PY={score_py}% | IA={score_ia}% | MÉDIA={score_medio}%\n"
@@ -3529,6 +3514,128 @@ def timeout_confirmacao_segundos(m: Metricas) -> int:
     if tempo >= 82:
         return 90
     return max(120, min(600, (82 - tempo + 1) * 60))
+
+# =========================================================
+# SNIPER V2 — LEITURA SEPARADA FT
+# Módulo isolado: não altera CHAMA, VOLUME, ARCE, score central nem IA V28.
+# Filosofia: favorito forte + necessidade + pressão madura no fim do jogo.
+# =========================================================
+
+def sniper_contexto_placar(m: "Metricas") -> Tuple[str, str]:
+    fav = m.lado_favorito
+    if fav not in {"CASA", "FORA"}:
+        return "SEM_FAVORITO", "SNIPER_SEM_FAVORITO"
+    gc, gf = extrair_gols_placar(m.placar)
+    if gc is None or gf is None:
+        return "PLACAR_INVALIDO", "SNIPER_PLACAR_INVALIDO"
+    gols_fav = gc if fav == "CASA" else gf
+    gols_adv = gf if fav == "CASA" else gc
+    diff = gols_fav - gols_adv
+    if diff < 0:
+        return "VALUE", f"FAVORITO_PERDENDO_{gols_fav}x{gols_adv}"
+    if diff == 0:
+        return "VALUE", f"FAVORITO_EMPATANDO_{gols_fav}x{gols_adv}"
+    if diff == 1:
+        return "SAFE", f"FAVORITO_VENCENDO_1_{gols_fav}x{gols_adv}"
+    if diff == 2:
+        return "RISCO", f"FAVORITO_VENCENDO_2_{gols_fav}x{gols_adv}"
+    return "MORTO", f"FAVORITO_SATISFEITO_DIFF_{diff}_{gols_fav}x{gols_adv}"
+
+
+def sniper_pressao_premiada(m: "Metricas") -> Tuple[bool, str]:
+    """True quando o gol recente pagou a pressão do favorito/pressionante."""
+    if not m.ultimo_gol or m.ultimo_gol_lado not in {"CASA", "FORA"}:
+        return False, "SNIPER_SEM_GOL_RECENTE"
+    delta = minutos_desde_ultimo_gol(m)
+    if delta < -1 or delta > 8:
+        return False, f"SNIPER_GOL_FORA_JANELA_{delta}MIN"
+    fav = m.lado_favorito
+    press = m.lado_pressionante
+    if fav not in {"CASA", "FORA"}:
+        return False, "SNIPER_SEM_FAVORITO"
+    if m.ultimo_gol_lado == fav and (ultimo_gol_deixou_lado_vencendo(m) or ultimo_gol_aumentou_vantagem(m)):
+        return True, f"SNIPER_PRESSAO_PREMIADA_FAV_GOL_{delta}MIN | {m.placar}"
+    if press in {"CASA", "FORA"} and m.ultimo_gol_lado == press and (ultimo_gol_deixou_lado_vencendo(m) or ultimo_gol_aumentou_vantagem(m)):
+        return True, f"SNIPER_PRESSAO_PREMIADA_PRESS_GOL_{delta}MIN | {m.placar}"
+    return False, f"SNIPER_GOL_RECENTE_NAO_PREMIOU_PRESSAO_{delta}MIN"
+
+
+def sniper_gol_contra_fluxo(m: "Metricas") -> Tuple[bool, str]:
+    if not m.ultimo_gol or m.ultimo_gol_lado not in {"CASA", "FORA"}:
+        return False, "SNIPER_SEM_GOL"
+    delta = minutos_desde_ultimo_gol(m)
+    if delta < -1 or delta > 8:
+        return False, f"SNIPER_GOL_FORA_JANELA_{delta}MIN"
+    fav = m.lado_favorito
+    press = m.lado_pressionante
+    if fav in {"CASA", "FORA"} and press == fav and m.ultimo_gol_lado != fav:
+        if pressao_viva_lado(m, fav):
+            return True, f"SNIPER_GOL_CONTRA_FLUXO_VALORIZA_{delta}MIN | fav={fav} | gol={m.ultimo_gol_lado}"
+    return False, "SNIPER_SEM_GOL_CONTRA_FLUXO"
+
+
+def filtro_sniper_ft_v2(m: "Metricas") -> Tuple[bool, str]:
+    """Porta própria do 🎯 SNIPER.
+
+    Não cria score novo e não substitui o V28. Apenas impede que o Sniper
+    entre quando o contexto já perdeu valor. Se passar, segue pelo fluxo
+    normal Python + IA V28.
+    """
+    if not eh_sniper_ft(m.estrategia):
+        return True, "NAO_SNIPER"
+
+    t = int(m.tempo or 0)
+    if t < 60 or t > 78:
+        return False, f"SNIPER_FORA_JANELA_{t}"
+
+    fav = m.lado_favorito
+    press = m.lado_pressionante
+    if fav not in {"CASA", "FORA"}:
+        return False, "SNIPER_SEM_FAVORITO"
+    if m.odd_favorito and m.odd_favorito > 1.60:
+        return False, f"SNIPER_ODD_FAVORITO_ACIMA_1_60 | odd={m.odd_favorito}"
+    if press != fav:
+        return False, f"SNIPER_FAVORITO_NAO_PRESSIONANTE | fav={fav} press={press}"
+
+    classe_placar, motivo_placar = sniper_contexto_placar(m)
+    if classe_placar == "MORTO":
+        return False, "SNIPER_FAVORITO_SATISFEITO | " + motivo_placar
+    if classe_placar == "RISCO" and not pressao_extrema_lado(m, fav):
+        return False, "SNIPER_FAVORITO_VENCE_2_SEM_EXTREMO | " + motivo_placar
+
+    d = dados_lado(m, fav)
+    ip = ip_lado(m, fav)
+    pressao_minima = d["u5"] >= 2 or d["u10"] >= 6 or ip["pico"] >= 20 or ip["c18"] >= 2 or ip["c22"] >= 1
+    consequencia_minima = d["rb"] >= 1 or d["rl"] >= 3 or d["chance"] >= 8 or d["xg"] >= 0.25 or d["cantos"] >= 2
+    if not pressao_minima:
+        return False, f"SNIPER_SEM_PRESSAO_VIVA | u5={d['u5']} u10={d['u10']} ip={ip['pico']}"
+    if not consequencia_minima:
+        return False, f"SNIPER_SEM_CONSEQUENCIA | rb={d['rb']} rl={d['rl']} chance={d['chance']} xg={d['xg']:.2f} cantos={d['cantos']}"
+
+    premiada, motivo_premiada = sniper_pressao_premiada(m)
+    if premiada:
+        cont_ok, cont_motivo = continuidade_pos_gol(m, fav)
+        if not cont_ok:
+            return False, motivo_premiada + " | " + cont_motivo
+        provas = 0
+        if d["u5"] >= 4: provas += 1
+        if d["u10"] >= 8: provas += 1
+        if d["rb"] >= 2 or d["chance"] >= 10 or d["xg"] >= 0.40: provas += 1
+        if ip["pico"] >= 22 or ip["c18"] >= 2: provas += 1
+        if provas < 3:
+            return False, f"SNIPER_PRESSAO_PREMIADA_SEM_NOVO_CICLO | provas={provas}/4 | {motivo_premiada} | {cont_motivo}"
+
+    contra_fluxo, motivo_contra = sniper_gol_contra_fluxo(m)
+    if contra_fluxo:
+        m.fluxo_motivo = (m.fluxo_motivo or "") + " | " + motivo_contra
+
+    return True, (
+        f"SNIPER_V2_PASSOU | classe={classe_placar} | {motivo_placar} | "
+        f"u5={d['u5']} u10={d['u10']} rb={d['rb']} rl={d['rl']} "
+        f"chance={d['chance']} xg={d['xg']:.2f} ip={ip['pico']} | "
+        f"premiada={premiada}:{motivo_premiada} | contra_fluxo={contra_fluxo}:{motivo_contra}"
+    )
+
 
 # =========================================================
 # V014 — FILTRO EXCLUSIVO VOLUME_FT
@@ -3892,9 +3999,10 @@ def v13_gerar_html(tipo: str, dt: Optional[datetime] = None) -> Path:
         score = html.escape(str(r.get("score", "") or ""))
         liga = html.escape(str(r.get("liga", "") or ""))
         uid_base = f"{r.get('bot','')}|{r.get('jogo','')}|{r.get('minuto','')}|{r.get('placar','')}|{r.get('score','')}|{i}"
-        uid = html.escape(remover_acentos(uid_base).lower())
+        # UID curto e seguro para HTML/JS. Evita aspas, espaços e acentos quebrando botões.
+        uid = hashlib.sha1(uid_base.encode("utf-8", errors="ignore")).hexdigest()[:16]
         linhas_html.append(f"""
-        <div class="item" data-id="{uid}" data-bot="{bot}" data-jogo="{jogo}" data-minuto="{minuto}" data-placar="{placar}" data-score="{score}" data-liga="{liga}" data-cornerpro="{html.escape(link)}">
+        <div class="item" data-id="{uid}" data-bot="{bot}" data-jogo="{jogo}" data-minuto="{minuto}" data-placar="{placar}" data-score="{score}" data-liga="{liga}" data-cornerpro="{html.escape(link, quote=True)}">
           <div class="topline">
             <span class="badge">{bot}</span>
             <strong>{jogo}</strong>
@@ -3902,9 +4010,9 @@ def v13_gerar_html(tipo: str, dt: Optional[datetime] = None) -> Path:
           <div class="meta">⏱ {minuto}' &nbsp;|&nbsp; 📊 {placar} &nbsp;|&nbsp; Score: <b>{score}%</b> &nbsp;|&nbsp; Liga: {liga} &nbsp;|&nbsp; {link_tag}</div>
           {motivo_txt}
           <div class="actions">
-            <button type="button" class="btn green" onclick="marcarResultado('{uid}', 'GREEN')">✅ GREEN</button>
-            <button type="button" class="btn red" onclick="marcarResultado('{uid}', 'RED')">❌ RED</button>
-            <button type="button" class="btn clear" onclick="limparResultado('{uid}')">↩ LIMPAR</button>
+            <button type="button" class="btn green" data-action="GREEN" data-id="{uid}">✅ GREEN</button>
+            <button type="button" class="btn red" data-action="RED" data-id="{uid}">❌ RED</button>
+            <button type="button" class="btn clear" data-action="CLEAR" data-id="{uid}">↩ LIMPAR</button>
             <span class="status" id="status-{uid}">PENDENTE</span>
           </div>
         </div>""")
@@ -4043,6 +4151,17 @@ function exportarCSV() {{
   const csv = [header.join(',')].concat(rows.map(r => header.map(h => csvEscape(r[h])).join(','))).join('\n');
   baixar('coutips_{tipo}_{dt.strftime('%Y_%m_%d')}_resultados.csv', csv, 'text/csv;charset=utf-8');
 }}
+document.addEventListener('click', function(e) {{
+  const btn = e.target.closest('button[data-action][data-id]');
+  if (!btn) return;
+  const id = btn.dataset.id;
+  const action = btn.dataset.action;
+  if (action === 'GREEN' || action === 'RED') {{
+    marcarResultado(id, action);
+  }} else if (action === 'CLEAR') {{
+    limparResultado(id);
+  }}
+}});
 aplicarEstado();
 </script>
 </body>
@@ -4163,6 +4282,14 @@ async def processar_alerta(alerta: Alerta) -> None:
         preencher_contexto_calculado(m)
         log(f"🧭 V20 FORCE_VOLUME_FT | {antigo}->VOLUME_FT | {m.jogo} | {m.tempo}'")
 
+    # SNIPER V2 — fail-safe: se o texto bruto tiver SNIPER, força a família separada.
+    if contem_sniper_bruto(m.texto_bruto) and m.estrategia != "SNIPER_FT":
+        antigo = m.estrategia
+        m.estrategia = "SNIPER_FT"
+        m.parser_observacoes.append(f"SNIPER_FORCE:{antigo}->SNIPER_FT")
+        preencher_contexto_calculado(m)
+        log(f"🎯 SNIPER FORCE | {antigo}->SNIPER_FT | {m.jogo} | {m.tempo}'")
+
     # =====================================================
     # V007 — bloqueios e roteamentos antes do score/IA
     # =====================================================
@@ -4218,6 +4345,23 @@ async def processar_alerta(alerta: Alerta) -> None:
                 await registrar_bloqueio_fluxo(m, motivo, score=0)
                 return
             log(f"🧪 V27 HT_MODERADO PASSOU COMO HT_ALAVANCAGEM_OBS | {m.jogo} | {ht_motivo}")
+
+    # SNIPER V2 — porta própria antes do score normal.
+    # Reprovados morrem silenciosamente no CSV/log, igual filosofia do Volume.
+    # Aprovados seguem o fluxo normal Python + IA V28, sem mexer no CHAMA/VOLUME/ARCE.
+    if eh_sniper_ft(m.estrategia):
+        ok_sniper, motivo_sniper = filtro_sniper_ft_v2(m)
+        if not ok_sniper:
+            m.fluxo_decisao = "SNIPER_V2_BLOQUEADO"
+            m.fluxo_motivo = motivo_sniper
+            decisao_py_sniper = DecisaoPython(score=0, aprovado_pre_ia=False, status="REPROVADO", motivo=motivo_sniper, detalhes={})
+            decisao_ia_sniper = DecisaoIA(decisao="BLOQUEAR", confianca_original=0, confianca_corrigida=0, motivo="SNIPER_V2_FILTRO", protecao_ativa=False, protecao_motivo="SEM_PROTECAO")
+            registrar_csv(m, decisao_py_sniper, decisao_ia_sniper, 0, "REPROVADO", motivo_sniper)
+            log(f"🔇 SNIPER V2 BLOQUEADO SILENCIOSO | {motivo_sniper} | {m.jogo}")
+            return
+        m.fluxo_decisao = "SNIPER_V2_APROVADO_PARA_SCORE"
+        m.fluxo_motivo = motivo_sniper
+        log(f"🎯 SNIPER V2 FILTRO PASSOU | {motivo_sniper} | {m.jogo}")
 
     # V014 — VOLUME_FT: porta exclusiva antes do score normal.
     # Reprovados morrem silenciosamente — só CSV/log interno, sem canal de reprovados.
