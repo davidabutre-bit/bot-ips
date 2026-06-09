@@ -2899,6 +2899,35 @@ def formatar_alerta_cliente(m: Metricas, score: int, alavancagem: bool = False) 
     return msg
 
 
+def formatar_alerta_canal_completo(m: Metricas, score: int, alavancagem: bool = False) -> str:
+    """Mensagem para o canal interno/completo (@ALFA_CON).
+
+    Diferença para o canal grátis/principal:
+    - mantém todo o corpo da mensagem igual;
+    - troca apenas o cabeçalho visual para identificar a família do bot;
+    - não altera parser, score, IA, filtros, grupo grátis ou canal público.
+    """
+    link = m.bet365 or ""
+    linhas = [
+        nome_visual_auditoria(m),
+        "",
+        f"🏟 {html.escape(m.jogo)}",
+        f"⏱ {m.tempo}' | {m.placar}",
+        f"🎯 {m.mercado}",
+        f"📊 COUTIPS: {score}%",
+        f"{emoji_liga(m.liga)} Liga: {m.liga}",
+        f"💰 Odd mínima de entrada: {ODD_MINIMA_CLIENTE}",
+        "📝 SIGA SUA GESTÃO DE BANCA",
+        "⛔ APOSTE COM RESPONSABILIDADE ⛔",
+    ]
+    if link:
+        linhas.append(f"🔗 {link}")
+    msg = "\n".join(linhas)
+    if alavancagem:
+        return "🔺 ALAVANCAGEM 🔺\n\n" + msg
+    return msg
+
+
 def agora_operacional_v11() -> datetime:
     return datetime.now(timezone.utc) + timedelta(hours=V11_TZ_OFFSET_HORAS)
 
@@ -4550,7 +4579,9 @@ async def processar_alerta(alerta: Alerta) -> None:
     m.alavancagem = "SIM" if alavanca_ok else "NAO"
     m.motivo_alavancagem = alavanca_motivo
 
-    mensagem_completa = formatar_alerta_cliente(m, score_medio, alavancagem=alavanca_ok)
+    # Canal completo/interno recebe visual técnico por família de bot.
+    # Grupo grátis/principal continua usando formatar_alerta_cliente() normal.
+    mensagem_completa = formatar_alerta_canal_completo(m, score_medio, alavancagem=alavanca_ok)
     canal_completo = destino_principal(m, score_medio)
     await enfileirar_envio(canal_completo, mensagem_completa)
     destinos = [canal_completo]
