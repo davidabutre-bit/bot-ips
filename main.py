@@ -1,24 +1,21 @@
 # -*- coding: utf-8 -*-
 """
-COUTIPS / ALFA — DC01
-Base DC01 gerada sobre V28 SNIPER V2 + HTMLFIX + auditoria visual
+COUTIPS / ALFA — DC01.2
+Base DC01.2 gerada sobre DC01.1 — ajustes pós-auditoria
 
-Objetivo:
-- Manter o score central preservado.
-- Aplicar mudanças binárias como binárias.
-- Corrigir parser/período sem matar jogo bom por erro bobo.
-- Bloquear apenas U18/U19/U20 sem mercado operacional.
-- Criar fluxo limpo CHAMA_FT → espera → BOT_FT CONFIRMAÇÃO → comparação → decisão.
-- Manter HT como camada premium de massacre contextual real.
-- Registrar motivos internos para auditoria.
+Mudanças DC01.2 (sem tocar score, V27, V28, DC01, CHAMA_FT):
+1. CONF01: BOT_FT CONFIRMAÇÃO bloqueia favorito vencendo por 1 com zebra morta.
+   Motivo: CONF01_FAVORITO_VENCE_1_ZEBRA_MORTA
+   Flag: HABILITAR_DC01_2_CONF01
 
-Start command: python main.py
+2. V26_CAOS_BIDIRECIONAL: reduz penalidade FAV_NAO_PRESSIONANTE em jogos de trocação.
+   - FORTE: penalidade zerada (0) quando zebra muito viva e favorito ainda ativo.
+   - MÉDIO: penalidade reduzida para -2 (em vez de -8).
+   - NORMAL: mantém penalidade original (-8).
+   Flag: HABILITAR_DC01_2_V26_CAOS_BIDIRECIONAL
 
-Mudanças V006:
-- Teto Python 96 / IA 95
-- HT: exige que favorito seja o lado pressionante (bloqueia zebra dominando)
-- Threshold odd para bloqueio HT: > 1.60 (preserva jogos equilibrados)
-- Mantém FT inalterado (75.9% de acerto na auditoria)
+Nota: SNIPER V2 e HT_PLACAR_LARGO já estavam implementados em DC01.1.
+Não foram recriados — flags existentes controlam o comportamento.
 
 Start command: python main.py
 """
@@ -57,7 +54,7 @@ except Exception:  # pragma: no cover
 # VERSÃO / CONFIGURAÇÃO BASE
 # =========================================================
 
-VERSAO_COUTIPS = "DC01_1_COUTIPS_ALFA_2026_06_09"
+VERSAO_COUTIPS = "DC01_2_COUTIPS_ALFA_2026_06_10"
 
 load_dotenv()
 
@@ -227,6 +224,27 @@ HABILITAR_DC01_1_SNIPER_NECESSIDADE = os.getenv("HABILITAR_DC01_1_SNIPER_NECESSI
 HABILITAR_DC01_1_HT_PLACAR_LARGO_NECESSIDADE = os.getenv("HABILITAR_DC01_1_HT_PLACAR_LARGO_NECESSIDADE", "true").lower() == "true"
 DC01_1_HT_DIF_MIN_PLACAR_LARGO = int(os.getenv("DC01_1_HT_DIF_MIN_PLACAR_LARGO", "3"))
 
+
+# =========================================================
+# DC01.2 — AJUSTES PÓS-AUDITORIA
+# Cinco ajustes isolados sem tocar score, V27, V28, DC01, CHAMA_FT.
+# Cada ajuste tem flag própria para rollback individual.
+# =========================================================
+
+# DC01.2 — CONF01: BOT_FT CONFIRMAÇÃO com lógica de necessidade explícita.
+# Bloqueia confirmação quando favorito já vence por 1 e zebra está morta.
+HABILITAR_DC01_2_CONF01 = os.getenv("HABILITAR_DC01_2_CONF01", "true").lower() == "true"
+
+# DC01.2 — SNIPER V2: bot de necessidade. Já implementado em DC01.1.
+# Flag mantida para consistência de nomenclatura. Controlado por HABILITAR_DC01_1_SNIPER_NECESSIDADE.
+
+# DC01.2 — HT placar largo sem necessidade. Já implementado em DC01.1.
+# Flag mantida para consistência. Controlado por HABILITAR_DC01_1_HT_PLACAR_LARGO_NECESSIDADE.
+
+# DC01.2 — V26 CAOS BIDIRECIONAL: reduz penalidade FAV_NAO_PRESSIONANTE em jogos de trocação.
+# Médio: penalidade -2 (em vez de -8). Forte: penalidade 0.
+# Nunca cria nova camada — apenas modifica a intensidade da penalidade V26.
+HABILITAR_DC01_2_V26_CAOS_BIDIRECIONAL = os.getenv("HABILITAR_DC01_2_V26_CAOS_BIDIRECIONAL", "true").lower() == "true"
 
 # V012 — camadas cirúrgicas: grupo grátis, ALAVANCAGEM, Austrália especial e HT-2.
 # Mantém score, funil, IA e parser centrais preservados.
@@ -438,6 +456,8 @@ def logar_versao_inicial() -> None:
     log(f"🧱 DC01 CHAMA placar elástico 3+: {'ATIVO' if HABILITAR_DC01_CHAMA_PLACAR_ELASTICO else 'DESATIVADO'}")
     log(f"🎯 DC01.1 SNIPER necessidade real: {'ATIVO' if HABILITAR_DC01_1_SNIPER_NECESSIDADE else 'DESATIVADO'}")
     log(f"⚡ DC01.1 HT placar largo com necessidade: {'ATIVO' if HABILITAR_DC01_1_HT_PLACAR_LARGO_NECESSIDADE else 'DESATIVADO'}")
+    log(f"🔐 DC01.2 CONF01 zebra morta: {'ATIVO' if HABILITAR_DC01_2_CONF01 else 'DESATIVADO'}")
+    log(f"🔥 DC01.2 V26 caos bidirecional: {'ATIVO' if HABILITAR_DC01_2_V26_CAOS_BIDIRECIONAL else 'DESATIVADO'}")
     log("🎯 SNIPER V2: ATIVO | leitura separada, pressão premiada/gol contra fluxo/necessidade")
     log("🏷️ Auditoria visual: ⚡ ARCE HT | 1T / 🔥 CHAMA FT | 2T / 📊 VOLUME FT | 2T / 🎯 SNIPER | 2T")
     log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
@@ -3474,6 +3494,16 @@ def confirmacao_isolada_valida(m: Metricas) -> Tuple[bool, str]:
     if fav not in {"CASA", "FORA"} or lado not in {"CASA", "FORA"}:
         return False, "SEM_FAVORITO_OU_PRESSIONANTE"
 
+    # DC01.2 — CONF01: favorito vencendo por 1 com zebra morta bloqueia confirmação isolada.
+    if HABILITAR_DC01_2_CONF01:
+        diff_iso = diferenca_placar(m)
+        vence_iso = lado_vencendo(m)
+        if vence_iso == fav and diff_iso == 1:
+            zebra_iso = lado_oposto(fav)
+            zebra_viva_iso, zebra_motivo_iso = dc01_1_zebra_ameaca_real(m, zebra_iso)
+            if not zebra_viva_iso:
+                return False, f"CONF01_FAVORITO_VENCE_1_ZEBRA_MORTA | {zebra_motivo_iso}"
+
     # Favorito pressionando e ainda não venceu/resolvido.
     if fav == lado and favorito_nao_vencendo(m) and pressao_viva_lado(m, lado) and consequencia_minima_emocional(m, lado):
         return True, "CONF_ISOLADA_FAVORITO_NAO_VENCE_COM_PRESSAO"
@@ -3503,6 +3533,22 @@ def comparar_alertas_confirmacao(old: Metricas, novo: Metricas) -> Tuple[bool, s
             f"CONF_GOL_RECENTE_PRESSIONANTE_RESOLVEU | ultimo={novo.ultimo_gol}' {novo.ultimo_gol_lado} | "
             f"placar={novo.placar} | press={novo.lado_pressionante}"
         ), detalhes
+
+    # DC01.2 — CONF01: bloqueia confirmação quando favorito vence por 1 e zebra está morta.
+    # A confirmação deve aprovar somente quando há melhora forte, necessidade real ou
+    # contexto de massacre extremo. Favorito vencendo por 1 com zebra sem vida = jogo resolvido.
+    if HABILITAR_DC01_2_CONF01:
+        fav_conf = novo.lado_favorito
+        if fav_conf in {"CASA", "FORA"}:
+            diff_conf = diferenca_placar(novo)
+            vence_conf = lado_vencendo(novo)
+            if vence_conf == fav_conf and diff_conf == 1:
+                zebra_conf = lado_oposto(fav_conf)
+                zebra_viva_conf, zebra_motivo_conf = dc01_1_zebra_ameaca_real(novo, zebra_conf)
+                if not zebra_viva_conf:
+                    return False, (
+                        f"CONF01_FAVORITO_VENCE_1_ZEBRA_MORTA | fav={fav_conf} | placar={novo.placar} | {zebra_motivo_conf}"
+                    ), detalhes
 
     campos = [
         ("ataques_perigosos", "AP"),
@@ -3897,11 +3943,90 @@ def dc01_1_ht_placar_largo_sem_necessidade(m: "Metricas", lado: str) -> Tuple[bo
     )
 
 
-def filtro_sniper_ft_v2(m: "Metricas") -> Tuple[bool, str]:
-    """Porta própria do 🎯 SNIPER.
+def v26_detectar_caos_bidirecional(m: "Metricas") -> Tuple[str, str]:
+    """DC01.2 — detecta trocação legítima para reduzir penalidade V26 FAV_NAO_PRESSIONANTE.
 
-    Não cria score novo e não substitui o V28. Apenas impede que o Sniper
-    entre quando o contexto já perdeu valor. Se passar, segue pelo fluxo
+    Objetivo: impedir que a V26 mate jogos de guerra aberta onde a zebra
+    realmente ameaça, mas o favorito ainda domina em termos de pressão global.
+
+    Retorna:
+        "NORMAL"  -> manter penalidade original (-8)
+        "MEDIO"   -> reduzir penalidade para -2  (V26_CAOS_BIDIRECIONAL_MEDIO)
+        "FORTE"   -> zerar penalidade            (V26_CAOS_BIDIRECIONAL_FORTE)
+
+    Prioriza sinais recentes: U5, U10, cantos recentes, AP recentes,
+    ultimo gol, exposicao dos dois lados. NAO usa apenas totais acumulados.
+    """
+    if not HABILITAR_DC01_2_V26_CAOS_BIDIRECIONAL:
+        return "NORMAL", "DC01_2_V26_CAOS_OFF"
+
+    fav = m.lado_favorito
+    zebra = lado_oposto(fav) if fav in {"CASA", "FORA"} else None
+    if not zebra:
+        return "NORMAL", "V26_CAOS_SEM_FAVORITO"
+
+    d_z = dados_lado(m, zebra)
+    d_f = dados_lado(m, fav)
+    ip_z = ip_lado(m, zebra)
+    ip_f = ip_lado(m, fav)
+
+    sinais_zebra_viva = 0
+    motivos_z: list = []
+
+    # Sinais recentes da zebra (prioridade maxima)
+    if d_z["u5"] >= 2:
+        sinais_zebra_viva += 2
+        motivos_z.append(f"ZEBRA_U5={d_z['u5']}")
+    if d_z["u10"] >= 4:
+        sinais_zebra_viva += 1
+        motivos_z.append(f"ZEBRA_U10={d_z['u10']}")
+    if d_z["rb"] >= 1:
+        sinais_zebra_viva += 2
+        motivos_z.append(f"ZEBRA_RB={d_z['rb']}")
+    if d_z["cantos"] >= 1:
+        sinais_zebra_viva += 1
+        motivos_z.append(f"ZEBRA_CANTOS={d_z['cantos']}")
+    if d_z["chance"] >= 4 or d_z["xg"] >= 0.15:
+        sinais_zebra_viva += 1
+        motivos_z.append(f"ZEBRA_CHANCE={d_z['chance']}_XG={d_z['xg']:.2f}")
+    if ip_z["pico"] >= 14 or ip_z["c10"] >= 1:
+        sinais_zebra_viva += 1
+        motivos_z.append(f"ZEBRA_IP={ip_z['pico']}_C10={ip_z['c10']}")
+
+    # Favorito tambem ainda pressionando (guerra aberta, nao jogo morto)
+    sinais_fav_ativo = 0
+    if d_f["u5"] >= 2:
+        sinais_fav_ativo += 1
+    if d_f["rb"] >= 1:
+        sinais_fav_ativo += 1
+    if ip_f["pico"] >= 18:
+        sinais_fav_ativo += 1
+
+    # Ultimo gol recente indica jogo vivo
+    delta_gol = minutos_desde_ultimo_gol(m)
+    gol_recente_sinal = -1 <= delta_gol <= 10
+
+    motivo_base = (
+        f"zebra_sinais={sinais_zebra_viva}|fav_ativo={sinais_fav_ativo}"
+        f"|gol_recente={gol_recente_sinal}|{','.join(motivos_z)}"
+    )
+
+    # FORTE: zebra muito viva + favorito ainda ativo + jogo claramente aberto
+    if sinais_zebra_viva >= 5 and sinais_fav_ativo >= 2 and (gol_recente_sinal or d_z["u5"] >= 3):
+        return "FORTE", f"V26_CAOS_BIDIRECIONAL_FORTE | {motivo_base}"
+
+    # MEDIO: zebra com alguma ameaca real + favorito ainda pressionando
+    if sinais_zebra_viva >= 3 and sinais_fav_ativo >= 1:
+        return "MEDIO", f"V26_CAOS_BIDIRECIONAL_MEDIO | {motivo_base}"
+
+    return "NORMAL", f"V26_CAOS_NORMAL_ZEBRA_FRACA | {motivo_base}"
+
+
+def filtro_sniper_ft_v2(m: "Metricas") -> Tuple[bool, str]:
+    """Porta própria do SNIPER FT.
+
+    Nao cria score novo e nao substitui o V28. Apenas impede que o Sniper
+    entre quando o contexto ja perdeu valor. Se passar, segue pelo fluxo
     normal Python + IA V28.
     """
     if not eh_sniper_ft(m.estrategia):
@@ -4787,19 +4912,28 @@ async def processar_alerta(alerta: Alerta) -> None:
         log(f"✅ DC01 CHAMA PLACAR ELÁSTICO PASSOU | {m.jogo} | {motivo_dc01}")
 
     # V026 — FAV_NAO_PRESSIONANTE: penaliza score FT onde favorito não é o lado pressionante.
-    # Modo auditoria: não bloqueia — registra motivo e aplica penalidade no score.
-    # O score ainda pode aprovar dependendo da margem. Permite observar antes de decidir.
+    # DC01.2 — V26_CAOS_BIDIRECIONAL: reduz penalidade em jogos de trocação legítima.
+    # Modo auditoria: não bloqueia — penaliza no score e registra motivo no CSV/HTML.
     if HABILITAR_V26_FAV_NAO_PRESSIONANTE and eh_ft(m.estrategia) and not eh_confirmacao(m.estrategia):
         fav_v26 = m.lado_favorito
         press_v26 = m.lado_pressionante
         if fav_v26 in {"CASA", "FORA"} and press_v26 in {"CASA", "FORA"} and fav_v26 != press_v26:
-            motivo_nao_press = f"V26_FAV_NAO_PRESSIONANTE_PENALIDADE={V26_FAV_NAO_PRESSIONANTE_PENALIDADE} | fav={fav_v26} press={press_v26}"
-            log(f"⚠️ V26 FAV_NAO_PRESSIONANTE | penalidade=-{V26_FAV_NAO_PRESSIONANTE_PENALIDADE} | {m.jogo} | {motivo_nao_press}")
-            # Registra na flag de observação da métrica para rastreio no CSV.
-            m.fluxo_motivo = (m.fluxo_motivo or "") + f" | {motivo_nao_press}"
-            # A penalidade é aplicada no score Python antes da IA.
-            # Usamos um atributo auxiliar que calcular_score_python considera.
-            m.penalidade_v26_fav_nao_press = V26_FAV_NAO_PRESSIONANTE_PENALIDADE
+            # DC01.2 — detecta caos bidirecional antes de aplicar penalidade
+            caos_nivel, caos_motivo = v26_detectar_caos_bidirecional(m)
+            if caos_nivel == "FORTE":
+                penalidade_efetiva = 0
+                log(f"🔥 V26_CAOS_BIDIRECIONAL_FORTE | penalidade=0 (zerada) | {m.jogo} | {caos_motivo}")
+                m.fluxo_motivo = (m.fluxo_motivo or "") + f" | {caos_motivo}"
+            elif caos_nivel == "MEDIO":
+                penalidade_efetiva = 2
+                log(f"⚡ V26_CAOS_BIDIRECIONAL_MEDIO | penalidade=-2 (reduzida de -{V26_FAV_NAO_PRESSIONANTE_PENALIDADE}) | {m.jogo} | {caos_motivo}")
+                m.fluxo_motivo = (m.fluxo_motivo or "") + f" | {caos_motivo}"
+            else:
+                penalidade_efetiva = V26_FAV_NAO_PRESSIONANTE_PENALIDADE
+                motivo_nao_press = f"V26_FAV_NAO_PRESSIONANTE_PENALIDADE={penalidade_efetiva} | fav={fav_v26} press={press_v26}"
+                log(f"⚠️ V26 FAV_NAO_PRESSIONANTE | penalidade=-{penalidade_efetiva} | {m.jogo} | {motivo_nao_press}")
+                m.fluxo_motivo = (m.fluxo_motivo or "") + f" | {motivo_nao_press}"
+            m.penalidade_v26_fav_nao_press = penalidade_efetiva
 
     # BOT_FT CONFIRMAÇÃO: se existe gatilho anterior pendente, comparar obrigatoriamente.
     if HABILITAR_CONFIRMACAO_V2 and eh_confirmacao(m.estrategia) and eh_ft(m.estrategia):
