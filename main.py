@@ -54,7 +54,7 @@ except Exception:  # pragma: no cover
 # VERSÃO / CONFIGURAÇÃO BASE
 # =========================================================
 
-VERSAO_COUTIPS = "DC01_2_COUTIPS_ALFA_2026_06_10"
+VERSAO_COUTIPS = "DC01_3_COUTIPS_ALFA_2026_06_12"
 
 load_dotenv()
 
@@ -242,6 +242,15 @@ HABILITAR_DC01_2_CONF01 = os.getenv("HABILITAR_DC01_2_CONF01", "true").lower() =
 # Flag mantida para consistência. Controlado por HABILITAR_DC01_1_HT_PLACAR_LARGO_NECESSIDADE.
 
 # DC01.2 — V26 CAOS BIDIRECIONAL: reduz penalidade FAV_NAO_PRESSIONANTE em jogos de trocação.
+
+# DC01.3 — TRÊS AJUSTES PÓS-AUDITORIA (12/06/2026)
+# Ajuste 1: gol de empate do favorito reduz exigência de provas em v27_continuidade_pos_gol.
+# Ajuste 2: favorito vencendo 1x0 passa com 3/4 critérios em vez de 4/4.
+# Ajuste 3: favorito perdendo por 1 aceita pressão simples (U5>=4 OU U10>=7).
+HABILITAR_DC01_3_EMPATE_FAVORITO = os.getenv("HABILITAR_DC01_3_EMPATE_FAVORITO", "true").lower() == "true"
+HABILITAR_DC01_3_1X0_TRES_DE_QUATRO = os.getenv("HABILITAR_DC01_3_1X0_TRES_DE_QUATRO", "true").lower() == "true"
+HABILITAR_DC01_3_PERDEDOR_PRESSAO_SIMPLES = os.getenv("HABILITAR_DC01_3_PERDEDOR_PRESSAO_SIMPLES", "true").lower() == "true"
+
 # Médio: penalidade -2 (em vez de -8). Forte: penalidade 0.
 # Nunca cria nova camada — apenas modifica a intensidade da penalidade V26.
 HABILITAR_DC01_2_V26_CAOS_BIDIRECIONAL = os.getenv("HABILITAR_DC01_2_V26_CAOS_BIDIRECIONAL", "true").lower() == "true"
@@ -458,6 +467,9 @@ def logar_versao_inicial() -> None:
     log(f"⚡ DC01.1 HT placar largo com necessidade: {'ATIVO' if HABILITAR_DC01_1_HT_PLACAR_LARGO_NECESSIDADE else 'DESATIVADO'}")
     log(f"🔐 DC01.2 CONF01 zebra morta: {'ATIVO' if HABILITAR_DC01_2_CONF01 else 'DESATIVADO'}")
     log(f"🔥 DC01.2 V26 caos bidirecional: {'ATIVO' if HABILITAR_DC01_2_V26_CAOS_BIDIRECIONAL else 'DESATIVADO'}")
+    log(f"⚽ DC01.3 empate favorito reduz provas: {'ATIVO' if HABILITAR_DC01_3_EMPATE_FAVORITO else 'DESATIVADO'}")
+    log(f"🎯 DC01.3 1x0 exige 3/4 critérios: {'ATIVO' if HABILITAR_DC01_3_1X0_TRES_DE_QUATRO else 'DESATIVADO'}")
+    log(f"⚡ DC01.3 perdedor por 1 pressão simples: {'ATIVO' if HABILITAR_DC01_3_PERDEDOR_PRESSAO_SIMPLES else 'DESATIVADO'}")
     log("🎯 SNIPER V2: ATIVO | leitura separada, pressão premiada/gol contra fluxo/necessidade")
     log("🏷️ Auditoria visual: ⚡ ARCE HT | 1T / 🔥 CHAMA FT | 2T / 📊 VOLUME FT | 2T / 🎯 SNIPER | 2T")
     log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
@@ -2125,6 +2137,23 @@ def v27_continuidade_pos_gol(m: Metricas) -> Tuple[bool, str]:
     if not (gol_lado_vencedor or gol_do_press or gol_do_fav):
         return True, "V27_GOL_NAO_PREMIOU_PRESSIONANTE"
 
+    # DC01.3 — Ajuste 1: gol de empate do favorito reduz exigência de provas.
+    # O favorito empatou o jogo — isso por si só é evidência de jogo vivo e fome.
+    # U5/U10 ainda não recarregaram mas o contexto é de pressão crescente.
+    if HABILITAR_DC01_3_EMPATE_FAVORITO:
+        gol_do_fav_empatou = (
+            gol_do_fav
+            and lado_vencendo(m) == "EMPATE"
+            and m.ultimo_gol_lado == m.lado_favorito
+        )
+        if gol_do_fav_empatou:
+            # Exige só 1 prova em vez de 2/3
+            provas_minimas_empate = 1
+        else:
+            provas_minimas_empate = None  # usa lógica normal
+    else:
+        provas_minimas_empate = None
+
     provas = 0
     if d["u5"] >= 3:
         provas += 1
@@ -2139,9 +2168,11 @@ def v27_continuidade_pos_gol(m: Metricas) -> Tuple[bool, str]:
 
     if delta <= 3:
         # Gol muito recente: exige mais cuidado porque odds/ritmo podem estar instáveis.
-        ok = provas >= 3
+        exige = provas_minimas_empate if provas_minimas_empate is not None else 3
+        ok = provas >= exige
     else:
-        ok = provas >= 2
+        exige = provas_minimas_empate if provas_minimas_empate is not None else 2
+        ok = provas >= exige
 
     motivo = (
         f"V27_CONT_POS_GOL provas={provas} delta={delta} lado={lado} "
@@ -2182,8 +2213,16 @@ def v27_perdedor_um_tem_reacao(m: Metricas, lado: str) -> Tuple[bool, str]:
     if lado != lado_perdendo(m):
         return True, "V27_LADO_NAO_E_PERDEDOR"
     d = dados_lado(m, lado)
-    pressao_dupla = d["u5"] >= 3 and d["u10"] >= 6
-    reacao_viva = pressao_dupla or (pressao_viva_lado(m, lado) and consequencia_real_lado(m, lado))
+    # DC01.3 — Ajuste 3: aceita pressão simples em vez de pressão dupla obrigatória.
+    # Original: u5>=3 AND u10>=6 (ambos obrigatórios)
+    # Novo: u5>=4 OR u10>=7 (qualquer um basta) — resolve reação recente com U10 ainda baixo.
+    if HABILITAR_DC01_3_PERDEDOR_PRESSAO_SIMPLES:
+        pressao_dupla = d["u5"] >= 3 and d["u10"] >= 6
+        pressao_simples = d["u5"] >= 4 or d["u10"] >= 7
+        reacao_viva = pressao_dupla or pressao_simples or (pressao_viva_lado(m, lado) and consequencia_real_lado(m, lado))
+    else:
+        pressao_dupla = d["u5"] >= 3 and d["u10"] >= 6
+        reacao_viva = pressao_dupla or (pressao_viva_lado(m, lado) and consequencia_real_lado(m, lado))
     motivo = f"V27_PERDEDOR_1 reacao={reacao_viva} u5={d['u5']} u10={d['u10']} consequencia={consequencia_real_lado(m,lado)}"
     return bool(reacao_viva), motivo
 
@@ -2202,12 +2241,22 @@ def v27_favorito_vencendo_1x0_exige_extra(m: Metricas, lado: str) -> Tuple[bool,
         return True, "V27_NAO_1X0_VENCEDOR"
     d = dados_lado(m, lado)
     ip = ip_lado(m, lado)
-    ok = (
-        d["u5"] >= 5
-        and d["u10"] >= 9
-        and (d["rb"] >= 2 or d["chance"] >= 10 or d["xg"] >= 0.45)
-        and (ip["pico"] >= 22 or ip["c18"] >= 2)
-    )
+    # DC01.3 — Ajuste 2: exige 3/4 critérios em vez de todos os 4 simultaneamente.
+    if HABILITAR_DC01_3_1X0_TRES_DE_QUATRO:
+        criterios = [
+            d["u5"] >= 5,
+            d["u10"] >= 9,
+            (d["rb"] >= 2 or d["chance"] >= 10 or d["xg"] >= 0.45),
+            (ip["pico"] >= 22 or ip["c18"] >= 2),
+        ]
+        ok = sum(criterios) >= 3
+    else:
+        ok = (
+            d["u5"] >= 5
+            and d["u10"] >= 9
+            and (d["rb"] >= 2 or d["chance"] >= 10 or d["xg"] >= 0.45)
+            and (ip["pico"] >= 22 or ip["c18"] >= 2)
+        )
     motivo = f"V27_1X0_EXTRA ok={ok} u5={d['u5']} u10={d['u10']} rb={d['rb']} chance={d['chance']} xg={d['xg']:.2f} ip={ip['pico']}"
     return ok, motivo
 
@@ -4639,7 +4688,18 @@ def v13_gerar_html(tipo: str, dt: Optional[datetime] = None) -> Path:
     const action = btn.getAttribute('data-action');
     if (!id || !action) return;
     setResultado(id, action);
-  }}, true);
+  }}, false);
+
+  document.querySelectorAll('.js-result').forEach(function(btn) {{
+    btn.addEventListener('click', function(e) {{
+      e.preventDefault();
+      e.stopPropagation();
+      const id = btn.getAttribute('data-id');
+      const action = btn.getAttribute('data-action');
+      if (!id || !action) return;
+      setResultado(id, action);
+    }});
+  }});
 
   document.getElementById('btnExportJson')?.addEventListener('click', function(e) {{
     e.preventDefault();
@@ -4652,7 +4712,7 @@ def v13_gerar_html(tipo: str, dt: Optional[datetime] = None) -> Path:
     const header = ['resultado','bot','jogo','minuto','placar','score','liga','cornerpro'];
     const csv = [header.join(',')].concat(rows.map(function(r) {{
       return header.map(function(h) {{ return csvEscape(r[h]); }}).join(',');
-    }})).join('\\n');
+    }})).join('\n');
     baixar('coutips_{tipo}_{data_key}_resultados.csv', csv, 'text/csv;charset=utf-8');
   }});
 
