@@ -4639,7 +4639,7 @@ body{{background:var(--bg);color:var(--text);font-family:'Segoe UI',system-ui,sa
 </div>
 <script>
 const GAMES={games_js};
-const KEY={json_mod.dumps(storage_key)};
+const KEY={json.dumps(storage_key)};
 let state={{}};
 let sel=null;
 try{{state=JSON.parse(localStorage.getItem(KEY))||{{}};}}catch(e){{}}
