@@ -54,7 +54,7 @@ except Exception:  # pragma: no cover
 # VERSÃO / CONFIGURAÇÃO BASE
 # =========================================================
 
-VERSAO_COUTIPS = "DC01_3_COUTIPS_ALFA_2026_06_12"
+VERSAO_COUTIPS = "DC01_4_COUTIPS_ALFA_2026_06_13"
 
 load_dotenv()
 
@@ -250,6 +250,17 @@ HABILITAR_DC01_2_CONF01 = os.getenv("HABILITAR_DC01_2_CONF01", "true").lower() =
 HABILITAR_DC01_3_EMPATE_FAVORITO = os.getenv("HABILITAR_DC01_3_EMPATE_FAVORITO", "true").lower() == "true"
 HABILITAR_DC01_3_1X0_TRES_DE_QUATRO = os.getenv("HABILITAR_DC01_3_1X0_TRES_DE_QUATRO", "true").lower() == "true"
 HABILITAR_DC01_3_PERDEDOR_PRESSAO_SIMPLES = os.getenv("HABILITAR_DC01_3_PERDEDOR_PRESSAO_SIMPLES", "true").lower() == "true"
+
+# DC01.4 — AJUSTES PÓS-AUDITORIA 13/06/2026
+# Ajuste A: GOL_RECENTE pressionante que continua dominando AP não bloqueia.
+#   Se pressionante marcou E AP diff ainda positivo E não esfriou (U5>0 OU RB>0 OU IP>=10),
+#   reduz exigência de provas: delta<=3 = 1 prova, delta>3 = 1 prova.
+#   Rollback: HABILITAR_DC01_4_GOL_RECENTE_PRESSIONANTE_AP=false
+# Ajuste B: CHAMA_FT placar elástico — perdedor forte + vencedor vivo = APROVAR direto.
+#   Remove espera de confirmação nesse cenário específico.
+#   Rollback: HABILITAR_DC01_4_CHAMA_ELASTICO_PERDEDOR_DIRETO=false
+HABILITAR_DC01_4_GOL_RECENTE_PRESSIONANTE_AP = os.getenv("HABILITAR_DC01_4_GOL_RECENTE_PRESSIONANTE_AP", "true").lower() == "true"
+HABILITAR_DC01_4_CHAMA_ELASTICO_PERDEDOR_DIRETO = os.getenv("HABILITAR_DC01_4_CHAMA_ELASTICO_PERDEDOR_DIRETO", "true").lower() == "true"
 
 # Médio: penalidade -2 (em vez de -8). Forte: penalidade 0.
 # Nunca cria nova camada — apenas modifica a intensidade da penalidade V26.
@@ -470,6 +481,8 @@ def logar_versao_inicial() -> None:
     log(f"⚽ DC01.3 empate favorito reduz provas: {'ATIVO' if HABILITAR_DC01_3_EMPATE_FAVORITO else 'DESATIVADO'}")
     log(f"🎯 DC01.3 1x0 exige 3/4 critérios: {'ATIVO' if HABILITAR_DC01_3_1X0_TRES_DE_QUATRO else 'DESATIVADO'}")
     log(f"⚡ DC01.3 perdedor por 1 pressão simples: {'ATIVO' if HABILITAR_DC01_3_PERDEDOR_PRESSAO_SIMPLES else 'DESATIVADO'}")
+    log(f"🔄 DC01.4 gol recente pressionante AP: {'ATIVO' if HABILITAR_DC01_4_GOL_RECENTE_PRESSIONANTE_AP else 'DESATIVADO'}")
+    log(f"🔓 DC01.4 CHAMA elástico perdedor direto: {'ATIVO' if HABILITAR_DC01_4_CHAMA_ELASTICO_PERDEDOR_DIRETO else 'DESATIVADO'}")
     log("🎯 SNIPER V2: ATIVO | leitura separada, pressão premiada/gol contra fluxo/necessidade")
     log("🏷️ Auditoria visual: ⚡ ARCE HT | 1T / 🔥 CHAMA FT | 2T / 📊 VOLUME FT | 2T / 🎯 SNIPER | 2T")
     log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
@@ -2166,12 +2179,26 @@ def v27_continuidade_pos_gol(m: Metricas) -> Tuple[bool, str]:
     if ip["pico"] >= 20 or ip["c18"] >= 1:
         provas += 1
 
+    # DC01.4 — Ajuste A: pressionante marcou e continua dominando AP.
+    # Se o gol foi do lado pressionante E ele ainda tem mais AP que o adversário
+    # E o jogo não esfriou de fato (U5>0 OU RB>0 OU IP>=10), a exigência cai para 1 prova.
+    provas_minimas_final = None
+    if HABILITAR_DC01_4_GOL_RECENTE_PRESSIONANTE_AP and gol_do_press and provas_minimas_empate is None:
+        lado_op = "FORA" if lado == "CASA" else "CASA"
+        d_op = dados_lado(m, lado_op)
+        ap_press = d["u10"] + d["u5"]
+        ap_op = d_op["u10"] + d_op["u5"]
+        press_domina_ap = ap_press > ap_op
+        jogo_nao_esfriou = d["u5"] > 0 or d["rb"] > 0 or ip["pico"] >= 10
+        if press_domina_ap and jogo_nao_esfriou:
+            provas_minimas_final = 1
+
     if delta <= 3:
         # Gol muito recente: exige mais cuidado porque odds/ritmo podem estar instáveis.
-        exige = provas_minimas_empate if provas_minimas_empate is not None else 3
+        exige = provas_minimas_final if provas_minimas_final is not None else (provas_minimas_empate if provas_minimas_empate is not None else 3)
         ok = provas >= exige
     else:
-        exige = provas_minimas_empate if provas_minimas_empate is not None else 2
+        exige = provas_minimas_final if provas_minimas_final is not None else (provas_minimas_empate if provas_minimas_empate is not None else 2)
         ok = provas >= exige
 
     motivo = (
@@ -3773,8 +3800,17 @@ def dc01_chama_placar_elastico(m: "Metricas") -> Tuple[str, str]:
             return "APROVAR", "DC01_CHAMA_PLACAR_ELASTICO_CAOS_PERDEDOR_ABSURDO_VENCEDOR_VIVO | " + resumo
         if perdedor_pressao_forte and vencedor_vivo:
             return "APROVAR", "DC01_CHAMA_PLACAR_ELASTICO_CAOS_PERDEDOR_FORTE_VENCEDOR_VIVO | " + resumo
-        if perdedor_pressao_forte or vencedor_vivo or perdedor_ja_marcou:
-            return "CONFIRMAR", "DC01_CHAMA_PLACAR_ELASTICO_MEIO_TERMO_PERDEDOR | " + resumo
+        # DC01.4 — Ajuste B: perdedor com pressão forte OU vencedor vivo OU perdedor marcou
+        # antes ia para CONFIRMAR aguardando timeout. Agora APROVA diretamente
+        # quando há pelo menos UMA dessas condições — confirmação raramente chega a tempo.
+        if HABILITAR_DC01_4_CHAMA_ELASTICO_PERDEDOR_DIRETO:
+            if perdedor_pressao_forte or (vencedor_vivo and perdedor_ja_marcou):
+                return "APROVAR", "DC01_CHAMA_PLACAR_ELASTICO_DC014_PERDEDOR_DIRETO | " + resumo
+            if vencedor_vivo or perdedor_ja_marcou:
+                return "CONFIRMAR", "DC01_CHAMA_PLACAR_ELASTICO_MEIO_TERMO_PERDEDOR | " + resumo
+        else:
+            if perdedor_pressao_forte or vencedor_vivo or perdedor_ja_marcou:
+                return "CONFIRMAR", "DC01_CHAMA_PLACAR_ELASTICO_MEIO_TERMO_PERDEDOR | " + resumo
         return "BLOQUEAR", "DC01_CHAMA_PLACAR_ELASTICO_PERDEDOR_PRESSAO_MORNA_VENCEDOR_MORTO | " + resumo
 
     # Vencedor gera o alerta: em placar elástico não liberar fácil, principalmente se acabou de marcar.
@@ -4459,14 +4495,11 @@ def v13_registrar(m: "Metricas", score_medio: int, aprovado: bool, motivo: str) 
 
 
 def v13_gerar_html(tipo: str, dt: Optional[datetime] = None) -> Path:
-    """Gera HTML diário interativo a partir do JSON.
+    """Gera HTML TURBO diário — padrão DC01.4.
 
-    DC01.1 HTMLFIX:
-    - remove dependência de onclick inline;
-    - usa addEventListener direto nos botões após DOMContentLoaded;
-    - localStorage tem fallback em memória caso o navegador/WebView bloqueie;
-    - botões sempre dão feedback visual imediato;
-    - guarda/exporta GREEN/RED.
+    Layout: lista lateral esquerda + iframe CornerPro direita.
+    Teclado: G=Green, R=Red, S=Skip, N=próximo pendente, arrows=navegar.
+    Exportar CSV no topbar. localStorage com fallback em memória.
     """
     dt = dt or datetime.now()
     arq_json = _v13_arquivo_json(tipo, dt)
@@ -4479,259 +4512,245 @@ def v13_gerar_html(tipo: str, dt: Optional[datetime] = None) -> Path:
             registros = []
 
     titulo = "APROVADOS" if tipo == "aprovados" else "REPROVADOS"
-    cor = "#00c853" if tipo == "aprovados" else "#e53935"
+    cor_topo = "#00c896" if tipo == "aprovados" else "#e94560"
     data_fmt = dt.strftime("%d/%m/%Y")
     data_key = dt.strftime("%Y_%m_%d")
     total = len(registros)
-    storage_key = f"coutips_auditoria_{tipo}_{data_key}"
+    storage_key = f"coutips_turbo_{tipo}_{data_key}"
 
-    linhas_html = []
+    # Gera itens da lista lateral
+    itens_js = []
     for i, r in enumerate(registros):
         link = str(r.get("cornerpro", "") or "")
-        link_safe = html.escape(link, quote=True)
-        link_tag = f'<a href="{link_safe}" target="_blank" rel="noopener noreferrer">🔗 CornerPro</a>' if link else "—"
-        motivo_txt = f'<div class="motivo">{html.escape(str(r.get("motivo", "") or ""))}</div>' if r.get("motivo") else ""
-        bot = html.escape(str(r.get("bot", "") or ""), quote=True)
-        jogo = html.escape(str(r.get("jogo", "") or ""), quote=True)
-        minuto = html.escape(str(r.get("minuto", "") or ""), quote=True)
-        placar = html.escape(str(r.get("placar", "") or ""), quote=True)
-        score = html.escape(str(r.get("score", "") or ""), quote=True)
-        liga = html.escape(str(r.get("liga", "") or ""), quote=True)
+        link_safe = link.replace("'", "\\'")
+        bot = str(r.get("bot", "") or "").replace("'", "\\'")
+        jogo = str(r.get("jogo", "") or "").replace("'", "\\'")
+        minuto = str(r.get("minuto", "") or "").replace("'", "\\'")
+        placar = str(r.get("placar", "") or "").replace("'", "\\'")
+        score = str(r.get("score", "") or "").replace("'", "\\'")
+        liga = str(r.get("liga", "") or "").replace("'", "\\'")
+        motivo = str(r.get("motivo", "") or "").replace("'", "\\'")
         uid_base = f"{r.get('bot','')}|{r.get('jogo','')}|{r.get('minuto','')}|{r.get('placar','')}|{r.get('score','')}|{i}"
-        uid = hashlib.sha1(uid_base.encode("utf-8", errors="ignore")).hexdigest()[:16]
-        linhas_html.append(f"""
-        <article class="item" data-id="{uid}" data-bot="{bot}" data-jogo="{jogo}" data-minuto="{minuto}" data-placar="{placar}" data-score="{score}" data-liga="{liga}" data-cornerpro="{link_safe}">
-          <div class="topline">
-            <span class="badge">{bot}</span>
-            <strong>{jogo}</strong>
-          </div>
-          <div class="meta">⏱ {minuto}' &nbsp;|&nbsp; 📊 {placar} &nbsp;|&nbsp; Score: <b>{score}%</b> &nbsp;|&nbsp; Liga: {liga} &nbsp;|&nbsp; {link_tag}</div>
-          {motivo_txt}
-          <div class="actions">
-            <button type="button" class="btn green js-result" data-action="GREEN" data-id="{uid}">✅ GREEN</button>
-            <button type="button" class="btn red js-result" data-action="RED" data-id="{uid}">❌ RED</button>
-            <button type="button" class="btn clear js-result" data-action="CLEAR" data-id="{uid}">↩ LIMPAR</button>
-            <span class="status" id="status-{uid}">PENDENTE</span>
-          </div>
-        </article>""")
+        uid = __import__('hashlib').sha1(uid_base.encode("utf-8", errors="ignore")).hexdigest()[:16]
+        itens_js.append(
+            f"{{id:'{uid}',bot:'{bot}',match:'{jogo}',min:'{minuto}',"
+            f"placar:'{placar}',score:'{score}',liga:'{liga}',"
+            f"motivo:'{motivo}',link:'{link_safe}'}}"
+        )
 
-    corpo = "\n".join(linhas_html) if linhas_html else "<p class='vazio'>Nenhum registro ainda.</p>"
+    games_js = "[" + ",\n".join(itens_js) + "]" if itens_js else "[]"
 
     conteudo = f"""<!DOCTYPE html>
 <html lang="pt-BR">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1.0,user-scalable=no">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>COUTIPS {titulo} — {data_fmt}</title>
 <style>
-  *{{box-sizing:border-box;margin:0;padding:0}}
-  body{{font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0d0d0d;color:#e0e0e0;padding:16px;padding-bottom:90px}}
-  h1{{color:{cor};font-size:1.25rem;margin-bottom:4px}}
-  .sub{{color:#999;font-size:0.85rem;margin-bottom:12px}}
-  .toolbar{{position:sticky;top:0;z-index:20;background:#101010;border:1px solid #272727;border-radius:10px;padding:10px;margin-bottom:12px;box-shadow:0 8px 20px rgba(0,0,0,.35)}}
-  .stats{{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px}}
-  .pill{{background:#1b1b1b;border:1px solid #333;border-radius:999px;padding:5px 9px;font-size:.78rem;color:#ddd}}
-  .pill.green{{border-color:#00c853;color:#69f0ae}}
-  .pill.red{{border-color:#e53935;color:#ff8a80}}
-  .pill.pending{{border-color:#ffb300;color:#ffd54f}}
-  .item{{background:#181818;border-left:4px solid {cor};border-radius:8px;padding:11px 12px;margin:8px 0;font-size:0.88rem;line-height:1.55;position:relative}}
-  .item.green-marked{{box-shadow:0 0 0 1px rgba(0,200,83,.5);border-left-color:#00c853;background:#102116}}
-  .item.red-marked{{box-shadow:0 0 0 1px rgba(229,57,53,.55);border-left-color:#e53935;background:#241111}}
-  .topline{{display:flex;align-items:center;gap:7px;flex-wrap:wrap;margin-bottom:3px}}
-  .badge{{display:inline-block;background:#1e3a5f;color:#90caf9;padding:2px 8px;border-radius:10px;font-size:0.72rem;font-weight:800}}
-  .meta{{color:#ddd}}
-  .motivo{{color:#ff8a65;font-size:0.8rem;margin-top:4px;word-break:break-word}}
-  a{{color:#ffb300;text-decoration:none}}
-  a:hover{{text-decoration:underline}}
-  .actions{{display:flex;gap:7px;align-items:center;flex-wrap:wrap;margin-top:10px}}
-  .btn{{border:0;border-radius:8px;padding:10px 12px;font-weight:900;font-size:.82rem;cursor:pointer;color:#fff;touch-action:manipulation;user-select:none;pointer-events:auto}}
-  .btn:active{{transform:scale(.97)}}
-  .btn.green{{background:#0b8f3a}}
-  .btn.red{{background:#b3261e}}
-  .btn.clear{{background:#333;color:#ddd}}
-  .btn.export{{background:#263238;color:#fff;border:1px solid #455a64}}
-  .status{{font-size:.78rem;font-weight:900;color:#ffb300;margin-left:2px}}
-  .status.green{{color:#69f0ae}}
-  .status.red{{color:#ff8a80}}
-  .vazio{{color:#888;margin-top:16px}}
-  .debug{{margin-top:8px;color:#777;font-size:.72rem}}
+:root{{--bg:#0d0f14;--s1:#161b24;--s2:#1e2533;--border:#2a3244;--red:#e94560;--gold:#f0a500;--green:#00c896;--blue:#4a9eff;--text:#e8ecf0;--muted:#6a7a8e}}
+*{{box-sizing:border-box;margin:0;padding:0}}
+html,body{{height:100%;overflow:hidden}}
+body{{background:var(--bg);color:var(--text);font-family:'Segoe UI',system-ui,sans-serif;font-size:13px;display:flex;flex-direction:column}}
+#topbar{{background:var(--s1);border-bottom:2px solid {cor_topo};padding:6px 14px;display:flex;align-items:center;gap:10px;flex-shrink:0;flex-wrap:wrap}}
+.logo{{font-size:10px;font-weight:800;letter-spacing:3px;color:{cor_topo}}}
+.tsub{{font-size:10px;color:var(--muted)}}
+.sep{{width:1px;height:28px;background:var(--border);flex-shrink:0}}
+.spacer{{flex:1}}
+.pill{{background:var(--s2);border:1px solid var(--border);border-radius:20px;padding:3px 10px;font-size:11px;color:var(--muted);display:flex;align-items:center;gap:5px}}
+.pill b{{font-size:13px;font-weight:700}}
+.pill.g b{{color:var(--green)}}.pill.r b{{color:var(--red)}}.pill.p b{{color:var(--gold)}}
+.csv-btn{{padding:4px 14px;background:#0d1a2e;border:1px solid #2a3e5a;border-radius:4px;color:var(--blue);font-size:11px;font-weight:700;cursor:pointer}}
+.csv-btn:hover{{background:#1a2e4a}}
+#main{{display:flex;flex:1;overflow:hidden;min-height:0}}
+#sidebar{{width:290px;flex-shrink:0;border-right:1px solid var(--border);overflow-y:auto;background:var(--bg)}}
+.item{{padding:8px 10px;border-bottom:1px solid var(--border);cursor:pointer;display:flex;align-items:center;gap:7px;border-left:3px solid transparent;user-select:none;transition:background .1s}}
+.item:hover{{background:var(--s2)}}
+.item.sel{{background:#0d1a2e;border-left-color:var(--blue)}}
+.item.dg{{border-left-color:var(--green)!important}}
+.item.dr{{border-left-color:var(--red)!important}}
+.item.ds{{opacity:0.4}}
+.dot{{width:7px;height:7px;border-radius:50%;flex-shrink:0;background:var(--border)}}
+.dot.g{{background:var(--green)}}.dot.r{{background:var(--red)}}.dot.s{{background:#333}}
+.ib{{flex:1;min-width:0}}
+.im{{font-weight:600;font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
+.imeta{{font-size:10px;color:var(--muted);margin-top:2px;display:flex;gap:5px;flex-wrap:wrap}}
+.sc{{font-family:monospace;font-weight:700;font-size:11px;color:var(--text)}}
+.bd{{padding:1px 5px;border-radius:3px;font-size:9px;font-weight:700;background:#1a1e2a;color:#4a9eff;border:1px solid #1e2e4a}}
+#right{{flex:1;display:flex;flex-direction:column;min-width:0;overflow:hidden}}
+#frame-wrap{{flex:1;position:relative;overflow:hidden;background:#111}}
+#frame-wrap iframe{{width:100%;height:100%;border:none;display:block}}
+#no-game{{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;background:var(--bg);pointer-events:none}}
+#no-game.hidden{{display:none}}
+#bottombar{{background:var(--s1);border-top:1px solid var(--border);padding:7px 14px;display:flex;align-items:center;gap:8px;flex-shrink:0}}
+#mlabel{{font-size:11px;font-weight:600;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--muted)}}
+.abtn{{padding:7px 18px;border-radius:5px;border:1px solid var(--border);background:var(--s2);color:var(--muted);font-size:13px;font-weight:700;cursor:pointer;transition:all .15s}}
+.abtn:hover{{opacity:.8}}
+.abtn.ag{{background:#004a30;border-color:var(--green);color:var(--green)}}
+.abtn.ar{{background:#4a0020;border-color:var(--red);color:var(--red)}}
+.abtn.as{{background:#1e2533;border-color:#3a4555;color:#4a5566}}
+.kh{{font-size:10px;color:var(--muted);display:flex;gap:6px;align-items:center}}
+.k{{background:var(--s2);border:1px solid var(--border);border-radius:3px;padding:1px 5px;font-family:monospace;font-size:10px}}
+.k.kg{{border-color:var(--green);color:var(--green)}}.k.kr{{border-color:var(--red);color:var(--red)}}
+#prog{{font-size:10px;color:var(--muted);white-space:nowrap}}
+::-webkit-scrollbar{{width:4px}}
+::-webkit-scrollbar-track{{background:var(--bg)}}
+::-webkit-scrollbar-thumb{{background:var(--border);border-radius:2px}}
 </style>
 </head>
 <body>
-<h1>📋 COUTIPS — {titulo}</h1>
-<div class="sub">{data_fmt} &nbsp;|&nbsp; {total} registro(s)</div>
-<div class="toolbar">
-  <div class="stats">
-    <span class="pill">Total: <b id="total">{total}</b></span>
-    <span class="pill green">GREEN: <b id="greens">0</b></span>
-    <span class="pill red">RED: <b id="reds">0</b></span>
-    <span class="pill pending">Pendentes: <b id="pendentes">{total}</b></span>
-  </div>
-  <div class="actions">
-    <button type="button" class="btn export" id="btnExportJson">⬇ Exportar JSON</button>
-    <button type="button" class="btn export" id="btnExportCsv">⬇ Exportar CSV</button>
-  </div>
-  <div class="debug" id="debug">HTMLFIX DC01.1 carregando...</div>
+<div id="topbar">
+  <div><div class="logo">COUTIPS / {titulo}</div><div class="tsub">{data_fmt}</div></div>
+  <div class="sep"></div>
+  <div class="spacer"></div>
+  <div class="pill p"><b id="ct">{total}</b> jogos</div>
+  <div class="pill g">🟢 <b id="cg">0</b></div>
+  <div class="pill r">🔴 <b id="cr">0</b></div>
+  <div class="pill"><b id="cp">{total}</b> pend.</div>
+  <button class="csv-btn" onclick="exportCSV()">⬇ Exportar CSV</button>
 </div>
-{corpo}
+<div id="main">
+  <div id="sidebar"></div>
+  <div id="right">
+    <div id="frame-wrap">
+      <iframe id="frm" src="about:blank"></iframe>
+      <div id="no-game">
+        <div style="font-size:32px;color:var(--border)">←</div>
+        <div style="font-size:13px;color:var(--muted)">Selecione um jogo na lista</div>
+        <div style="font-size:11px;color:var(--border)">G = Green · R = Red · N = próximo pendente</div>
+      </div>
+    </div>
+    <div id="bottombar">
+      <div id="mlabel">Nenhum jogo selecionado</div>
+      <button class="abtn" id="bg" onclick="setResult(sel,'green')">🟢 G</button>
+      <button class="abtn" id="br" onclick="setResult(sel,'red')">🔴 R</button>
+      <button class="abtn" id="bs" onclick="setResult(sel,'skip')">— S</button>
+      <div class="sep"></div>
+      <div class="kh">
+        <span><span class="k kg">G</span></span>
+        <span><span class="k kr">R</span></span>
+        <span><span class="k">S</span></span>
+        <span><span class="k">↑↓</span></span>
+        <span><span class="k">N</span> pend.</span>
+      </div>
+      <div class="spacer"></div>
+      <div id="prog"></div>
+    </div>
+  </div>
+</div>
 <script>
-(function() {{
-  'use strict';
-  const STORAGE_KEY = {json.dumps(storage_key)};
-  let memoria = {{}};
-
-  function debug(msg) {{
-    const el = document.getElementById('debug');
-    if (el) el.textContent = msg;
-  }}
-
-  function carregar() {{
-    try {{
-      const raw = window.localStorage ? localStorage.getItem(STORAGE_KEY) : null;
-      memoria = raw ? JSON.parse(raw) : memoria;
-      return Object.assign({{}}, memoria);
-    }} catch(e) {{
-      return Object.assign({{}}, memoria);
-    }}
-  }}
-
-  function salvar(dados) {{
-    memoria = Object.assign({{}}, dados);
-    try {{
-      if (window.localStorage) localStorage.setItem(STORAGE_KEY, JSON.stringify(memoria));
-    }} catch(e) {{
-      debug('HTMLFIX: localStorage bloqueado, usando memória da página.');
-    }}
-  }}
-
-  function setResultado(id, resultado) {{
-    const dados = carregar();
-    if (resultado === 'CLEAR') delete dados[id];
-    else dados[id] = resultado;
-    salvar(dados);
-    aplicarEstado();
-  }}
-
-  function aplicarEstado() {{
-    const dados = carregar();
-    let greens = 0, reds = 0;
-    document.querySelectorAll('.item').forEach(function(item) {{
-      const id = item.getAttribute('data-id');
-      const res = dados[id];
-      const st = document.getElementById('status-' + id);
-      item.classList.remove('green-marked','red-marked');
-      if (st) {{
-        st.classList.remove('green','red');
-        st.textContent = 'PENDENTE';
-      }}
-      if (res === 'GREEN') {{
-        greens++;
-        item.classList.add('green-marked');
-        if (st) {{ st.textContent = '✅ GREEN'; st.classList.add('green'); }}
-      }} else if (res === 'RED') {{
-        reds++;
-        item.classList.add('red-marked');
-        if (st) {{ st.textContent = '❌ RED'; st.classList.add('red'); }}
-      }}
-    }});
-    const total = document.querySelectorAll('.item').length;
-    const g = document.getElementById('greens');
-    const r = document.getElementById('reds');
-    const p = document.getElementById('pendentes');
-    if (g) g.textContent = greens;
-    if (r) r.textContent = reds;
-    if (p) p.textContent = total - greens - reds;
-    debug('HTMLFIX DC01.1 ativo — botões GREEN/RED clicáveis.');
-  }}
-
-  function coletarResultados() {{
-    const dados = carregar();
-    return Array.from(document.querySelectorAll('.item')).map(function(item) {{
-      const id = item.getAttribute('data-id') || '';
-      return {{
-        id: id,
-        resultado: dados[id] || '',
-        bot: item.getAttribute('data-bot') || '',
-        jogo: item.getAttribute('data-jogo') || '',
-        minuto: item.getAttribute('data-minuto') || '',
-        placar: item.getAttribute('data-placar') || '',
-        score: item.getAttribute('data-score') || '',
-        liga: item.getAttribute('data-liga') || '',
-        cornerpro: item.getAttribute('data-cornerpro') || ''
-      }};
-    }});
-  }}
-
-  function baixar(nome, conteudo, tipo) {{
-    const blob = new Blob([conteudo], {{type: tipo}});
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = nome;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    setTimeout(function() {{ URL.revokeObjectURL(url); }}, 500);
-  }}
-
-  function csvEscape(v) {{
-    v = String(v == null ? '' : v);
-    return '"' + v.replace(/"/g, '""') + '"';
-  }}
-
-  document.addEventListener('click', function(e) {{
-    const btn = e.target.closest('.js-result');
-    if (!btn) return;
-    e.preventDefault();
-    e.stopPropagation();
-    const id = btn.getAttribute('data-id');
-    const action = btn.getAttribute('data-action');
-    if (!id || !action) return;
-    setResultado(id, action);
-  }}, false);
-
-  document.querySelectorAll('.js-result').forEach(function(btn) {{
-    btn.addEventListener('click', function(e) {{
-      e.preventDefault();
-      e.stopPropagation();
-      const id = btn.getAttribute('data-id');
-      const action = btn.getAttribute('data-action');
-      if (!id || !action) return;
-      setResultado(id, action);
-    }});
+const GAMES={games_js};
+const KEY={json_mod.dumps(storage_key)};
+let state={{}};
+let sel=null;
+try{{state=JSON.parse(localStorage.getItem(KEY))||{{}};}}catch(e){{}}
+function save(){{try{{localStorage.setItem(KEY,JSON.stringify(state));}}catch(e){{}}}}
+function renderSidebar(){{
+  const sb=document.getElementById('sidebar');
+  let h='';
+  GAMES.forEach((g)=>{{
+    const r=state[g.id];
+    const dc=r==='green'?'dg':r==='red'?'dr':r==='skip'?'ds':'';
+    const sc=g.id===sel?'sel':'';
+    const dot=r==='green'?'g':r==='red'?'r':r==='skip'?'s':'';
+    h+=`<div class="item ${{sc}} ${{dc}}" id="i-${{g.id}}" onclick="pick('${{g.id}}')">
+      <div class="dot ${{dot}}"></div>
+      <div class="ib">
+        <div class="im">${{g.match}}</div>
+        <div class="imeta">
+          <span class="bd">${{g.bot}}</span>
+          <span class="sc">${{g.placar}}</span>
+          <span>${{g.min}}</span>
+          <span style="color:var(--muted)">${{g.score}}%</span>
+        </div>
+      </div>
+    </div>`;
   }});
-
-  document.getElementById('btnExportJson')?.addEventListener('click', function(e) {{
-    e.preventDefault();
-    baixar('coutips_{tipo}_{data_key}_resultados.json', JSON.stringify(coletarResultados(), null, 2), 'application/json;charset=utf-8');
+  sb.innerHTML=h;
+  updStats();
+}}
+function pick(id){{
+  sel=id;
+  const g=GAMES.find(x=>x.id===id);
+  if(!g)return;
+  document.querySelectorAll('.item').forEach(el=>{{
+    el.classList.remove('sel');
+    if(el.id==='i-'+id){{el.classList.add('sel');el.scrollIntoView({{block:'nearest'}});}}
   }});
-
-  document.getElementById('btnExportCsv')?.addEventListener('click', function(e) {{
-    e.preventDefault();
-    const rows = coletarResultados();
-    const header = ['resultado','bot','jogo','minuto','placar','score','liga','cornerpro'];
-    const csv = [header.join(',')].concat(rows.map(function(r) {{
-      return header.map(function(h) {{ return csvEscape(r[h]); }}).join(',');
-    }})).join('\n');
-    baixar('coutips_{tipo}_{data_key}_resultados.csv', csv, 'text/csv;charset=utf-8');
+  document.getElementById('frm').src=g.link||'about:blank';
+  document.getElementById('no-game').classList.add('hidden');
+  document.getElementById('mlabel').innerHTML=`${{g.match}} &nbsp;·&nbsp; ${{g.placar}} &nbsp;·&nbsp; ${{g.min}} &nbsp;·&nbsp; ${{g.score}}% &nbsp;·&nbsp; ${{g.liga}}`;
+  updBtns();
+}}
+function updBtns(){{
+  const r=state[sel];
+  ['bg','br','bs'].forEach(id=>{{document.getElementById(id).className='abtn';}});
+  if(r==='green')document.getElementById('bg').className='abtn ag';
+  if(r==='red')  document.getElementById('br').className='abtn ar';
+  if(r==='skip') document.getElementById('bs').className='abtn as';
+}}
+function setResult(id,result){{
+  if(!id)return;
+  state[id]=result;
+  save();
+  renderSidebar();
+  document.querySelectorAll('.item').forEach(el=>el.classList.remove('sel'));
+  const el=document.getElementById('i-'+id);
+  if(el)el.classList.add('sel');
+  updBtns();
+  setTimeout(()=>{{
+    const idx=GAMES.findIndex(g=>g.id===id);
+    const nxt=GAMES.slice(idx+1).find(g=>!state[g.id]);
+    if(nxt)pick(nxt.id);
+  }},250);
+}}
+function nextPending(){{
+  const idx=sel?GAMES.findIndex(g=>g.id===sel):-1;
+  const nxt=GAMES.slice(idx+1).find(g=>!state[g.id])||GAMES.find(g=>!state[g.id]);
+  if(nxt)pick(nxt.id);
+}}
+function updStats(){{
+  const g=Object.values(state).filter(v=>v==='green').length;
+  const r=Object.values(state).filter(v=>v==='red').length;
+  const s=Object.values(state).filter(v=>v==='skip').length;
+  const p=GAMES.length-g-r-s;
+  document.getElementById('cg').textContent=g;
+  document.getElementById('cr').textContent=r;
+  document.getElementById('cp').textContent=p;
+  const done=g+r;
+  document.getElementById('prog').textContent=done>0?`${{done}}/${{GAMES.length}} · ${{Math.round(g/done*100)}}% green`:`${{GAMES.length}} jogos`;
+}}
+function exportCSV(){{
+  const rows=[['ID','BOT','JOGO','LIGA','MIN','PLACAR','SCORE','RESULTADO','MOTIVO','LINK']];
+  GAMES.forEach(g=>{{
+    rows.push([g.id,g.bot,g.match,g.liga,g.min,g.placar,g.score,state[g.id]||'pendente',g.motivo||'',g.link||'']);
   }});
-
-  window.marcarResultado = function(id, resultado) {{ setResultado(id, resultado); }};
-  window.limparResultado = function(id) {{ setResultado(id, 'CLEAR'); }};
-
-  if (document.readyState === 'loading') {{
-    document.addEventListener('DOMContentLoaded', aplicarEstado);
-  }} else {{
-    aplicarEstado();
-  }}
-}})();
+  const csv=rows.map(r=>r.map(c=>'"'+String(c).replace(/"/g,'""')+'"').join(';')).join('\\n');
+  const blob=new Blob([csv],{{type:'text/csv;charset=utf-8;'}});
+  const url=URL.createObjectURL(blob);
+  const a=document.createElement('a');
+  a.href=url;a.download='coutips_{tipo}_{data_key}.csv';a.click();
+  URL.revokeObjectURL(url);
+}}
+document.addEventListener('keydown',e=>{{
+  const t=document.activeElement.tagName;
+  if(t==='INPUT'||t==='TEXTAREA')return;
+  if(e.key==='g'||e.key==='G'){{if(sel)setResult(sel,'green');}}
+  else if(e.key==='r'||e.key==='R'){{if(sel)setResult(sel,'red');}}
+  else if(e.key==='s'||e.key==='S'){{if(sel)setResult(sel,'skip');}}
+  else if(e.key==='n'||e.key==='N')nextPending();
+  else if(e.key==='ArrowDown'){{const idx=GAMES.findIndex(g=>g.id===sel);if(idx<GAMES.length-1)pick(GAMES[idx+1].id);}}
+  else if(e.key==='ArrowUp'){{const idx=GAMES.findIndex(g=>g.id===sel);if(idx>0)pick(GAMES[idx-1].id);}}
+}});
+renderSidebar();
+const first=GAMES.find(g=>!state[g.id]);
+if(first)pick(first.id);
 </script>
 </body>
 </html>"""
 
     try:
         arq_html.write_text(conteudo, encoding="utf-8")
-        log(f"📄 DC01.1 HTMLFIX interativo gerado | {arq_html.name} | {total} registros")
+        log(f"📄 DC01.4 HTML TURBO gerado | {arq_html.name} | {total} registros")
     except Exception as e:
         log(f"⚠️ V13 gerar_html erro | {type(e).__name__}: {e}")
     return arq_html
