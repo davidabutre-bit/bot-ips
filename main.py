@@ -54,7 +54,7 @@ except Exception:  # pragma: no cover
 # VERSÃO / CONFIGURAÇÃO BASE
 # =========================================================
 
-VERSAO_COUTIPS = "DC01_4_COUTIPS_ALFA_2026_06_13"
+VERSAO_COUTIPS = "ALFA_COUTIPS_2026_06_18_V29_MELHORIAS"
 
 load_dotenv()
 
@@ -110,7 +110,7 @@ AUDITORIA_CHAT_IDS = {
 MODO_TESTE = os.getenv("MODO_TESTE", "false").lower() == "true"
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.5")
 OPENAI_HABILITADO = os.getenv("OPENAI_HABILITADO", "true").lower() == "true"
 OPENAI_TIMEOUT = float(os.getenv("OPENAI_TIMEOUT", "30"))
 
@@ -262,6 +262,33 @@ HABILITAR_DC01_3_PERDEDOR_PRESSAO_SIMPLES = os.getenv("HABILITAR_DC01_3_PERDEDOR
 HABILITAR_DC01_4_GOL_RECENTE_PRESSIONANTE_AP = os.getenv("HABILITAR_DC01_4_GOL_RECENTE_PRESSIONANTE_AP", "true").lower() == "true"
 HABILITAR_DC01_4_CHAMA_ELASTICO_PERDEDOR_DIRETO = os.getenv("HABILITAR_DC01_4_CHAMA_ELASTICO_PERDEDOR_DIRETO", "true").lower() == "true"
 
+# =========================================================
+# V29 — PACOTE DE MELHORIAS 18/06/2026
+# Flag única controla todo o pacote de código.
+# Flag separada controla o pacote IA (modelo + prompt).
+# Rollback: setar HABILITAR_V29_MELHORIAS=false ou HABILITAR_V29_IA_NOVA=false no Railway.
+# =========================================================
+HABILITAR_V29_MELHORIAS = os.getenv("HABILITAR_V29_MELHORIAS", "true").lower() == "true"
+HABILITAR_V29_IA_NOVA = os.getenv("HABILITAR_V29_IA_NOVA", "true").lower() == "true"
+
+# V29 — Thresholds configuráveis para as novas travas
+# Item 1: trava confirmação favorito vencendo + gol recente
+V29_CONF_FAV_VENCENDO_GOL_RECENTE_JANELA = int(os.getenv("V29_CONF_FAV_VENCENDO_GOL_RECENTE_JANELA", "15"))
+V29_CONF_FAV_VENCENDO_U10_MIN = int(os.getenv("V29_CONF_FAV_VENCENDO_U10_MIN", "10"))
+V29_CONF_FAV_VENCENDO_RB_MIN = int(os.getenv("V29_CONF_FAV_VENCENDO_RB_MIN", "6"))
+V29_CONF_FAV_VENCENDO_XG_MIN = float(os.getenv("V29_CONF_FAV_VENCENDO_XG_MIN", "2.0"))
+# Item 2: trava confirmação placar largo adversário
+V29_CONF_PLACAR_LARGO_MIN_DIFF = int(os.getenv("V29_CONF_PLACAR_LARGO_MIN_DIFF", "3"))
+# Item 10: decaimento de pressão no 2ºP
+V29_DECAIMENTO_XG_MIN = float(os.getenv("V29_DECAIMENTO_XG_MIN", "1.5"))
+V29_DECAIMENTO_U10_MIN = int(os.getenv("V29_DECAIMENTO_U10_MIN", "8"))
+# Item 11: DC01 massacre absoluto do vencedor
+V29_MASSACRE_IP_MIN = float(os.getenv("V29_MASSACRE_IP_MIN", "25.0"))
+V29_MASSACRE_RB_MIN = int(os.getenv("V29_MASSACRE_RB_MIN", "10"))
+V29_MASSACRE_CHANCE_MIN = int(os.getenv("V29_MASSACRE_CHANCE_MIN", "12"))
+V29_MASSACRE_DIFF_MIN = int(os.getenv("V29_MASSACRE_DIFF_MIN", "3"))
+V29_MASSACRE_GOL_ANTES_MIN = int(os.getenv("V29_MASSACRE_GOL_ANTES_MIN", "60"))
+
 # Médio: penalidade -2 (em vez de -8). Forte: penalidade 0.
 # Nunca cria nova camada — apenas modifica a intensidade da penalidade V26.
 HABILITAR_DC01_2_V26_CAOS_BIDIRECIONAL = os.getenv("HABILITAR_DC01_2_V26_CAOS_BIDIRECIONAL", "true").lower() == "true"
@@ -317,6 +344,11 @@ locks_por_jogo: Dict[str, asyncio.Lock] = {}
 # Não substitui a janela curta de decisão; é memória operacional entre CHAMA_FT/ALFA_FT e BOT_FT CONFIRMAÇÃO.
 pendentes_confirmacao_ft: Dict[str, Dict[str, Any]] = {}
 tarefas_timeout_confirmacao_ft: Dict[str, asyncio.Task] = {}
+
+# V29 — cooldown universal por jogo.
+# Registra qualquer jogo que foi aprovado e enviado. Chave = normalizar_chave_jogo(jogo).
+# Impede segunda entrada do mesmo jogo independente do bot.
+v29_aprovados_por_jogo: Dict[str, float] = {}
 
 # V011 — estado do grupo grátis.
 # V017 — contadores e cooldowns persistidos em JSON para sobreviver a restarts.
@@ -485,6 +517,14 @@ def logar_versao_inicial() -> None:
     log(f"🔓 DC01.4 CHAMA elástico perdedor direto: {'ATIVO' if HABILITAR_DC01_4_CHAMA_ELASTICO_PERDEDOR_DIRETO else 'DESATIVADO'}")
     log("🎯 SNIPER V2: ATIVO | leitura separada, pressão premiada/gol contra fluxo/necessidade")
     log("🏷️ Auditoria visual: ⚡ ARCE HT | 1T / 🔥 CHAMA FT | 2T / 📊 VOLUME FT | 2T / 🎯 SNIPER | 2T")
+    log(f"🆕 V29 melhorias código: {'ATIVO' if HABILITAR_V29_MELHORIAS else 'DESATIVADO'}")
+    log(f"🤖 V29 IA nova (gpt-5.5 + prompt conservador): {'ATIVO' if HABILITAR_V29_IA_NOVA else 'DESATIVADO'}")
+    log(f"🛡️ V29 trava conf favorito vencendo+gol recente: janela={V29_CONF_FAV_VENCENDO_GOL_RECENTE_JANELA}min u10≥{V29_CONF_FAV_VENCENDO_U10_MIN} rb≥{V29_CONF_FAV_VENCENDO_RB_MIN} xg≥{V29_CONF_FAV_VENCENDO_XG_MIN}")
+    log(f"🛡️ V29 trava conf placar largo: dif≥{V29_CONF_PLACAR_LARGO_MIN_DIFF}")
+    log(f"🛡️ V29 trava RB=0 liga fraca (NEUTRA/PERIGOSA): {'ATIVA' if HABILITAR_V29_MELHORIAS else 'DESATIVADA'}")
+    log(f"🛡️ V29 trava decaimento pressão 2ºP: xg≥{V29_DECAIMENTO_XG_MIN} u10≥{V29_DECAIMENTO_U10_MIN}")
+    log(f"🔺 V29 massacre absoluto vencedor: ip≥{V29_MASSACRE_IP_MIN} rb≥{V29_MASSACRE_RB_MIN} chance≥{V29_MASSACRE_CHANCE_MIN} dif≥{V29_MASSACRE_DIFF_MIN} gol_antes_min{V29_MASSACRE_GOL_ANTES_MIN}")
+    log(f"⏳ V29 cooldown universal por jogo: {'ATIVO' if HABILITAR_V29_MELHORIAS else 'DESATIVADO'}")
     log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
 
@@ -2844,6 +2884,74 @@ def corte_por_estrategia(estrategia: str) -> int:
 # =========================================================
 
 def montar_prompt_ia(m: Metricas, decisao_py: DecisaoPython) -> str:
+    """V29 — prompt orientado a eliminar falsos positivos.
+
+    Filosofia: a IA procura armadilhas antes de procurar oportunidades.
+    Pergunta central: existe evidência real de que o próximo gol continua vivo?
+    """
+    if HABILITAR_V29_IA_NOVA:
+        return f"""
+Você é a IA Auditora do projeto COUTIPS/ALFA. Sua função principal é ELIMINAR FALSOS POSITIVOS.
+
+FILOSOFIA OBRIGATÓRIA:
+Você não procura oportunidades. Você procura armadilhas.
+Prefira bloquear um jogo bom a aprovar um jogo ruim.
+Se houver dúvida relevante, penalize.
+
+HIERARQUIA DE DECISÃO:
+1. Procure motivos para REPROVAR.
+2. Procure sinais de pressão fake.
+3. Procure sinais de perda de contexto ou motivação.
+4. Só então avalie motivos para aprovar.
+
+PERGUNTA CENTRAL:
+"Existe evidência real de que o próximo gol continua vivo neste momento, ou os números estão criando uma falsa impressão de valor?"
+
+CASOS QUE GERAM SUSPEITA AUTOMÁTICA (penalize fortemente):
+- Favorito vencendo por 3 ou mais gols
+- Gol recente seguido de queda brusca de pressão
+- Ataques perigosos altos sem remates compatíveis (fake pressure)
+- Pressão concentrada apenas nos últimos 5 minutos
+- Domínio estatístico sem invasão efetiva (AP alto, RB baixo, xG baixo)
+- Mercado já muito fechado sem valor restante
+
+REGRAS DE CONTEXTO (não bloquear automaticamente):
+- Gol recente do favorito que CONTINUOU pressionando é neutro, não negativo
+- Gol contra o fluxo (adversário marcou mas favorito segue dominando) é positivo
+- Super favorito empatando ou perdendo com pressão sustentada é contexto positivo
+
+Responda em UMA linha no formato:
+DECISAO=APROVAR|BLOQUEAR; CONFIANCA=0-100; PRESSAO_SUSTENTAVEL=0-100; RISCO_FAKE_PRESSURE=0-100; CONTINUIDADE_OFENSIVA=0-100; MOTIVACAO_DE_GOL=0-100; MOTIVO=texto curto
+
+DADOS:
+Estratégia: {m.estrategia}
+Jogo: {m.jogo}
+Competição: {m.competicao}
+Minuto: {m.tempo}
+Placar: {m.placar}
+Mercado: {m.mercado}
+Liga: {m.liga}
+Odds: {m.odds}
+Favorito: {m.lado_favorito} odd {m.odd_favorito}
+Dominante: {m.lado_dominante}
+Pressionante: {m.lado_pressionante}
+Último gol: {m.ultimo_gol}' {m.ultimo_gol_lado}
+AP: {m.ataques_perigosos}
+U5: {m.ultimos5}
+U10: {m.ultimos10}
+Cantos: {m.cantos}
+RB: {m.remates_baliza}
+Remates lado: {m.remates_lado}
+RDA: {m.remates_dentro_area}
+Chance gol: {m.chance_golo}
+xG: {m.xg}
+IP: {m.pressao_alfa}
+Valor pós-evento: {m.valor_pos_evento_classe} | {m.valor_pos_evento_motivo}
+Score Python: {decisao_py.score}
+Motivo Python: {decisao_py.motivo}
+""".strip()
+
+    # Prompt legado (HABILITAR_V29_IA_NOVA=false)
     return f"""
 Você é a IA Auditora do projeto COUTIPS/ALFA.
 Python é o motor principal. Sua função é auditar fake pressure e incoerências, não destruir contexto institucional forte.
@@ -2893,14 +3001,27 @@ async def consultar_openai(m: Metricas, decisao_py: DecisaoPython) -> Tuple[str,
         return "APROVAR", decisao_py.score, "OPENAI_DESATIVADA_USANDO_SCORE_PYTHON"
 
     prompt = montar_prompt_ia(m, decisao_py)
+
+    # V29 — sistema prompt diferente para IA nova
+    if HABILITAR_V29_IA_NOVA:
+        system_prompt = (
+            "Você é uma IA auditora conservadora especializada em eliminar falsos positivos em apostas de futebol ao vivo. "
+            "Sua missão principal é encontrar armadilhas, não oportunidades. "
+            "Responda SOMENTE no formato exato pedido, sem texto adicional."
+        )
+        max_tokens = 180
+    else:
+        system_prompt = "Você é uma IA auditora objetiva de futebol ao vivo. Responda somente no formato pedido."
+        max_tokens = 120
+
     payload = {
         "model": OPENAI_MODEL,
         "messages": [
-            {"role": "system", "content": "Você é uma IA auditora objetiva de futebol ao vivo. Responda somente no formato pedido."},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": prompt},
         ],
         "temperature": 0.1,
-        "max_tokens": 120,
+        "max_tokens": max_tokens,
     }
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
     try:
@@ -2908,12 +3029,26 @@ async def consultar_openai(m: Metricas, decisao_py: DecisaoPython) -> Tuple[str,
             r = await http.post("https://api.openai.com/v1/chat/completions", json=payload, headers=headers)
             r.raise_for_status()
             content = r.json()["choices"][0]["message"]["content"].strip()
+
         decisao = "APROVAR" if "APROVAR" in content.upper() else "BLOQUEAR" if "BLOQUEAR" in content.upper() else "APROVAR"
         conf = pegar_numero(r"CONFIANCA\s*=\s*(\d+)", content, decisao_py.score)
         if conf == decisao_py.score:
             conf = pegar_numero(r"CONFIANÇA\s*=\s*(\d+)", content, decisao_py.score)
-        motivo = content[:250]
-        log(f"🤖 OpenAI | {m.jogo} | {decisao} | confiança={conf}")
+
+        # V29 — extrai variáveis adicionais da IA nova para log/CSV
+        if HABILITAR_V29_IA_NOVA:
+            pressao_sust = pegar_numero(r"PRESSAO_SUSTENTAVEL\s*=\s*(\d+)", content, 0)
+            risco_fake = pegar_numero(r"RISCO_FAKE_PRESSURE\s*=\s*(\d+)", content, 0)
+            continuidade = pegar_numero(r"CONTINUIDADE_OFENSIVA\s*=\s*(\d+)", content, 0)
+            motivacao = pegar_numero(r"MOTIVACAO_DE_GOL\s*=\s*(\d+)", content, 0)
+            log(
+                f"🤖 OpenAI V29 | {m.jogo} | {decisao} | score={conf} | "
+                f"pressao={pressao_sust} fake={risco_fake} cont={continuidade} motiv={motivacao}"
+            )
+        else:
+            log(f"🤖 OpenAI | {m.jogo} | {decisao} | confiança={conf}")
+
+        motivo = content[:300]
         return decisao, clamp(conf, 0, 95), motivo  # teto IA: nunca passa de 95
     except Exception as e:
         log(f"⚠️ OpenAI falhou | usando score Python | {type(e).__name__}: {e}")
@@ -3580,6 +3715,16 @@ def confirmacao_isolada_valida(m: Metricas) -> Tuple[bool, str]:
             if not zebra_viva_iso:
                 return False, f"CONF01_FAVORITO_VENCE_1_ZEBRA_MORTA | {zebra_motivo_iso}"
 
+    # V29 Item 1 — trava favorito vencendo + gol recente do favorito
+    bloqueio_v29_1, motivo_v29_1 = v29_trava_conf_favorito_vencendo_gol_recente(m)
+    if bloqueio_v29_1:
+        return False, motivo_v29_1
+
+    # V29 Item 2 — trava placar largo adversário
+    bloqueio_v29_2, motivo_v29_2 = v29_trava_conf_placar_largo(m)
+    if bloqueio_v29_2:
+        return False, motivo_v29_2
+
     # Favorito pressionando e ainda não venceu/resolvido.
     if fav == lado and favorito_nao_vencendo(m) and pressao_viva_lado(m, lado) and consequencia_minima_emocional(m, lado):
         return True, "CONF_ISOLADA_FAVORITO_NAO_VENCE_COM_PRESSAO"
@@ -3609,6 +3754,16 @@ def comparar_alertas_confirmacao(old: Metricas, novo: Metricas) -> Tuple[bool, s
             f"CONF_GOL_RECENTE_PRESSIONANTE_RESOLVEU | ultimo={novo.ultimo_gol}' {novo.ultimo_gol_lado} | "
             f"placar={novo.placar} | press={novo.lado_pressionante}"
         ), detalhes
+
+    # V29 Item 1 — trava favorito vencendo + gol recente do favorito
+    bloqueio_v29_1, motivo_v29_1 = v29_trava_conf_favorito_vencendo_gol_recente(novo)
+    if bloqueio_v29_1:
+        return False, motivo_v29_1, detalhes
+
+    # V29 Item 2 — trava placar largo adversário (favorito perdendo por 3+)
+    bloqueio_v29_2, motivo_v29_2 = v29_trava_conf_placar_largo(novo)
+    if bloqueio_v29_2:
+        return False, motivo_v29_2, detalhes
 
     # DC01.2 — CONF01: bloqueia confirmação quando favorito vence por 1 e zebra está morta.
     # A confirmação deve aprovar somente quando há melhora forte, necessidade real ou
@@ -3794,6 +3949,13 @@ def dc01_chama_placar_elastico(m: "Metricas") -> Tuple[str, str]:
     if ambos_mortos:
         return "BLOQUEAR", "DC01_CHAMA_PLACAR_ELASTICO_MORTO | " + resumo
 
+    # V29 Item 11 — exceção massacre absoluto do vencedor
+    # Critérios extremos: IP≥25 + RB≥10 + chance≥12 + vencendo por 3+ + gol antes do min 60
+    # Quando ativo: aprova diretamente, sem exigir reação do perdedor
+    massacre_ok, massacre_motivo = v29_massacre_absoluto_vencedor(m)
+    if massacre_ok:
+        return "APROVAR", f"DC01_MASSACRE_VENCEDOR_ABSOLUTO | {massacre_motivo} | {resumo}"
+
     # Perdedor gera o alerta: só aprova direto se for pressão forte/absurda E o vencedor ainda responde.
     if lado == perdedor:
         if perdedor_pressao_absurda and vencedor_vivo:
@@ -3822,6 +3984,211 @@ def dc01_chama_placar_elastico(m: "Metricas") -> Tuple[str, str]:
         return "BLOQUEAR", "DC01_CHAMA_PLACAR_ELASTICO_VENCEDOR_SATISFEITO | " + resumo
 
     return "CONFIRMAR", "DC01_CHAMA_PLACAR_ELASTICO_LADO_DIVERGENTE_MEIO_TERMO | " + resumo
+
+# =========================================================
+# V29 — FUNÇÕES DE APOIO ÀS NOVAS TRAVAS
+# =========================================================
+
+def v29_massacre_absoluto_vencedor(m: "Metricas") -> Tuple[bool, str]:
+    """Item 11 — verifica se o vencedor está em modo massacre absoluto.
+
+    Critérios: IP pico ≥ 25 + RB ≥ 10 + chance ≥ 12 + vencendo por 3+ + último gol antes do min 60.
+    Quando verdadeiro: aprova sem exigir reação do perdedor E quebra trava de liga PERIGOSA.
+    """
+    if not HABILITAR_V29_MELHORIAS:
+        return False, "V29_MELHORIAS_OFF"
+
+    vencedor = lado_vencendo(m)
+    if vencedor not in {"CASA", "FORA"}:
+        return False, "V29_SEM_VENCEDOR"
+
+    dif = diferenca_placar(m)
+    if dif < V29_MASSACRE_DIFF_MIN:
+        return False, f"V29_DIF_{dif}_ABAIXO_{V29_MASSACRE_DIFF_MIN}"
+
+    # Último gol deve ter ocorrido antes da janela de leitura (minuto 60)
+    if m.ultimo_gol and int(m.ultimo_gol) >= V29_MASSACRE_GOL_ANTES_MIN:
+        return False, f"V29_GOL_RECENTE_{m.ultimo_gol}_NAO_ANTES_MIN{V29_MASSACRE_GOL_ANTES_MIN}"
+
+    d_venc = dados_lado(m, vencedor)
+    ip_venc = ip_lado(m, vencedor)
+
+    if ip_venc["pico"] < V29_MASSACRE_IP_MIN:
+        return False, f"V29_IP_PICO_{ip_venc['pico']:.1f}_ABAIXO_{V29_MASSACRE_IP_MIN}"
+    if d_venc["rb"] < V29_MASSACRE_RB_MIN:
+        return False, f"V29_RB_{d_venc['rb']}_ABAIXO_{V29_MASSACRE_RB_MIN}"
+    if d_venc["chance"] < V29_MASSACRE_CHANCE_MIN:
+        return False, f"V29_CHANCE_{d_venc['chance']}_ABAIXO_{V29_MASSACRE_CHANCE_MIN}"
+
+    return True, (
+        f"V29_DC01_MASSACRE_VENCEDOR_ABSOLUTO | venc={vencedor} dif={dif} "
+        f"ip_pico={ip_venc['pico']:.1f} rb={d_venc['rb']} chance={d_venc['chance']} "
+        f"ultimo_gol={m.ultimo_gol}'"
+    )
+
+
+def v29_trava_conf_favorito_vencendo_gol_recente(novo: "Metricas") -> Tuple[bool, str]:
+    """Item 1 — bloqueia confirmação quando favorito vencendo + gol recente do favorito.
+
+    Favorito vencendo + gol dele nos últimos N min → exige U10 ≥ X ou RB 2ºP ≥ Y ou xG ≥ Z.
+    """
+    if not HABILITAR_V29_MELHORIAS:
+        return False, "V29_MELHORIAS_OFF"
+
+    fav = novo.lado_favorito
+    if fav not in {"CASA", "FORA"}:
+        return False, "V29_SEM_FAVORITO"
+
+    vencendo = lado_vencendo(novo)
+    if vencendo != fav:
+        return False, "V29_FAV_NAO_VENCENDO"
+
+    # Verifica se o gol recente foi do favorito
+    if novo.ultimo_gol_lado != fav:
+        return False, "V29_GOL_NAO_DO_FAVORITO"
+
+    delta = minutos_desde_ultimo_gol(novo)
+    if delta > V29_CONF_FAV_VENCENDO_GOL_RECENTE_JANELA:
+        return False, f"V29_GOL_HA_{delta}MIN_FORA_JANELA_{V29_CONF_FAV_VENCENDO_GOL_RECENTE_JANELA}"
+
+    # Gol do favorito dentro da janela — verificar se há justificativa extrema
+    d_fav = dados_lado(novo, fav)
+    xg_total = float(sum(novo.xg)) if isinstance(novo.xg, tuple) else 0.0
+
+    if d_fav["u10"] >= V29_CONF_FAV_VENCENDO_U10_MIN:
+        return False, f"V29_U10_{d_fav['u10']}_JUSTIFICA_CONF"
+    if d_fav["rb"] >= V29_CONF_FAV_VENCENDO_RB_MIN:
+        return False, f"V29_RB_{d_fav['rb']}_JUSTIFICA_CONF"
+    if xg_total >= V29_CONF_FAV_VENCENDO_XG_MIN:
+        return False, f"V29_XG_{xg_total:.2f}_JUSTIFICA_CONF"
+
+    return True, (
+        f"V29_TRAVA_CONF_FAV_VENCENDO_GOL_RECENTE | fav={fav} gol_ha={delta}min "
+        f"u10={d_fav['u10']} rb={d_fav['rb']} xg={xg_total:.2f}"
+    )
+
+
+def v29_trava_conf_placar_largo(novo: "Metricas") -> Tuple[bool, str]:
+    """Item 2 — bloqueia confirmação quando favorito está perdendo por 3+ gols."""
+    if not HABILITAR_V29_MELHORIAS:
+        return False, "V29_MELHORIAS_OFF"
+
+    fav = novo.lado_favorito
+    if fav not in {"CASA", "FORA"}:
+        return False, "V29_SEM_FAVORITO"
+
+    vencendo = lado_vencendo(novo)
+    if vencendo == fav or vencendo == "EMPATE":
+        return False, "V29_FAV_NAO_PERDENDO"
+
+    dif = diferenca_placar(novo)
+    if dif < V29_CONF_PLACAR_LARGO_MIN_DIFF:
+        return False, f"V29_DIF_{dif}_ABAIXO_{V29_CONF_PLACAR_LARGO_MIN_DIFF}"
+
+    return True, f"V29_TRAVA_CONF_PLACAR_LARGO | fav={fav} perdendo_por={dif} placar={novo.placar}"
+
+
+def v29_trava_decaimento_pressao_2p(m: "Metricas") -> Tuple[bool, str]:
+    """Item 10 — bloqueia CHAMA_FT quando favorito vencendo mas relaxou no 2ºP.
+
+    Condição: favorito vencendo + AP 2ºP favorito < AP 2ºP adversário.
+    Exige xG ≥ 1.50 E U10 ≥ 8 para passar. Sem ambos, bloqueia.
+    """
+    if not HABILITAR_V29_MELHORIAS:
+        return False, "V29_MELHORIAS_OFF"
+
+    if m.estrategia != "CHAMA_FT":
+        return False, "V29_NAO_CHAMA_FT"
+
+    fav = m.lado_favorito
+    if fav not in {"CASA", "FORA"}:
+        return False, "V29_SEM_FAVORITO"
+
+    vencendo = lado_vencendo(m)
+    if vencendo != fav:
+        return False, "V29_FAV_NAO_VENCENDO"
+
+    # Verificar decaimento: AP 2ºP do favorito < AP 2ºP do adversário
+    # Usamos ataques_perigosos totais como proxy (2ºP não está separado no dataclass)
+    # A comparação U5/U10 recentes é o sinal mais confiável de quem domina AGORA
+    adv = lado_oposto(fav)
+    d_fav = dados_lado(m, fav)
+    d_adv = dados_lado(m, adv)
+
+    # AP total: se o favorito tem menos AP total E menos pressão recente, decaiu
+    ap_fav = valor_lado(m, "ataques_perigosos", fav)
+    ap_adv = valor_lado(m, "ataques_perigosos", adv)
+
+    if ap_fav >= ap_adv:
+        return False, f"V29_FAV_AP_{ap_fav}_AINDA_DOMINA_{ap_adv}"
+
+    # Favorito com menos AP total E vencendo = possível decaimento
+    # Confirma com U5/U10 recentes
+    u5_fav = d_fav["u5"]
+    u10_fav = d_fav["u10"]
+    u5_adv = d_adv["u5"]
+    u10_adv = d_adv["u10"]
+
+    # Se favorito ainda domina os recentes, não é decaimento real
+    if u5_fav > u5_adv and u10_fav > u10_adv:
+        return False, f"V29_FAV_RECENTES_U5={u5_fav}>{u5_adv}_U10={u10_fav}>{u10_adv}_SEM_DECAIMENTO"
+
+    # Decaimento confirmado — verificar se há justificativa extrema
+    xg_total = float(sum(m.xg)) if isinstance(m.xg, tuple) else 0.0
+
+    if xg_total >= V29_DECAIMENTO_XG_MIN and u10_fav >= V29_DECAIMENTO_U10_MIN:
+        return False, f"V29_XG_{xg_total:.2f}_U10={u10_fav}_JUSTIFICA"
+
+    return True, (
+        f"V29_TRAVA_DECAIMENTO_2P | fav={fav} ap_fav={ap_fav}<ap_adv={ap_adv} "
+        f"u5={u5_fav}x{u5_adv} u10={u10_fav}x{u10_adv} xg={xg_total:.2f}"
+    )
+
+
+def v29_trava_rb_zero_liga_fraca(m: "Metricas") -> Tuple[bool, str]:
+    """Item 5 — bloqueia quando perdedor tem RB=0 em liga NEUTRA ou PERIGOSA.
+
+    Exceção: item 11 (massacre absoluto) já aprovado — não aplica.
+    Exceção: ligas MODERADA e PREMIUM — não aplica.
+    """
+    if not HABILITAR_V29_MELHORIAS:
+        return False, "V29_MELHORIAS_OFF"
+
+    if m.liga not in {"NEUTRA", "PERIGOSA"}:
+        return False, f"V29_LIGA_{m.liga}_NAO_APLICA_RB_ZERO"
+
+    # Verifica se é massacre absoluto — se sim, não bloqueia
+    massacre_ok, _ = v29_massacre_absoluto_vencedor(m)
+    if massacre_ok:
+        return False, "V29_MASSACRE_ABSOLUTO_EXCECAO_RB_ZERO"
+
+    vencendo = lado_vencendo(m)
+    if vencendo not in {"CASA", "FORA"}:
+        return False, "V29_SEM_VENCEDOR_PARA_VERIFICAR_PERDEDOR"
+
+    perdedor = lado_oposto(vencendo)
+    rb_perdedor = valor_lado(m, "remates_baliza", perdedor)
+
+    if rb_perdedor > 0:
+        return False, f"V29_PERDEDOR_RB={rb_perdedor}_OK"
+
+    return True, f"V29_TRAVA_RB_ZERO_PERDEDOR | liga={m.liga} perdedor={perdedor} rb=0"
+
+
+def v29_cooldown_universal_aprovado(chave_jogo: str) -> bool:
+    """Item 9 — verifica se o jogo já foi aprovado e enviado hoje por qualquer bot."""
+    if not HABILITAR_V29_MELHORIAS:
+        return False
+    ts = v29_aprovados_por_jogo.get(chave_jogo, 0)
+    if not ts:
+        return False
+    # Cooldown de 24h — mesmo jogo não reentra no dia
+    return time.time() - ts < 86400
+
+
+def v29_marcar_aprovado_universal(chave_jogo: str) -> None:
+    """Item 9 — registra que o jogo foi aprovado para cooldown universal."""
+    v29_aprovados_por_jogo[chave_jogo] = time.time()
 
 # =========================================================
 # SNIPER V2 — LEITURA SEPARADA FT
@@ -4902,6 +5269,45 @@ async def processar_alerta(alerta: Alerta) -> None:
         await registrar_bloqueio_fluxo(m, motivo, score=0)
         return
 
+    # V29 Item 9 — cooldown universal: jogo já aprovado hoje não reentra
+    chave_jogo_base = normalizar_chave_jogo(m.jogo)
+    if v29_cooldown_universal_aprovado(chave_jogo_base) and not eh_confirmacao(m.estrategia):
+        m.fluxo_decisao = "V29_COOLDOWN_UNIVERSAL"
+        m.fluxo_motivo = f"JOGO_JA_APROVADO_HOJE | {m.jogo}"
+        log(f"⏳ V29 COOLDOWN_UNIVERSAL | {m.jogo} | já foi aprovado hoje")
+        await registrar_bloqueio_fluxo(m, f"V29_COOLDOWN_UNIVERSAL | {m.fluxo_motivo}", score=0)
+        return
+
+    # V29 Item 5 — trava RB=0 do perdedor em liga NEUTRA/PERIGOSA
+    if eh_ft(m.estrategia) and not eh_confirmacao(m.estrategia):
+        bloqueio_rb, motivo_rb = v29_trava_rb_zero_liga_fraca(m)
+        if bloqueio_rb:
+            m.fluxo_decisao = "V29_TRAVA_RB_ZERO_LIGA_FRACA"
+            m.fluxo_motivo = motivo_rb
+            log(f"⛔ V29 RB_ZERO_LIGA_FRACA | {m.jogo} | {motivo_rb}")
+            await registrar_bloqueio_fluxo(m, f"V29_TRAVA_RB_ZERO_LIGA_FRACA | {motivo_rb}", score=0)
+            return
+
+    # V29 Item 10 — trava decaimento de pressão no 2ºP (CHAMA_FT)
+    if m.estrategia == "CHAMA_FT":
+        bloqueio_dec, motivo_dec = v29_trava_decaimento_pressao_2p(m)
+        if bloqueio_dec:
+            m.fluxo_decisao = "V29_TRAVA_DECAIMENTO_PRESSAO_2P"
+            m.fluxo_motivo = motivo_dec
+            log(f"⛔ V29 DECAIMENTO_PRESSAO_2P | {m.jogo} | {motivo_dec}")
+            await registrar_bloqueio_fluxo(m, f"V29_TRAVA_DECAIMENTO_PRESSAO_2P | {motivo_dec}", score=0)
+            return
+
+    # V29 Item 11 — exceção massacre absoluto: quebra trava de liga PERIGOSA
+    # Quando o vencedor tem números extremos, permite seguir mesmo em liga PERIGOSA
+    _v29_massacre_ativo = False
+    if HABILITAR_V29_MELHORIAS and m.liga == "PERIGOSA":
+        massacre_ok_pre, massacre_motivo_pre = v29_massacre_absoluto_vencedor(m)
+        if massacre_ok_pre:
+            _v29_massacre_ativo = True
+            m.fluxo_motivo = (m.fluxo_motivo or "") + f" | V29_MASSACRE_EXCECAO_PERIGOSA"
+            log(f"✅ V29 MASSACRE_ABSOLUTO_EXCECAO_PERIGOSA | {m.jogo} | {massacre_motivo_pre}")
+
     # V27/V28 — HT_MODERADO: taxa 53% — bloqueio total no V28.
     # V27 modo observacao preservado via flag; V28 bloqueia completamente.
     if contem_ht_moderado_bruto(m.texto_bruto):
@@ -5193,6 +5599,9 @@ async def processar_alerta(alerta: Alerta) -> None:
 
     m.destino_final = ",".join(destinos)
     marcar_enviado(chave, m, score_medio)
+    # V29 Item 9 — registra aprovação para cooldown universal
+    if HABILITAR_V29_MELHORIAS:
+        v29_marcar_aprovado_universal(normalizar_chave_jogo(m.jogo))
     log(
         f"✅ ENVIADO/ENFILEIRADO V11 | {m.estrategia} | score={score_medio}% | "
         f"destinos={m.destino_final} | gratis={m.grupo_gratuito}:{m.motivo_grupo_gratuito} | "
