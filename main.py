@@ -3918,7 +3918,8 @@ def dc01_chama_placar_elastico(m: "Metricas") -> Tuple[str, str]:
     # Vencedor vivo: sinais mínimos de contra-ataque/resposta nos últimos 10.
     vencedor_vivo = (
         d_venc["u5"] >= 1
-        or d_venc["u10"] >= 3        or d_venc["rb"] >= 1
+        or d_venc["u10"] >= 3
+        or d_venc["rb"] >= 1
         or d_venc["rl"] >= 2
         or d_venc["chance"] >= 5
         or d_venc["xg"] >= 0.20
@@ -5785,7 +5786,7 @@ async def main() -> None:
         import httpx
         from bs4 import BeautifulSoup
         
-        url_lista = "https://clube.theoborges.com/matches?dia=hoje"
+        url_lista = "https://clube.theoborges.com/matches?dia=amanha"
         headers = {"User-Agent": "Mozilla/5.0"}
         
         async with httpx.AsyncClient(follow_redirects=True) as client_http:
