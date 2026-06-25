@@ -3918,8 +3918,7 @@ def dc01_chama_placar_elastico(m: "Metricas") -> Tuple[str, str]:
     # Vencedor vivo: sinais mínimos de contra-ataque/resposta nos últimos 10.
     vencedor_vivo = (
         d_venc["u5"] >= 1
-        or d_venc["u10"] >= 3
-        or d_venc["rb"] >= 1
+        or d_venc["u10"] >= 3        or d_venc["rb"] >= 1
         or d_venc["rl"] >= 2
         or d_venc["chance"] >= 5
         or d_venc["xg"] >= 0.20
@@ -5762,6 +5761,134 @@ async def main() -> None:
                 await receber_mensagem(event)
         except Exception as e:
             log(f"⚠️ V24 handler_outgoing erro | {type(e).__name__}: {e}")
+
+    # =========================================================
+    # COMANDO /teste — VARREDURA MANUAL DO SITE THEOBORGES
+    # =========================================================
+    @client.on(events.NewMessage(incoming=True))
+    async def handler_teste(event):
+        texto = event.raw_text or ""
+        if texto.strip().lower() == "/teste":
+            log("📩 /teste RECEBIDO (INCOMING)")
+            await varrer_site_theoborges()
+
+    @client.on(events.NewMessage(from_users='me'))
+    async def handler_teste_me(event):
+        texto = event.raw_text or ""
+        if texto.strip().lower() == "/teste":
+            log("📩 /teste RECEBIDO (CHAT PRIVADO)")
+            await varrer_site_theoborges()
+
+    async def varrer_site_theoborges():
+        log("🚀 INICIANDO VARREdura DO SITE THEOBORGES (COMANDO MANUAL)")
+        
+        import httpx
+        from bs4 import BeautifulSoup
+        
+        url_lista = "https://clube.theoborges.com/matches?dia=hoje"
+        headers = {"User-Agent": "Mozilla/5.0"}
+        
+        async with httpx.AsyncClient(follow_redirects=True) as client_http:
+            try:
+                response = await client_http.get(url_lista, headers=headers, timeout=15)
+                if response.status_code != 200:
+                    log(f"❌ Erro ao acessar lista de jogos: {response.status_code}")
+                    await client.send_message("me", "❌ Erro ao acessar o site. Código: " + str(response.status_code))
+                    return
+            except Exception as e:
+                log(f"❌ Erro na requisição: {e}")
+                await client.send_message("me", "❌ Erro de conexão com o site.")
+                return
+
+        soup = BeautifulSoup(response.text, "html.parser")
+        
+        links_jogos = []
+        for link in soup.select("a.match-row"):
+            href = link.get("href")
+            if href and "/game/" in href:
+                url_completa = f"https://clube.theoborges.com{href}"
+                if url_completa not in links_jogos:
+                    links_jogos.append(url_completa)
+
+        if not links_jogos:
+            log("❌ Nenhum link de jogo encontrado.")
+            await client.send_message("me", "❌ Nenhum jogo encontrado na página.")
+            return
+
+        log(f"📊 Encontrados {len(links_jogos)} jogos para analisar.")
+        jogos_filtrados = []
+
+        for url in links_jogos[:20]:
+            try:
+                response = await client_http.get(url, headers=headers, timeout=15)
+                if response.status_code != 200:
+                    continue
+                soup_jogo = BeautifulSoup(response.text, "html.parser")
+                
+                titulo = soup_jogo.select_one(".match-name")
+                nome_jogo = titulo.text.strip() if titulo else "Jogo não identificado"
+
+                media_gols = 0.0
+                media_gols_element = soup_jogo.select_one(".pg-tstable-row .pgcv:contains('Média total de Gols')")
+                if media_gols_element:
+                    try:
+                        media_gols = float(media_gols_element.text.strip().replace(',', '.'))
+                    except:
+                        pass
+
+                over25 = 0
+                over25_element = soup_jogo.select_one(".pg-tstable-row:contains('Over 2.5 Gols') .pg-tstable-value-home")
+                if over25_element:
+                    try:
+                        over25 = int(over25_element.text.strip().replace('%', ''))
+                    except:
+                        pass
+
+                if media_gols >= 2.5 or over25 >= 60:
+                    jogos_filtrados.append({
+                        "nome": nome_jogo,
+                        "media_gols": media_gols,
+                        "over25": over25
+                    })
+                
+                await asyncio.sleep(1)
+            except Exception as e:
+                log(f"⚠️ Erro processando: {e}")
+                continue
+
+        if not jogos_filtrados:
+            await client.send_message("me", "❌ Nenhum jogo passou no filtro hoje.")
+            return
+
+        jogos_filtrados.sort(key=lambda x: x["media_gols"], reverse=True)
+        total = len(jogos_filtrados)
+
+        if total >= 8:
+            top, anc, comp = jogos_filtrados[:8], 4, 4
+        elif total == 7:
+            top, anc, comp = jogos_filtrados[:7], 3, 4
+        elif total == 6:
+            top, anc, comp = jogos_filtrados[:6], 3, 3
+        elif total == 5:
+            top, anc, comp = jogos_filtrados[:5], 2, 3
+        else:
+            top, anc, comp = jogos_filtrados[:total], 2, total - 2
+
+        mensagem = f"📢 **MÚLTIPLA DE TESTE ({total} JOGOS)** 📢\n\n"
+        mensagem += f"**ÂNCORAS ({anc}):**\n"
+        for i in range(anc):
+            j = top[i]
+            mercado = "Over 2.5" if j["over25"] >= 65 else "Over 1.5" if j["media_gols"] >= 2.5 else "Escanteios"
+            mensagem += f"{i+1}. {j['nome']} -> **{mercado}**\n"
+
+        mensagem += f"\n**COMPLEMENTOS ({comp}):**\n"
+        for i in range(anc, anc + comp):
+            j = top[i]
+            mercado = "Over 2.5" if j["over25"] >= 65 else "Over 1.5" if j["media_gols"] >= 2.5 else "Escanteios"
+            mensagem += f"{i+1}. {j['nome']} -> **{mercado}**\n"
+
+        await client.send_message("me", mensagem)
+        log("✅ Múltipla enviada.")
 
     # V24 — captura posts de canal via handler incoming geral.
     # auditoria_autorizada() filtra por ID — só o dono recebe os HTMLs.
