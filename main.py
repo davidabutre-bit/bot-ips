@@ -5786,110 +5786,117 @@ async def main() -> None:
         import httpx
         from bs4 import BeautifulSoup
         
-        url_lista = "https://clube.theoborges.com/matches?dia=amanha"
-        headers = {"User-Agent": "Mozilla/5.0"}
+        # Tenta buscar "hoje" primeiro. Se não achar, tenta "amanha".
+        dias_para_tentar = ["hoje", "amanha"]
+        encontrou_jogos = False
         
-        async with httpx.AsyncClient(follow_redirects=True) as client_http:
-            try:
-                response = await client_http.get(url_lista, headers=headers, timeout=15)
-                if response.status_code != 200:
-                    log(f"❌ Erro ao acessar lista de jogos: {response.status_code}")
-                    await client.send_message("me", "❌ Erro ao acessar o site. Código: " + str(response.status_code))
-                    return
-            except Exception as e:
-                log(f"❌ Erro na requisição: {e}")
-                await client.send_message("me", "❌ Erro de conexão com o site.")
-                return
-
-        soup = BeautifulSoup(response.text, "html.parser")
-        
-        links_jogos = []
-        for link in soup.select("a.match-row"):
-            href = link.get("href")
-            if href and "/game/" in href:
-                url_completa = f"https://clube.theoborges.com{href}"
-                if url_completa not in links_jogos:
-                    links_jogos.append(url_completa)
-
-        if not links_jogos:
-            log("❌ Nenhum link de jogo encontrado.")
-            await client.send_message("me", "❌ Nenhum jogo encontrado na página.")
-            return
-
-        log(f"📊 Encontrados {len(links_jogos)} jogos para analisar.")
-        jogos_filtrados = []
-
-        for url in links_jogos[:20]:
-            try:
-                response = await client_http.get(url, headers=headers, timeout=15)
-                if response.status_code != 200:
+        for dia in dias_para_tentar:
+            url_lista = f"https://clube.theoborges.com/matches?dia={dia}"
+            headers = {"User-Agent": "Mozilla/5.0"}
+            
+            log(f"🔄 Tentando buscar jogos para: {dia}")
+            
+            async with httpx.AsyncClient(follow_redirects=True) as client_http:
+                try:
+                    response = await client_http.get(url_lista, headers=headers, timeout=15)
+                    if response.status_code != 200:
+                        log(f"⚠️ Erro ao acessar lista de jogos ({dia}): {response.status_code}")
+                        continue
+                except Exception as e:
+                    log(f"❌ Erro na requisição para {dia}: {e}")
                     continue
-                soup_jogo = BeautifulSoup(response.text, "html.parser")
-                
-                titulo = soup_jogo.select_one(".match-name")
-                nome_jogo = titulo.text.strip() if titulo else "Jogo não identificado"
 
-                media_gols = 0.0
-                media_gols_element = soup_jogo.select_one(".pg-tstable-row .pgcv:contains('Média total de Gols')")
-                if media_gols_element:
-                    try:
-                        media_gols = float(media_gols_element.text.strip().replace(',', '.'))
-                    except:
-                        pass
+            soup = BeautifulSoup(response.text, "html.parser")
+            
+            links_jogos = []
+            for link in soup.select("a.match-row"):
+                href = link.get("href")
+                if href and "/game/" in href:
+                    url_completa = f"https://clube.theoborges.com{href}"
+                    if url_completa not in links_jogos:
+                        links_jogos.append(url_completa)
 
-                over25 = 0
-                over25_element = soup_jogo.select_one(".pg-tstable-row:contains('Over 2.5 Gols') .pg-tstable-value-home")
-                if over25_element:
-                    try:
-                        over25 = int(over25_element.text.strip().replace('%', ''))
-                    except:
-                        pass
+            if not links_jogos:
+                log(f"ℹ️ Nenhum link de jogo encontrado para {dia}.")
+                continue  # Tenta o próximo dia
 
-                if media_gols >= 2.5 or over25 >= 60:
-                    jogos_filtrados.append({
-                        "nome": nome_jogo,
-                        "media_gols": media_gols,
-                        "over25": over25
-                    })
-                
-                await asyncio.sleep(1)
-            except Exception as e:
-                log(f"⚠️ Erro processando: {e}")
-                continue
+            log(f"📊 Encontrados {len(links_jogos)} jogos para analisar em {dia}.")
+            jogos_filtrados = []
 
-        if not jogos_filtrados:
-            await client.send_message("me", "❌ Nenhum jogo passou no filtro hoje.")
-            return
+            for url in links_jogos[:20]:
+                try:
+                    response = await client_http.get(url, headers=headers, timeout=15)
+                    if response.status_code != 200:
+                        continue
+                    soup_jogo = BeautifulSoup(response.text, "html.parser")
+                    
+                    titulo = soup_jogo.select_one(".match-name")
+                    nome_jogo = titulo.text.strip() if titulo else "Jogo não identificado"
 
-        jogos_filtrados.sort(key=lambda x: x["media_gols"], reverse=True)
-        total = len(jogos_filtrados)
+                    media_gols = 0.0
+                    media_gols_element = soup_jogo.select_one(".pg-tstable-row .pgcv:contains('Média total de Gols')")
+                    if media_gols_element:
+                        try:
+                            media_gols = float(media_gols_element.text.strip().replace(',', '.'))
+                        except:
+                            pass
 
-        if total >= 8:
-            top, anc, comp = jogos_filtrados[:8], 4, 4
-        elif total == 7:
-            top, anc, comp = jogos_filtrados[:7], 3, 4
-        elif total == 6:
-            top, anc, comp = jogos_filtrados[:6], 3, 3
-        elif total == 5:
-            top, anc, comp = jogos_filtrados[:5], 2, 3
-        else:
-            top, anc, comp = jogos_filtrados[:total], 2, total - 2
+                    over25 = 0
+                    over25_element = soup_jogo.select_one(".pg-tstable-row:contains('Over 2.5 Gols') .pg-tstable-value-home")
+                    if over25_element:
+                        try:
+                            over25 = int(over25_element.text.strip().replace('%', ''))
+                        except:
+                            pass
 
-        mensagem = f"📢 **MÚLTIPLA DE TESTE ({total} JOGOS)** 📢\n\n"
-        mensagem += f"**ÂNCORAS ({anc}):**\n"
-        for i in range(anc):
-            j = top[i]
-            mercado = "Over 2.5" if j["over25"] >= 65 else "Over 1.5" if j["media_gols"] >= 2.5 else "Escanteios"
-            mensagem += f"{i+1}. {j['nome']} -> **{mercado}**\n"
+                    if media_gols >= 2.5 or over25 >= 60:
+                        jogos_filtrados.append({
+                            "nome": nome_jogo,
+                            "media_gols": media_gols,
+                            "over25": over25
+                        })
+                    
+                    await asyncio.sleep(1)
+                except Exception as e:
+                    log(f"⚠️ Erro processando: {e}")
+                    continue
 
-        mensagem += f"\n**COMPLEMENTOS ({comp}):**\n"
-        for i in range(anc, anc + comp):
-            j = top[i]
-            mercado = "Over 2.5" if j["over25"] >= 65 else "Over 1.5" if j["media_gols"] >= 2.5 else "Escanteios"
-            mensagem += f"{i+1}. {j['nome']} -> **{mercado}**\n"
+            if jogos_filtrados:
+                encontrou_jogos = True
+                jogos_filtrados.sort(key=lambda x: x["media_gols"], reverse=True)
+                total = len(jogos_filtrados)
 
-        await client.send_message("me", mensagem)
-        log("✅ Múltipla enviada.")
+                if total >= 8:
+                    top, anc, comp = jogos_filtrados[:8], 4, 4
+                elif total == 7:
+                    top, anc, comp = jogos_filtrados[:7], 3, 4
+                elif total == 6:
+                    top, anc, comp = jogos_filtrados[:6], 3, 3
+                elif total == 5:
+                    top, anc, comp = jogos_filtrados[:5], 2, 3
+                else:
+                    top, anc, comp = jogos_filtrados[:total], 2, total - 2
+
+                mensagem = f"📢 **MÚLTIPLA DE TESTE ({total} JOGOS) — {dia.upper()}** 📢\n\n"
+                mensagem += f"**ÂNCORAS ({anc}):**\n"
+                for i in range(anc):
+                    j = top[i]
+                    mercado = "Over 2.5" if j["over25"] >= 65 else "Over 1.5" if j["media_gols"] >= 2.5 else "Escanteios"
+                    mensagem += f"{i+1}. {j['nome']} -> **{mercado}**\n"
+
+                mensagem += f"\n**COMPLEMENTOS ({comp}):**\n"
+                for i in range(anc, anc + comp):
+                    j = top[i]
+                    mercado = "Over 2.5" if j["over25"] >= 65 else "Over 1.5" if j["media_gols"] >= 2.5 else "Escanteios"
+                    mensagem += f"{i+1}. {j['nome']} -> **{mercado}**\n"
+
+                await client.send_message("me", mensagem)
+                log(f"✅ Múltipla enviada com base em {dia}.")
+                break  # Para o loop, pois encontrou jogos
+
+        if not encontrou_jogos:
+            await client.send_message("me", "❌ Nenhum jogo encontrado para hoje ou amanhã.")
+            log("❌ Nenhum jogo encontrado para hoje ou amanhã.")
 
     # V24 — captura posts de canal via handler incoming geral.
     # auditoria_autorizada() filtra por ID — só o dono recebe os HTMLs.
