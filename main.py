@@ -5763,6 +5763,155 @@ async def main() -> None:
         except Exception as e:
             log(f"⚠️ V24 handler_outgoing erro | {type(e).__name__}: {e}")
 
+    # =========================================================
+    # COMANDO /teste — VARREDURA MANUAL DO SITE THEOBORGES
+    # =========================================================
+    import httpx
+    from bs4 import BeautifulSoup
+
+    async def varrer_site_theoborges():
+        log("🚀 INICIANDO VARREdura DO SITE THEOBORGES (COMANDO MANUAL)")
+        
+        url_lista = "https://clube.theoborges.com/matches?dia=hoje"
+        headers = {"User-Agent": "Mozilla/5.0"}
+        
+        async with httpx.AsyncClient() as client_http:
+            try:
+                response = await client_http.get(url_lista, headers=headers, timeout=15)
+                if response.status_code != 200:
+                    log(f"❌ Erro ao acessar lista de jogos: {response.status_code}")
+                    return
+            except Exception as e:
+                log(f"❌ Erro na requisição da lista: {e}")
+                return
+
+        soup = BeautifulSoup(response.text, "html.parser")
+        
+        links_jogos = []
+        for link in soup.select("a.match-row"):
+            href = link.get("href")
+            if href and "/game/" in href:
+                url_completa = f"https://clube.theoborges.com{href}"
+                if url_completa not in links_jogos:
+                    links_jogos.append(url_completa)
+
+        log(f"📊 Encontrados {len(links_jogos)} jogos para analisar.")
+
+        jogos_filtrados = []
+
+        for url in links_jogos[:20]:
+            try:
+                response = await client_http.get(url, headers=headers, timeout=15)
+                if response.status_code != 200:
+                    continue
+                soup_jogo = BeautifulSoup(response.text, "html.parser")
+                
+                titulo = soup_jogo.select_one(".match-name")
+                nome_jogo = titulo.text.strip() if titulo else "Jogo não identificado"
+
+                # Média de Gols
+                media_gols = 0.0
+                media_gols_element = soup_jogo.select_one(".pg-tstable-row .pgcv:contains('Média total de Gols')")
+                if media_gols_element:
+                    try:
+                        media_gols = float(media_gols_element.text.strip().replace(',', '.'))
+                    except: pass
+
+                # Over 2.5
+                over25 = 0
+                over25_element = soup_jogo.select_one(".pg-tstable-row:contains('Over 2.5 Gols') .pg-tstable-value-home")
+                if over25_element:
+                    try:
+                        over25 = int(over25_element.text.strip().replace('%', ''))
+                    except: pass
+
+                # Escanteios
+                media_escanteios = 0.0
+                escanteios_element = soup_jogo.select_one(".pg-tstable-row:contains('Média total de escanteios') .pgcv")
+                if escanteios_element:
+                    try:
+                        media_escanteios = float(escanteios_element.text.strip().replace(',', '.'))
+                    except: pass
+
+                # FILTRO DURO (Jogos com média >= 2.5 OU Over 2.5 >= 60%)
+                if media_gols >= 2.5 or over25 >= 60:
+                    jogos_filtrados.append({
+                        "nome": nome_jogo,
+                        "media_gols": media_gols,
+                        "over25": over25,
+                        "media_escanteios": media_escanteios
+                    })
+                
+                await asyncio.sleep(1)
+                
+            except Exception as e:
+                log(f"⚠️ Erro ao processar jogo: {e}")
+                continue
+
+        if not jogos_filtrados:
+            log("❌ Nenhum jogo passou no filtro.")
+            await client.send_message("me", "❌ Nenhum jogo passou no filtro para o teste de hoje.")
+            return
+
+        # Ordenar por média de gols
+        jogos_filtrados.sort(key=lambda x: x["media_gols"], reverse=True)
+        total = len(jogos_filtrados)
+
+        # Lógica de redução progressiva
+        if total >= 8:
+            top = jogos_filtrados[:8]
+            anc = 4
+            comp = 4
+        elif total == 7:
+            top = jogos_filtrados[:7]
+            anc = 3
+            comp = 4
+        elif total == 6:
+            top = jogos_filtrados[:6]
+            anc = 3
+            comp = 3
+        elif total == 5:
+            top = jogos_filtrados[:5]
+            anc = 2
+            comp = 3
+        else:
+            top = jogos_filtrados[:total]
+            anc = 2
+            comp = total - 2
+
+        mensagem = f"📢 **MÚLTIPLA DE TESTE ({total} JOGOS)** 📢\n\n"
+        mensagem += f"**ÂNCORAS ({anc}):**\n"
+        for i in range(anc):
+            j = top[i]
+            mercado = "Over 2.5" if j["over25"] >= 65 else "Over 1.5" if j["media_gols"] >= 2.5 else "Escanteios"
+            mensagem += f"{i+1}. {j['nome']} -> **{mercado}**\n"
+
+        mensagem += f"\n**COMPLEMENTOS ({comp}):**\n"
+        for i in range(anc, anc + comp):
+            j = top[i]
+            mercado = "Over 2.5" if j["over25"] >= 65 else "Over 1.5" if j["media_gols"] >= 2.5 else "Escanteios"
+            mensagem += f"{i+1}. {j['nome']} -> **{mercado}**\n"
+
+        log("✅ Múltipla montada. Enviando para o chat privado.")
+        await client.send_message("me", mensagem)
+        log("📤 Mensagem enviada com sucesso.")
+
+    # Handler para o comando /teste em mensagens incoming (canais/grupos)
+    @client.on(events.NewMessage(incoming=True))
+    async def handler_teste(event):
+        texto = event.raw_text or ""
+        if texto.strip().lower() == "/teste":
+            log("📩 COMANDO /teste RECEBIDO (INCOMING)")
+            await varrer_site_theoborges()
+
+    # Handler específico para o chat privado ("Saved Messages")
+    @client.on(events.NewMessage(from_users='me'))
+    async def handler_me(event):
+        texto = event.raw_text or ""
+        if texto.strip().lower() == "/teste":
+            log("📩 COMANDO /teste RECEBIDO (CHAT PRIVADO)")
+            await varrer_site_theoborges()
+
     # V24 — captura posts de canal via handler incoming geral.
     # auditoria_autorizada() filtra por ID — só o dono recebe os HTMLs.
     # O handler incoming já existia; o filtro por texto e ID é feito dentro de receber_mensagem.
@@ -5776,101 +5925,7 @@ async def main() -> None:
     log(f"📡 Canais ativos: principal={TARGET_CHANNEL} | confirmação={CONFIRMATION_CHANNEL}")
     await client.run_until_disconnected()
 
-# =========================================================
-# COMANDO /teste — VARREDURA MANUAL DO SITE THEOBORGES
-# =========================================================
-import httpx
-from bs4 import BeautifulSoup
 
-async def varrer_site_theoborges():
-    log("🚀 INICIANDO VARREdura DO SITE THEOBORGES")
-    url_lista = "https://clube.theoborges.com/matches?dia=hoje"
-    headers = {"User-Agent": "Mozilla/5.0"}
-    async with httpx.AsyncClient() as client:
-        try:
-            response = await client.get(url_lista, headers=headers, timeout=15)
-            if response.status_code != 200:
-                log(f"❌ Erro ao acessar lista: {response.status_code}")
-                return
-        except Exception as e:
-            log(f"❌ Erro na requisição: {e}")
-            return
-
-    soup = BeautifulSoup(response.text, "html.parser")
-    links_jogos = []
-    for link in soup.select("a.match-row"):
-        href = link.get("href")
-        if href and "/game/" in href:
-            links_jogos.append(f"https://clube.theoborges.com{href}")
-
-    log(f"📊 Encontrados {len(links_jogos)} jogos.")
-    jogos_filtrados = []
-
-    for url in links_jogos[:20]:
-        try:
-            response = await client.get(url, headers=headers, timeout=15)
-            if response.status_code != 200: continue
-            soup_jogo = BeautifulSoup(response.text, "html.parser")
-            titulo = soup_jogo.select_one(".match-name")
-            nome_jogo = titulo.text.strip() if titulo else "Jogo não identificado"
-
-            media_gols = 0.0
-            mg = soup_jogo.select_one(".pg-tstable-row .pgcv:contains('Média total de Gols')")
-            if mg:
-                try: media_gols = float(mg.text.strip().replace(',', '.'))
-                except: pass
-
-            over25 = 0
-            ov = soup_jogo.select_one(".pg-tstable-row:contains('Over 2.5 Gols') .pg-tstable-value-home")
-            if ov:
-                try: over25 = int(ov.text.strip().replace('%', ''))
-                except: pass
-
-            media_escanteios = 0.0
-            esc = soup_jogo.select_one(".pg-tstable-row:contains('Média total de escanteios') .pgcv")
-            if esc:
-                try: media_escanteios = float(esc.text.strip().replace(',', '.'))
-                except: pass
-
-            if media_gols >= 2.5 or over25 >= 60:
-                jogos_filtrados.append({"nome": nome_jogo, "media_gols": media_gols, "over25": over25, "media_escanteios": media_escanteios})
-            await asyncio.sleep(1)
-        except Exception as e:
-            log(f"⚠️ Erro ao processar: {e}")
-
-    if not jogos_filtrados:
-        await client.send_message("me", "❌ Nenhum jogo passou no filtro hoje.")
-        return
-
-    jogos_filtrados.sort(key=lambda x: x["media_gols"], reverse=True)
-    total = len(jogos_filtrados)
-
-    if total >= 8: top, anc, comp = jogos_filtrados[:8], 4, 4
-    elif total == 7: top, anc, comp = jogos_filtrados[:7], 3, 4
-    elif total == 6: top, anc, comp = jogos_filtrados[:6], 3, 3
-    elif total == 5: top, anc, comp = jogos_filtrados[:5], 2, 3
-    else: top, anc, comp = jogos_filtrados[:total], 2, total - 2
-
-    mensagem = f"📢 MÚLTIPLA DE TESTE ({total} JOGOS)\n\nÂNCORAS ({anc}):\n"
-    for i in range(anc):
-        j = top[i]
-        mercado = "Over 2.5" if j["over25"] >= 65 else "Over 1.5" if j["media_gols"] >= 2.5 else "Escanteios"
-        mensagem += f"{i+1}. {j['nome']} -> {mercado}\n"
-
-    mensagem += f"\nCOMPLEMENTOS ({comp}):\n"
-    for i in range(anc, anc + comp):
-        j = top[i]
-        mercado = "Over 2.5" if j["over25"] >= 65 else "Over 1.5" if j["media_gols"] >= 2.5 else "Escanteios"
-        mensagem += f"{i+1}. {j['nome']} -> {mercado}\n"
-
-    await client.send_message("me", mensagem)
-    log("✅ Múltipla enviada para o chat privado.")
-
-@client.on(events.NewMessage(incoming=True))
-async def handler_teste(event):
-    if (event.raw_text or "").strip().lower() == "/teste":
-        log("📩 /teste RECEBIDO")
-        await varrer_site_theoborges()
 if __name__ == "__main__":
     try:
         asyncio.run(main())
