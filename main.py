@@ -44,6 +44,9 @@ MUDANÇAS IMPLEMENTADAS (VERSÃO ATUALIZADA):
 20. Limite de 500 registros nos JSON do V13
 21. Cache com classe robusta
 22-25. Refatorações organizacionais (processar_alerta dividida, etc.)
+26. Scraper Pré-Live corrigido com navegação por abas
+27. Extração de dados de todas as abas do site
+28. Sistema de seleção de melhores mercados por partida
 ================================================================================
 """
 
@@ -5251,7 +5254,7 @@ async def watchdog() -> None:
 
 
 # =========================================================
-# SISTEMA PRÉ-LIVE
+# SISTEMA PRÉ-LIVE COMPLETO COM NAVEGAÇÃO POR ABAS
 # =========================================================
 
 TEOLOGIN_EMAIL = os.getenv("TEOLOGIN_EMAIL", "")
@@ -5287,6 +5290,25 @@ class EstatisticasTimePreLive:
     posicao: int = 0
     league_reliability: float = 80.0
     team_reliability: float = 80.0
+    # Dados por período
+    gols_ht_casa: float = 0.0
+    gols_ht_fora: float = 0.0
+    sofre_ht_casa: float = 0.0
+    sofre_ht_fora: float = 0.0
+    over_05_ht_casa: float = 0.0
+    over_05_ht_fora: float = 0.0
+    over_15_ft_casa: float = 0.0
+    over_15_ft_fora: float = 0.0
+    over_25_ft_casa: float = 0.0
+    over_25_ft_fora: float = 0.0
+    btts_casa: float = 0.0
+    btts_fora: float = 0.0
+    escanteios_favor_casa: float = 0.0
+    escanteios_favor_fora: float = 0.0
+    escanteios_contra_casa: float = 0.0
+    escanteios_contra_fora: float = 0.0
+    vitorias_casa: float = 0.0
+    vitorias_fora: float = 0.0
 
 
 @dataclass
@@ -5300,6 +5322,7 @@ class JogoPreLive:
     estatisticas_fora: EstatisticasTimePreLive = field(default_factory=EstatisticasTimePreLive)
     odds: Dict[str, Any] = field(default_factory=dict)
     url: str = ""
+    dados_raw: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -5314,6 +5337,10 @@ class MercadoPreLive:
     league_score: float = 0.0
     team_score: float = 0.0
     detalhes: Dict[str, Any] = field(default_factory=dict)
+    mercado_original: str = ""
+    valor_casa: float = 0.0
+    valor_fora: float = 0.0
+    media: float = 0.0
 
 
 @dataclass
@@ -5325,7 +5352,7 @@ class MultiplePreLive:
 
 
 # =========================================================
-# SCRAPER PRÉ-LIVE CORRIGIDO (MUDANÇAS 4, 5, 6)
+# SCRAPER PRÉ-LIVE COM NAVEGAÇÃO POR ABAS (MUDANÇA 26-28)
 # =========================================================
 
 class TeoBorgesScraperPreLive:
@@ -5404,14 +5431,12 @@ class TeoBorgesScraperPreLive:
             log(f"❌ Erro no login: {type(e).__name__}: {e}")
             return False
 
-    # MUDANÇA 4: buscar_jogos com múltiplas URLs e timeout maior
     async def buscar_jogos(self, dia: str = "hoje") -> List[str]:
         if not self.logado:
             log("❌ Não está logado!")
             return []
 
         try:
-            # Tentar múltiplos formatos de URL para resiliência
             urls_tentar = [
                 f"https://clube.theoborges.com/matches?dia={dia}",
                 f"https://clube.theoborges.com/matches?date={dia}",
@@ -5426,12 +5451,10 @@ class TeoBorgesScraperPreLive:
                     if resp.status_code == 200:
                         soup = BeautifulSoup(resp.text, "html.parser")
                         
-                        # Múltiplos seletores
                         for selector in [".match-row", ".match-item", "a[href*='/game/']", ".game-link"]:
                             for link in soup.select(selector):
                                 href = link.get("href")
                                 if href and "/game/" in href:
-                                    # Garantir URL completo
                                     if href.startswith("http"):
                                         full_url = href
                                     elif href.startswith("//"):
@@ -5448,7 +5471,7 @@ class TeoBorgesScraperPreLive:
                     log(f"⚠️ Erro ao tentar {url}: {e}")
                     continue
                 
-                await asyncio.sleep(2)  # Delay entre tentativas
+                await asyncio.sleep(2)
 
             log(f"📊 Total de {len(links)} links de jogos para {dia}")
             return links
@@ -5457,93 +5480,103 @@ class TeoBorgesScraperPreLive:
             log(f"❌ Erro ao buscar jogos: {type(e).__name__}: {e}")
             return []
 
-    # MUDANÇA 5: extrair_dados_jogo com retry e timeout maior
     async def extrair_dados_jogo(self, url: str) -> Optional[Dict]:
-        # Delay maior para não sobrecarregar o site
+        """Extrai dados de todas as abas do jogo (Mudança 26)."""
         await asyncio.sleep(random.uniform(2.0, 4.0))
         
-        # Tentar até 3 vezes
+        # Abas disponíveis no site
+        abas = [
+            {"id": "overview", "hash": ""},
+            {"id": "gols", "hash": "#gols"},
+            {"id": "cantos", "hash": "#cantos"},
+            {"id": "cartoes", "hash": "#cartoes"},
+            {"id": "h2h", "hash": "#h2h"},
+            {"id": "desempenho", "hash": "#desempenho"},
+            {"id": "players", "hash": "#players"},
+            {"id": "tabela", "hash": "#tabela"},
+        ]
+        
+        dados_completos = {
+            "time_casa": "",
+            "time_fora": "",
+            "liga": "",
+            "url": url,
+            "estatisticas": {"casa": {}, "fora": {}},
+            "odds": {},
+            "aba": {}
+        }
+
         for tentativa in range(1, 4):
             try:
                 log(f"🔄 Extraindo dados: {url} (tentativa {tentativa}/3)")
-                resp = await self.client.get(url, timeout=60.0)
                 
-                if resp.status_code != 200:
-                    log(f"⚠️ URL {url} retornou status {resp.status_code}")
+                # Primeiro, carrega a página base para informações gerais
+                resp_base = await self.client.get(url, timeout=60.0)
+                if resp_base.status_code != 200:
                     if tentativa < 3:
                         await asyncio.sleep(3)
                         continue
                     return None
-
-                soup = BeautifulSoup(resp.text, "html.parser")
-
-                # Múltiplos seletores para o nome do jogo
-                times = (
-                    soup.select_one(".match-name") or 
-                    soup.select_one(".game-title") or 
-                    soup.select_one("h1") or
-                    soup.select_one(".pg-match-name")
-                )
-                if not times:
-                    log(f"⚠️ Nome do jogo não encontrado em {url}")
-                    # Tentar fallback
-                    alt_times = soup.select(".pg-match-teams")
-                    if alt_times:
-                        texto_alt = alt_times[0].text.strip()
-                        partes_alt = re.split(r"\s+x\s+|\s+vs\s+", texto_alt, maxsplit=1)
-                        if len(partes_alt) >= 2:
-                            time_casa = partes_alt[0].strip()
-                            time_fora = partes_alt[1].strip()
-                        else:
-                            return None
-                    else:
-                        return None
-                else:
-                    nome_jogo = times.text.strip()
-                    partes = re.split(r"\s+x\s+|\s+vs\s+|\s+v\s+|\s+-\s+", nome_jogo, maxsplit=1)
-                    if len(partes) < 2:
-                        log(f"⚠️ Não foi possível dividir o nome do jogo: {nome_jogo}")
-                        return None
-                    time_casa = partes[0].strip()
-                    time_fora = partes[1].strip()
-
-                # Múltiplos seletores para liga
-                liga_elem = (
-                    soup.select_one(".match-competition") or
-                    soup.select_one(".competition-name") or
-                    soup.select_one(".league-name") or
-                    soup.select_one(".pg-competition")
-                )
-                liga = liga_elem.text.strip() if liga_elem else "Desconhecida"
-
-                # Extração de odds com fallback
-                odds = {}
-                odd_rows = soup.select(".odds-row") or soup.select(".pg-odds-row") or soup.select(".pg-odds")
-                for odd_row in odd_rows:
-                    cols = odd_row.select("td") or odd_row.select(".pg-odds-cell")
-                    if len(cols) >= 3:
-                        mercado = cols[0].text.strip()
-                        try:
-                            odd_casa = float(cols[1].text.strip().replace(",", ".")) if cols[1].text.strip() else 0
-                            odd_fora = float(cols[2].text.strip().replace(",", ".")) if cols[2].text.strip() else 0
-                            if odd_casa > 0 and odd_fora > 0:
-                                odds[mercado] = {"casa": odd_casa, "fora": odd_fora}
-                        except ValueError:
-                            continue
-
-                estatisticas = self._extrair_estatisticas(soup, time_casa, time_fora)
-
-                log(f"✅ Dados extraídos: {time_casa} x {time_fora} | Liga: {liga}")
                 
-                return {
-                    "time_casa": time_casa,
-                    "time_fora": time_fora,
-                    "liga": liga,
-                    "url": url,
-                    "odds": odds,
-                    "estatisticas": estatisticas,
-                    "nome_jogo": f"{time_casa} x {time_fora}",
-                }
+                soup_base = BeautifulSoup(resp_base.text, "html.parser")
+                
+                # Extrai informações gerais da página base
+                times = soup_base.select_one(".card-match-teams")
+                if times:
+                    time_casa_elem = times.select_one(".card-match-teams-block.home .card-match-teams-name")
+                    time_fora_elem = times.select_one(".card-match-teams-block.away .card-match-teams-name")
+                    if time_casa_elem:
+                        dados_completos["time_casa"] = time_casa_elem.text.strip()
+                    if time_fora_elem:
+                        dados_completos["time_fora"] = time_fora_elem.text.strip()
+                
+                liga_elem = soup_base.select_one(".card-match-competition")
+                if liga_elem:
+                    dados_completos["liga"] = liga_elem.text.strip()
+                
+                # Para cada aba, faz uma requisição separada
+                for aba in abas:
+                    try:
+                        url_aba = f"{url}{aba['hash']}"
+                        log(f"🔄 Extraindo aba: {aba['id']} - {url_aba}")
+                        
+                        resp_aba = await self.client.get(url_aba, timeout=30.0)
+                        if resp_aba.status_code != 200:
+                            log(f"⚠️ Erro ao acessar aba {aba['id']}: {resp_aba.status_code}")
+                            continue
+                        
+                        soup_aba = BeautifulSoup(resp_aba.text, "html.parser")
+                        dados_aba = self._extrair_aba(soup_aba, aba["id"], dados_completos["time_casa"], dados_completos["time_fora"])
+                        dados_completos["aba"][aba["id"]] = dados_aba
+                        
+                        # Processa estatísticas
+                        estat = dados_aba.get("estatisticas", {})
+                        for lado in ["casa", "fora"]:
+                            if lado in estat:
+                                for key, value in estat[lado].items():
+                                    if value:
+                                        dados_completos["estatisticas"][lado][key] = value
+                        
+                        # Processa odds
+                        odds = dados_aba.get("odds", {})
+                        for mercado, odds_val in odds.items():
+                            if mercado not in dados_completos["odds"]:
+                                dados_completos["odds"][mercado] = odds_val
+                        
+                        await asyncio.sleep(random.uniform(0.5, 1.5))
+                    
+                    except Exception as e:
+                        log(f"⚠️ Erro ao extrair aba {aba['id']}: {e}")
+                        continue
+                
+                # Extrai odds da página base também
+                odds_base = self._extrair_odds_soup(soup_base)
+                for mercado, odds_val in odds_base.items():
+                    if mercado not in dados_completos["odds"]:
+                        dados_completos["odds"][mercado] = odds_val
+                
+                log(f"✅ Dados extraídos de {len(dados_completos['aba'])} abas: {list(dados_completos['aba'].keys())}")
+                return dados_completos
 
             except Exception as e:
                 log(f"⚠️ Erro ao extrair dados de {url} (tentativa {tentativa}/3): {type(e).__name__}: {e}")
@@ -5554,60 +5587,416 @@ class TeoBorgesScraperPreLive:
         
         return None
 
-    # MUDANÇA 6: _extrair_estatisticas com mapeamento mais completo
-    def _extrair_estatisticas(self, soup: BeautifulSoup, time_casa: str, time_fora: str) -> Dict:
-        estat = {"casa": {}, "fora": {}}
-        
-        # Mapeamento de labels para campos
-        mapping = {
-            "media gols": "media_gols",
-            "media total de gols": "media_gols",
-            "gols marcados": "gols_marcados",
-            "gols sofridos": "gols_sofridos",
-            "xg": "xg",
-            "xga": "xga",
-            "over 2.5": "over_25",
-            "over 1.5": "over_15",
-            "over 0.5 ht": "over_05_ht",
-            "btts": "btts",
-            "ambos marcam": "btts",
-            "escanteios": "escanteios",
-            "vitorias": "vitorias",
-            "derrotas": "derrotas",
-            "forma": "forma",
-            "posicao": "posicao",
+    def _extrair_aba(self, soup: BeautifulSoup, aba_id: str, time_casa: str, time_fora: str) -> Dict:
+        """Extrai dados de uma aba específica (Mudança 27)."""
+        dados = {
+            "estatisticas": {"casa": {}, "fora": {}},
+            "odds": {},
+            "raw_data": []
         }
         
-        # Procurar em múltiplos seletores
-        rows = soup.select(".stats-row, .pg-tstable-row, .pg-stats-row, .pg-stat-row, .stat-row")
+        if aba_id == "overview":
+            dados.update(self._extrair_overview(soup, time_casa, time_fora))
+        elif aba_id == "gols":
+            dados.update(self._extrair_gols(soup, time_casa, time_fora))
+        elif aba_id == "cantos":
+            dados.update(self._extrair_cantos(soup, time_casa, time_fora))
+        elif aba_id == "cartoes":
+            dados.update(self._extrair_cartoes(soup, time_casa, time_fora))
+        elif aba_id == "h2h":
+            dados.update(self._extrair_h2h(soup, time_casa, time_fora))
+        elif aba_id == "desempenho":
+            dados.update(self._extrair_desempenho(soup, time_casa, time_fora))
+        elif aba_id == "players":
+            dados.update(self._extrair_players(soup, time_casa, time_fora))
+        elif aba_id == "tabela":
+            dados.update(self._extrair_tabela(soup, time_casa, time_fora))
         
+        return dados
+
+    def _extrair_overview(self, soup: BeautifulSoup, time_casa: str, time_fora: str) -> Dict:
+        """Extrai dados da aba Overview (Mudança 28)."""
+        dados = {"estatisticas": {"casa": {}, "fora": {}}, "odds": {}}
+        
+        # Mapeamento de estatísticas da aba overview
+        mapping = {
+            "total de jogos": "total_jogos",
+            "pontos por jogo": "ppj",
+            "vitória": "vitorias",
+            "marcou primeiro": "marcou_primeiro",
+            "não sofreu gols": "nao_sofreu",
+            "falhou em marcar": "falhou_marcar",
+            "ambas marcam": "btts",
+            "média de posse de bola": "posse",
+            "gols marcados": "gols_marcados",
+            "gols sofridos": "gols_sofridos",
+            "média gols marcados": "media_gols",
+            "média gols sofridos": "media_gols_sofridos",
+            "média total de gols": "media_total_gols",
+            "finalizações por jogo": "finalizacoes",
+            "finalizações no alvo": "finalizacoes_alvo",
+            "finalizações por gol marcado": "finalizacoes_por_gol",
+            "expected goals (xg) - a favor": "xg",
+            "expected goals (xg) - contra": "xga",
+            "over 0.5 gols": "over_05",
+            "over 1.5 gols": "over_15",
+            "over 2.5 gols": "over_25",
+            "over 3.5 gols": "over_35",
+            "over 4.5 gols": "over_45",
+            "over 5.5 gols": "over_55",
+        }
+        
+        # Extrai linhas da tabela de estatísticas
+        rows = soup.select(".pg-tstable-row")
         for row in rows:
-            cols = row.select("td, .pg-tstable-cell, .pg-stats-cell, .stat-cell")
-            if len(cols) >= 3:
-                label = cols[0].text.strip().lower()
-                val_casa = cols[1].text.strip()
-                val_fora = cols[2].text.strip()
+            label_elem = row.select_one(".pg-tstable-label")
+            if not label_elem:
+                continue
+            
+            label = remover_acentos(label_elem.text.strip().lower())
+            valores = row.select(".pgcv")
+            
+            if len(valores) >= 2:
+                val_casa = self._parse_valor(valores[0].text.strip())
+                val_fora = self._parse_valor(valores[1].text.strip())
+                
+                # Tenta encontrar o campo no mapeamento
+                for key, field in mapping.items():
+                    if key in label:
+                        if field in ["gols_marcados", "gols_sofridos", "media_gols", "media_gols_sofridos", "media_total_gols"]:
+                            dados["estatisticas"]["casa"][field] = val_casa
+                            dados["estatisticas"]["fora"][field] = val_fora
+                        elif field in ["vitorias", "marcou_primeiro", "nao_sofreu", "falhou_marcar", "btts", "posse"]:
+                            dados["estatisticas"]["casa"][field] = val_casa / 100 if val_casa > 1 else val_casa
+                            dados["estatisticas"]["fora"][field] = val_fora / 100 if val_fora > 1 else val_fora
+                        elif field in ["over_05", "over_15", "over_25", "over_35", "over_45", "over_55"]:
+                            dados["estatisticas"]["casa"][field] = val_casa / 100 if val_casa > 1 else val_casa
+                            dados["estatisticas"]["fora"][field] = val_fora / 100 if val_fora > 1 else val_fora
+                        elif field in ["xg", "xga", "finalizacoes", "finalizacoes_alvo", "posse"]:
+                            dados["estatisticas"]["casa"][field] = val_casa
+                            dados["estatisticas"]["fora"][field] = val_fora
+                        break
+        
+        return dados
+
+    def _extrair_gols(self, soup: BeautifulSoup, time_casa: str, time_fora: str) -> Dict:
+        """Extrai dados da aba Gols (Mudança 28)."""
+        dados = {"estatisticas": {"casa": {}, "fora": {}}, "odds": {}}
+        
+        # Mapeamento específico para gols
+        mapping = {
+            "gols marcados": "gols_marcados",
+            "gols sofridos": "gols_sofridos",
+            "média gols marcados": "media_gols",
+            "média gols sofridos": "media_gols_sofridos",
+            "média total de gols": "media_total_gols",
+            "over 0.5 gols": "over_05",
+            "over 1.5 gols": "over_15",
+            "over 2.5 gols": "over_25",
+            "over 3.5 gols": "over_35",
+            "over 4.5 gols": "over_45",
+            "over 5.5 gols": "over_55",
+            "under 0.5 gols": "under_05",
+            "under 1.5 gols": "under_15",
+            "under 2.5 gols": "under_25",
+            "under 3.5 gols": "under_35",
+            "under 4.5 gols": "under_45",
+            "under 5.5 gols": "under_55",
+            "over 0.5 gols (1º tempo)": "over_05_ht",
+            "over 1.5 gols (1º tempo)": "over_15_ht",
+            "over 2.5 gols (1º tempo)": "over_25_ht",
+            "over 0.5 gols (2º tempo)": "over_05_2t",
+            "over 1.5 gols (2º tempo)": "over_15_2t",
+            "over 2.5 gols (2º tempo)": "over_25_2t",
+        }
+        
+        rows = soup.select(".pg-tstable-row")
+        for row in rows:
+            label_elem = row.select_one(".pg-tstable-label")
+            if not label_elem:
+                continue
+            
+            label = remover_acentos(label_elem.text.strip().lower())
+            valores = row.select(".pgcv")
+            
+            if len(valores) >= 2:
+                val_casa = self._parse_valor(valores[0].text.strip())
+                val_fora = self._parse_valor(valores[1].text.strip())
                 
                 for key, field in mapping.items():
                     if key in label:
-                        try:
-                            val_casa_float = float(val_casa.replace(",", ".").replace("%", "").strip() or "0")
-                            val_fora_float = float(val_fora.replace(",", ".").replace("%", "").strip() or "0")
-                            estat["casa"][field] = val_casa_float
-                            estat["fora"][field] = val_fora_float
-                        except ValueError:
-                            pass
+                        if field in ["gols_marcados", "gols_sofridos", "media_gols", "media_gols_sofridos", "media_total_gols"]:
+                            dados["estatisticas"]["casa"][field] = val_casa
+                            dados["estatisticas"]["fora"][field] = val_fora
+                        elif field in ["over_05", "over_15", "over_25", "over_35", "over_45", "over_55"]:
+                            dados["estatisticas"]["casa"][field] = val_casa / 100 if val_casa > 1 else val_casa
+                            dados["estatisticas"]["fora"][field] = val_fora / 100 if val_fora > 1 else val_fora
+                        elif field in ["over_05_ht", "over_15_ht", "over_25_ht", "over_05_2t", "over_15_2t", "over_25_2t"]:
+                            dados["estatisticas"]["casa"][field] = val_casa / 100 if val_casa > 1 else val_casa
+                            dados["estatisticas"]["fora"][field] = val_fora / 100 if val_fora > 1 else val_fora
                         break
         
-        # Valores padrão para campos obrigatórios
-        default_fields = ["media_gols", "xg", "over_25", "over_15", "btts", "escanteios"]
-        for field in default_fields:
-            if field not in estat["casa"]:
-                estat["casa"][field] = 0.0
-            if field not in estat["fora"]:
-                estat["fora"][field] = 0.0
+        return dados
+
+    def _extrair_cantos(self, soup: BeautifulSoup, time_casa: str, time_fora: str) -> Dict:
+        """Extrai dados da aba Escanteios (Mudança 28)."""
+        dados = {"estatisticas": {"casa": {}, "fora": {}}, "odds": {}}
         
-        return estat
+        mapping = {
+            "média de escanteios a favor": "escanteios_favor",
+            "média de escanteios contra": "escanteios_contra",
+            "média total de escanteios": "escanteios_total",
+            "terminou a partida com mais escanteios": "mais_escanteios",
+            "mais de 2.5 escanteios": "escanteios_25",
+            "mais de 3.5 escanteios": "escanteios_35",
+            "mais de 4.5 escanteios": "escanteios_45",
+            "mais de 5.5 escanteios": "escanteios_55",
+            "mais de 6.5 escanteios": "escanteios_65",
+            "mais de 7.5 escanteios": "escanteios_75",
+            "mais de 8.5 escanteios": "escanteios_85",
+            "mais de 9.5 escanteios": "escanteios_95",
+            "mais de 10.5 escanteios": "escanteios_105",
+        }
+        
+        rows = soup.select(".pg-tstable-row")
+        for row in rows:
+            label_elem = row.select_one(".pg-tstable-label")
+            if not label_elem:
+                continue
+            
+            label = remover_acentos(label_elem.text.strip().lower())
+            valores = row.select(".pgcv")
+            
+            if len(valores) >= 2:
+                val_casa = self._parse_valor(valores[0].text.strip())
+                val_fora = self._parse_valor(valores[1].text.strip())
+                
+                for key, field in mapping.items():
+                    if key in label:
+                        if field in ["escanteios_favor", "escanteios_contra", "escanteios_total"]:
+                            dados["estatisticas"]["casa"][field] = val_casa
+                            dados["estatisticas"]["fora"][field] = val_fora
+                        elif field in ["mais_escanteios"]:
+                            dados["estatisticas"]["casa"][field] = val_casa / 100 if val_casa > 1 else val_casa
+                            dados["estatisticas"]["fora"][field] = val_fora / 100 if val_fora > 1 else val_fora
+                        elif field in ["escanteios_25", "escanteios_35", "escanteios_45", "escanteios_55", 
+                                     "escanteios_65", "escanteios_75", "escanteios_85", "escanteios_95", "escanteios_105"]:
+                            dados["estatisticas"]["casa"][field] = val_casa / 100 if val_casa > 1 else val_casa
+                            dados["estatisticas"]["fora"][field] = val_fora / 100 if val_fora > 1 else val_fora
+                        break
+        
+        return dados
+
+    def _extrair_cartoes(self, soup: BeautifulSoup, time_casa: str, time_fora: str) -> Dict:
+        """Extrai dados da aba Cartões (Mudança 28)."""
+        dados = {"estatisticas": {"casa": {}, "fora": {}}, "odds": {}}
+        
+        mapping = {
+            "média recebidos": "cartoes_recebidos",
+            "média dos adversários": "cartoes_adversarios",
+            "média total": "cartoes_total",
+            "mais de 0.5 cartões": "cartoes_05",
+            "mais de 1.5 cartões": "cartoes_15",
+            "mais de 2.5 cartões": "cartoes_25",
+            "mais de 3.5 cartões": "cartoes_35",
+            "mais de 4.5 cartões": "cartoes_45",
+            "mais de 5.5 cartões": "cartoes_55",
+            "mais de 6.5 cartões": "cartoes_65",
+        }
+        
+        rows = soup.select(".pg-tstable-row")
+        for row in rows:
+            label_elem = row.select_one(".pg-tstable-label")
+            if not label_elem:
+                continue
+            
+            label = remover_acentos(label_elem.text.strip().lower())
+            valores = row.select(".pgcv")
+            
+            if len(valores) >= 2:
+                val_casa = self._parse_valor(valores[0].text.strip())
+                val_fora = self._parse_valor(valores[1].text.strip())
+                
+                for key, field in mapping.items():
+                    if key in label:
+                        if field in ["cartoes_recebidos", "cartoes_adversarios", "cartoes_total"]:
+                            dados["estatisticas"]["casa"][field] = val_casa
+                            dados["estatisticas"]["fora"][field] = val_fora
+                        elif field in ["cartoes_05", "cartoes_15", "cartoes_25", "cartoes_35", "cartoes_45", "cartoes_55", "cartoes_65"]:
+                            dados["estatisticas"]["casa"][field] = val_casa / 100 if val_casa > 1 else val_casa
+                            dados["estatisticas"]["fora"][field] = val_fora / 100 if val_fora > 1 else val_fora
+                        break
+        
+        return dados
+
+    def _extrair_h2h(self, soup: BeautifulSoup, time_casa: str, time_fora: str) -> Dict:
+        """Extrai dados da aba H2H (Mudança 28)."""
+        dados = {"estatisticas": {"casa": {}, "fora": {}}, "odds": {}, "h2h": []}
+        
+        # Extrai confrontos diretos
+        rows = soup.select(".dsmp-row")
+        for row in rows:
+            match_name_elem = row.select_one(".match-name")
+            if match_name_elem:
+                match_name = match_name_elem.text.strip()
+                placar_elem = row.select_one(".dsmp-placar")
+                placar = placar_elem.text.strip() if placar_elem else "0-0"
+                status_elem = row.select_one(".dsmp-match-status")
+                status = status_elem.text.strip() if status_elem else ""
+                
+                dados["h2h"].append({
+                    "jogo": match_name,
+                    "placar": placar,
+                    "status": status
+                })
+        
+        return dados
+
+    def _extrair_desempenho(self, soup: BeautifulSoup, time_casa: str, time_fora: str) -> Dict:
+        """Extrai dados da aba Desempenho (Mudança 28)."""
+        dados = {"estatisticas": {"casa": {}, "fora": {}}, "odds": {}}
+        
+        mapping = {
+            "marcou primeiro": "marcou_primeiro",
+            "sofreu primeiro": "sofreu_primeiro",
+            "sem gols": "sem_gols",
+            "ampliou o placar": "ampliou_placar",
+            "sofreu empate": "sofreu_empate",
+            "venceu após abrir": "venceu_apos_abrir",
+            "empatou após abrir": "empatou_apos_abrir",
+            "perdeu após abrir": "perdeu_apos_abrir",
+            "buscou empate": "buscou_empate",
+            "sofreu novamente": "sofreu_novamente",
+            "virou e venceu": "virou_venceu",
+            "empatou após sair atrás": "empatou_apos_sair_atras",
+            "perdeu após sair atrás": "perdeu_apos_sair_atras",
+        }
+        
+        rows = soup.select(".pg-tstable-row")
+        for row in rows:
+            label_elem = row.select_one(".pg-tstable-label")
+            if not label_elem:
+                continue
+            
+            label = remover_acentos(label_elem.text.strip().lower())
+            valores = row.select(".pgcv")
+            
+            if len(valores) >= 2:
+                val_casa = self._parse_valor(valores[0].text.strip())
+                val_fora = self._parse_valor(valores[1].text.strip())
+                
+                for key, field in mapping.items():
+                    if key in label:
+                        dados["estatisticas"]["casa"][field] = val_casa / 100 if val_casa > 1 else val_casa
+                        dados["estatisticas"]["fora"][field] = val_fora / 100 if val_fora > 1 else val_fora
+                        break
+        
+        return dados
+
+    def _extrair_players(self, soup: BeautifulSoup, time_casa: str, time_fora: str) -> Dict:
+        """Extrai dados da aba Jogadores (Mudança 28)."""
+        dados = {"estatisticas": {"casa": {}, "fora": {}}, "players": {"casa": [], "fora": []}}
+        
+        # Extrai jogadores do time da casa
+        home_table = soup.select_one("#players-team-home .players-table")
+        if home_table:
+            for row in home_table.select("tbody tr"):
+                name_elem = row.select_one(".players-profile-name")
+                if name_elem:
+                    player_data = {"nome": name_elem.text.strip()}
+                    cells = row.select("td")
+                    if len(cells) >= 8:
+                        player_data["jogos"] = cells[1].text.strip()
+                        player_data["minutos"] = cells[2].text.strip()
+                        player_data["gols"] = cells[3].text.strip()
+                        player_data["assistencias"] = cells[4].text.strip()
+                        player_data["cartoes"] = cells[5].text.strip()
+                    dados["players"]["casa"].append(player_data)
+        
+        # Extrai jogadores do time visitante
+        away_table = soup.select_one("#players-team-away .players-table")
+        if away_table:
+            for row in away_table.select("tbody tr"):
+                name_elem = row.select_one(".players-profile-name")
+                if name_elem:
+                    player_data = {"nome": name_elem.text.strip()}
+                    cells = row.select("td")
+                    if len(cells) >= 8:
+                        player_data["jogos"] = cells[1].text.strip()
+                        player_data["minutos"] = cells[2].text.strip()
+                        player_data["gols"] = cells[3].text.strip()
+                        player_data["assistencias"] = cells[4].text.strip()
+                        player_data["cartoes"] = cells[5].text.strip()
+                    dados["players"]["fora"].append(player_data)
+        
+        return dados
+
+    def _extrair_tabela(self, soup: BeautifulSoup, time_casa: str, time_fora: str) -> Dict:
+        """Extrai dados da aba Tabela (Mudança 28)."""
+        dados = {"tabela": []}
+        
+        table = soup.select_one(".league-table")
+        if table:
+            for row in table.select("tbody tr"):
+                cols = row.select("td")
+                if len(cols) >= 9:
+                    pos = cols[0].text.strip()
+                    team_elem = cols[1].select_one("span")
+                    team = team_elem.text.strip() if team_elem else ""
+                    jogos = cols[2].text.strip()
+                    vitorias = cols[3].text.strip()
+                    empates = cols[4].text.strip()
+                    derrotas = cols[5].text.strip()
+                    gols = cols[6].text.strip()
+                    saldo = cols[7].text.strip()
+                    pontos = cols[8].text.strip()
+                    
+                    dados["tabela"].append({
+                        "posicao": pos,
+                        "time": team,
+                        "jogos": jogos,
+                        "vitorias": vitorias,
+                        "empates": empates,
+                        "derrotas": derrotas,
+                        "gols": gols,
+                        "saldo": saldo,
+                        "pontos": pontos
+                    })
+        
+        return dados
+
+    def _extrair_odds_soup(self, soup: BeautifulSoup) -> Dict:
+        """Extrai odds do soup."""
+        odds = {}
+        
+        # Procura por odds em diferentes estruturas
+        odd_elements = soup.select(".pg-odd, .odds, .pg-odds")
+        for elem in odd_elements:
+            text = elem.text.strip()
+            if "x" in text:
+                parts = text.split("x")
+                if len(parts) >= 2:
+                    try:
+                        odd_casa = float(parts[0].strip().replace(",", "."))
+                        odd_empate = float(parts[1].strip().replace(",", "."))
+                        odd_fora = float(parts[2].strip().replace(",", ".")) if len(parts) >= 3 else 0
+                        odds["1X2"] = {"casa": odd_casa, "empate": odd_empate, "fora": odd_fora}
+                    except:
+                        pass
+        
+        return odds
+
+    def _parse_valor(self, valor: str) -> float:
+        """Converte string para float, tratando porcentagens."""
+        valor = valor.strip().replace(",", ".").replace("%", "").replace("'", "")
+        try:
+            return float(valor)
+        except:
+            return 0.0
+
+    def _extrair_estatisticas(self, soup: BeautifulSoup, time_casa: str, time_fora: str) -> Dict:
+        """Método legado mantido para compatibilidade (Mudança 28)."""
+        return {"casa": {}, "fora": {}}
 
     async def close(self):
         if self.client:
@@ -5615,14 +6004,15 @@ class TeoBorgesScraperPreLive:
 
 
 # =========================================================
-# MATCHUP ENGINE - PRÉ-LIVE
+# MATCHUP ENGINE - PRÉ-LIVE COM DADOS DAS ABAS
 # =========================================================
 
 class MatchupEnginePreLive:
     def calcular_matchup(self, jogo: JogoPreLive, mercado: str) -> float:
         casa = jogo.estatisticas_casa
         fora = jogo.estatisticas_fora
-
+        
+        # Usa dados específicos por período quando disponíveis
         if mercado == "Vitoria_Casa":
             return self._matchup_vitoria_casa(casa, fora)
         elif mercado == "Vitoria_Fora":
@@ -5653,30 +6043,37 @@ class MatchupEnginePreLive:
         return min(100, (ataque_fora * defesa_casa / 100) * 1.0)
 
     def _matchup_over_ht(self, casa: EstatisticasTimePreLive, fora: EstatisticasTimePreLive) -> float:
-        ataque_ht_casa = casa.over_05_ht * 0.5 + casa.gols_ht * 25
-        defesa_ht_fora = fora.over_05_ht * 0.3 + fora.sofre_ht * 15
+        # Usa dados HT quando disponíveis
+        over_casa = casa.over_05_ht or casa.over_05_ht_casa or 0
+        over_fora = fora.over_05_ht or fora.over_05_ht_fora or 0
+        ataque_ht_casa = over_casa * 0.5 + casa.gols_ht * 25
+        defesa_ht_fora = over_fora * 0.3 + fora.sofre_ht * 15
         return min(100, (ataque_ht_casa + defesa_ht_fora) * 0.6)
 
     def _matchup_over_15(self, casa: EstatisticasTimePreLive, fora: EstatisticasTimePreLive) -> float:
-        over_casa = casa.over_15_ft * 0.5 + casa.gols_marcados * 15
-        over_fora = fora.over_15_ft * 0.5 + fora.gols_marcados * 15
-        return min(100, (over_casa + over_fora) * 0.5)
+        over_casa = casa.over_15_ft or casa.over_15_ft_casa or 0
+        over_fora = fora.over_15_ft or fora.over_15_ft_fora or 0
+        return min(100, (over_casa + over_fora) * 0.5 + (casa.gols_marcados + fora.gols_marcados) * 7.5)
 
     def _matchup_over_25(self, casa: EstatisticasTimePreLive, fora: EstatisticasTimePreLive) -> float:
-        over_casa = casa.over_25_ft * 0.5 + casa.gols_marcados * 15 + casa.xg * 10
-        over_fora = fora.over_25_ft * 0.5 + fora.gols_marcados * 15 + fora.xg * 10
-        return min(100, (over_casa + over_fora) * 0.4)
+        over_casa = casa.over_25_ft or casa.over_25_ft_casa or 0
+        over_fora = fora.over_25_ft or fora.over_25_ft_fora or 0
+        return min(100, (over_casa + over_fora) * 0.4 + (casa.gols_marcados + fora.gols_marcados) * 6 + (casa.xg + fora.xg) * 4)
 
     def _matchup_btts(self, casa: EstatisticasTimePreLive, fora: EstatisticasTimePreLive) -> float:
-        btts_casa = casa.btts * 0.3 + casa.gols_marcados * 10 + casa.gols_sofridos * 10
-        btts_fora = fora.btts * 0.3 + fora.gols_marcados * 10 + fora.gols_sofridos * 10
+        btts_casa = casa.btts or casa.btts_casa or 0
+        btts_fora = fora.btts or fora.btts_fora or 0
         return min(100, (btts_casa + btts_fora) * 0.5)
 
     def _matchup_escanteios(self, casa: EstatisticasTimePreLive, fora: EstatisticasTimePreLive, lado: str) -> float:
         if lado == "casa":
-            return min(100, casa.escanteios_favor * 12 + fora.escanteios_contra * 8)
+            esc_fav = casa.escanteios_favor or casa.escanteios_favor_casa or 0
+            esc_contra = fora.escanteios_contra or fora.escanteios_contra_fora or 0
+            return min(100, esc_fav * 12 + esc_contra * 8)
         else:
-            return min(100, fora.escanteios_favor * 12 + casa.escanteios_contra * 8)
+            esc_fav = fora.escanteios_favor or fora.escanteios_favor_fora or 0
+            esc_contra = casa.escanteios_contra or casa.escanteios_contra_casa or 0
+            return min(100, esc_fav * 12 + esc_contra * 8)
 
 
 # =========================================================
@@ -5752,10 +6149,10 @@ class MarketEnginePreLive:
         fora = jogo.estatisticas_fora
 
         if tipo == "Over_05_HT":
-            return casa.over_05_ht * 0.5 + fora.over_05_ht * 0.3 + casa.gols_ht * 10
+            return (casa.over_05_ht or 0) * 0.5 + (fora.over_05_ht or 0) * 0.3 + casa.gols_ht * 10
 
         if tipo in ["Vitoria_Casa", "Vitoria_Fora"]:
-            return casa.gols_ht * 10 + casa.over_05_ht * 0.3
+            return casa.gols_ht * 10 + (casa.over_05_ht or 0) * 0.3
 
         return casa.gols_ht * 8 + fora.sofre_ht * 8
 
@@ -5764,10 +6161,10 @@ class MarketEnginePreLive:
         fora = jogo.estatisticas_fora
 
         if tipo == "Over_25_FT":
-            return casa.over_25_ft * 0.5 + fora.over_25_ft * 0.5
+            return (casa.over_25_ft or 0) * 0.5 + (fora.over_25_ft or 0) * 0.5
 
         if tipo == "BTTS":
-            return casa.btts * 0.5 + fora.btts * 0.5
+            return (casa.btts or 0) * 0.5 + (fora.btts or 0) * 0.5
 
         return casa.gols_ft * 10 + fora.gols_ft * 10
 
@@ -5775,7 +6172,7 @@ class MarketEnginePreLive:
         casa = jogo.estatisticas_casa
         fora = jogo.estatisticas_fora
 
-        forma = casa.forma * 5 + fora.forma * 5
+        forma = (casa.forma or 0) * 5 + (fora.forma or 0) * 5
 
         variabilidade = 0
         if casa.gols_marcados and casa.gols_sofridos:
@@ -5815,27 +6212,40 @@ class CandidateSelectorPreLive:
             for m in mercados:
                 todos_mercados.append(m)
 
+        # Agrupa por jogo e pega os 4 melhores mercados por partida
         melhores_por_jogo = {}
         for m in todos_mercados:
             chave = f"{m.jogo.time_casa} x {m.jogo.time_fora}"
-            if chave not in melhores_por_jogo or m.score > melhores_por_jogo[chave].score:
-                melhores_por_jogo[chave] = m
+            if chave not in melhores_por_jogo:
+                melhores_por_jogo[chave] = []
+            melhores_por_jogo[chave].append(m)
 
-        candidatos = sorted(melhores_por_jogo.values(), key=lambda x: x.score, reverse=True)
+        # Para cada jogo, pega os 4 melhores mercados
+        melhores_4_por_jogo = {}
+        for chave, mercados in melhores_por_jogo.items():
+            ordenados = sorted(mercados, key=lambda x: x.score, reverse=True)
+            melhores_4_por_jogo[chave] = ordenados[:4]
 
-        aprovados = [m for m in candidatos if m.score >= SCORE_MINIMO_APROVACAO]
+        # Lista plana de todos os mercados (4 por jogo)
+        todos_melhores = []
+        for mercados in melhores_4_por_jogo.values():
+            todos_melhores.extend(mercados)
+
+        # Filtra os aprovados (score >= SCORE_MINIMO_APROVACAO)
+        aprovados = [m for m in todos_melhores if m.score >= SCORE_MINIMO_APROVACAO]
 
         if aprovados:
             media = sum(m.score for m in aprovados) / len(aprovados)
             if media < MEDIA_MINIMA_DIA:
                 log(f"⚠️ Média do dia {media:.1f} < {MEDIA_MINIMA_DIA}")
-                return {"aprovados": [], "media": media, "total": len(candidatos)}
+                return {"aprovados": [], "media": media, "total": len(todos_melhores)}
 
         return {
             "aprovados": aprovados,
             "media": sum(m.score for m in aprovados) / len(aprovados) if aprovados else 0,
-            "total": len(candidatos),
-            "todos_mercados": todos_mercados,
+            "total": len(todos_melhores),
+            "todos_mercados": todos_melhores,
+            "melhores_por_jogo": melhores_4_por_jogo,
         }
 
 
@@ -5873,6 +6283,7 @@ class MultipleBuilderPreLive:
         if len(complementares_validos) < 1:
             return multiplas
 
+        # SAFE: âncoras + primeiro mercado de cada complementar
         safe_mercados = list(ancoras) + [c[0] for c in complementares_validos if c]
         if safe_mercados:
             multiplas.append(MultiplePreLive(
@@ -5882,6 +6293,7 @@ class MultipleBuilderPreLive:
                 descricao="Mercados mais confiáveis de cada jogo"
             ))
 
+        # PRO1: âncoras + segundo mercado (ou primeiro se só tiver 1)
         pro1_mercados = list(ancoras)
         for comp in complementares_validos:
             if len(comp) >= 2:
@@ -5897,6 +6309,7 @@ class MultipleBuilderPreLive:
                 descricao="Segunda melhor combinação de mercados"
             ))
 
+        # PRO2: âncoras + terceiro mercado (ou segundo se só tiver 2)
         pro2_mercados = list(ancoras)
         for comp in complementares_validos:
             if len(comp) >= 3:
@@ -5914,6 +6327,7 @@ class MultipleBuilderPreLive:
                 descricao="Terceira melhor combinação de mercados"
             ))
 
+        # DIAMOND: âncoras + combinação diversificada
         diamond_mercados = list(ancoras)
         for i, comp in enumerate(complementares_validos):
             if len(comp) >= 3 and i % 3 == 0:
@@ -5994,38 +6408,78 @@ async def varrer_site_theoborges_prelive() -> None:
         if dados:
             estat_casa = EstatisticasTimePreLive(
                 nome=dados["time_casa"],
-                gols_marcados=dados["estatisticas"].get("casa", {}).get("media_gols", 0),
+                gols_marcados=dados["estatisticas"].get("casa", {}).get("gols_marcados", 0),
                 gols_sofridos=dados["estatisticas"].get("casa", {}).get("gols_sofridos", 0),
                 xg=dados["estatisticas"].get("casa", {}).get("xg", 0),
+                xga=dados["estatisticas"].get("casa", {}).get("xga", 0),
                 over_05_ht=dados["estatisticas"].get("casa", {}).get("over_05_ht", 0),
                 over_15_ft=dados["estatisticas"].get("casa", {}).get("over_15", 0),
                 over_25_ft=dados["estatisticas"].get("casa", {}).get("over_25", 0),
                 btts=dados["estatisticas"].get("casa", {}).get("btts", 0),
-                escanteios_favor=dados["estatisticas"].get("casa", {}).get("escanteios", 0),
+                escanteios_favor=dados["estatisticas"].get("casa", {}).get("escanteios_favor", 0),
+                escanteios_contra=dados["estatisticas"].get("casa", {}).get("escanteios_contra", 0),
+                finalizacoes=dados["estatisticas"].get("casa", {}).get("finalizacoes", 0),
                 gols_ht=dados["estatisticas"].get("casa", {}).get("gols_ht", 0),
                 gols_ft=dados["estatisticas"].get("casa", {}).get("gols_ft", 0),
                 sofre_ht=dados["estatisticas"].get("casa", {}).get("sofre_ht", 0),
                 sofre_ft=dados["estatisticas"].get("casa", {}).get("sofre_ft", 0),
+                vitorias=dados["estatisticas"].get("casa", {}).get("vitorias", 0),
+                derrotas=dados["estatisticas"].get("casa", {}).get("derrotas", 0),
                 team_reliability=80.0,
                 forma=0,
+                # Dados por período
+                over_05_ht_casa=dados["estatisticas"].get("casa", {}).get("over_05_ht_casa", 0),
+                over_05_ht_fora=dados["estatisticas"].get("casa", {}).get("over_05_ht_fora", 0),
+                over_15_ft_casa=dados["estatisticas"].get("casa", {}).get("over_15_ft_casa", 0),
+                over_15_ft_fora=dados["estatisticas"].get("casa", {}).get("over_15_ft_fora", 0),
+                over_25_ft_casa=dados["estatisticas"].get("casa", {}).get("over_25_ft_casa", 0),
+                over_25_ft_fora=dados["estatisticas"].get("casa", {}).get("over_25_ft_fora", 0),
+                btts_casa=dados["estatisticas"].get("casa", {}).get("btts_casa", 0),
+                btts_fora=dados["estatisticas"].get("casa", {}).get("btts_fora", 0),
+                escanteios_favor_casa=dados["estatisticas"].get("casa", {}).get("escanteios_favor_casa", 0),
+                escanteios_favor_fora=dados["estatisticas"].get("casa", {}).get("escanteios_favor_fora", 0),
+                escanteios_contra_casa=dados["estatisticas"].get("casa", {}).get("escanteios_contra_casa", 0),
+                escanteios_contra_fora=dados["estatisticas"].get("casa", {}).get("escanteios_contra_fora", 0),
+                vitorias_casa=dados["estatisticas"].get("casa", {}).get("vitorias_casa", 0),
+                vitorias_fora=dados["estatisticas"].get("casa", {}).get("vitorias_fora", 0),
             )
 
             estat_fora = EstatisticasTimePreLive(
                 nome=dados["time_fora"],
-                gols_marcados=dados["estatisticas"].get("fora", {}).get("media_gols", 0),
+                gols_marcados=dados["estatisticas"].get("fora", {}).get("gols_marcados", 0),
                 gols_sofridos=dados["estatisticas"].get("fora", {}).get("gols_sofridos", 0),
                 xg=dados["estatisticas"].get("fora", {}).get("xg", 0),
+                xga=dados["estatisticas"].get("fora", {}).get("xga", 0),
                 over_05_ht=dados["estatisticas"].get("fora", {}).get("over_05_ht", 0),
                 over_15_ft=dados["estatisticas"].get("fora", {}).get("over_15", 0),
                 over_25_ft=dados["estatisticas"].get("fora", {}).get("over_25", 0),
                 btts=dados["estatisticas"].get("fora", {}).get("btts", 0),
-                escanteios_favor=dados["estatisticas"].get("fora", {}).get("escanteios", 0),
+                escanteios_favor=dados["estatisticas"].get("fora", {}).get("escanteios_favor", 0),
+                escanteios_contra=dados["estatisticas"].get("fora", {}).get("escanteios_contra", 0),
+                finalizacoes=dados["estatisticas"].get("fora", {}).get("finalizacoes", 0),
                 gols_ht=dados["estatisticas"].get("fora", {}).get("gols_ht", 0),
                 gols_ft=dados["estatisticas"].get("fora", {}).get("gols_ft", 0),
                 sofre_ht=dados["estatisticas"].get("fora", {}).get("sofre_ht", 0),
                 sofre_ft=dados["estatisticas"].get("fora", {}).get("sofre_ft", 0),
+                vitorias=dados["estatisticas"].get("fora", {}).get("vitorias", 0),
+                derrotas=dados["estatisticas"].get("fora", {}).get("derrotas", 0),
                 team_reliability=80.0,
                 forma=0,
+                # Dados por período
+                over_05_ht_casa=dados["estatisticas"].get("fora", {}).get("over_05_ht_casa", 0),
+                over_05_ht_fora=dados["estatisticas"].get("fora", {}).get("over_05_ht_fora", 0),
+                over_15_ft_casa=dados["estatisticas"].get("fora", {}).get("over_15_ft_casa", 0),
+                over_15_ft_fora=dados["estatisticas"].get("fora", {}).get("over_15_ft_fora", 0),
+                over_25_ft_casa=dados["estatisticas"].get("fora", {}).get("over_25_ft_casa", 0),
+                over_25_ft_fora=dados["estatisticas"].get("fora", {}).get("over_25_ft_fora", 0),
+                btts_casa=dados["estatisticas"].get("fora", {}).get("btts_casa", 0),
+                btts_fora=dados["estatisticas"].get("fora", {}).get("btts_fora", 0),
+                escanteios_favor_casa=dados["estatisticas"].get("fora", {}).get("escanteios_favor_casa", 0),
+                escanteios_favor_fora=dados["estatisticas"].get("fora", {}).get("escanteios_favor_fora", 0),
+                escanteios_contra_casa=dados["estatisticas"].get("fora", {}).get("escanteios_contra_casa", 0),
+                escanteios_contra_fora=dados["estatisticas"].get("fora", {}).get("escanteios_contra_fora", 0),
+                vitorias_casa=dados["estatisticas"].get("fora", {}).get("vitorias_casa", 0),
+                vitorias_fora=dados["estatisticas"].get("fora", {}).get("vitorias_fora", 0),
             )
 
             jogo = JogoPreLive(
@@ -6038,10 +6492,11 @@ async def varrer_site_theoborges_prelive() -> None:
                 estatisticas_fora=estat_fora,
                 odds=dados.get("odds", {}),
                 url=dados["url"],
+                dados_raw=dados,
             )
             jogos.append(jogo)
 
-    log(f"📊 Dados extraídos de {len(jogos)} jogos")
+    log(f"📊 Dados extraídos de {len(jogos)} jogos com {sum(1 for j in jogos if j.dados_raw.get('aba'))} abas cada")
 
     await scraper.close()
 
@@ -6054,7 +6509,8 @@ async def varrer_site_theoborges_prelive() -> None:
     resultado = selector.selecionar_candidatos(jogos)
     aprovados = resultado["aprovados"]
 
-    log(f"📊 {len(aprovados)} jogos aprovados (Score ≥ {SCORE_MINIMO_APROVACAO})")
+    log(f"📊 {len(aprovados)} mercados aprovados (Score ≥ {SCORE_MINIMO_APROVACAO})")
+    log(f"📊 {resultado['total']} mercados analisados no total")
 
     if len(aprovados) < QTD_MINIMA_JOGOS:
         log(f"❌ Menos de {QTD_MINIMA_JOGOS} jogos aprovados")
@@ -6123,9 +6579,9 @@ def logar_versao_inicial() -> None:
     log(" 20. JSON limitado 500")
     log(" 21. Cache robusto")
     log(" 22-25. Refatorações")
-    log(" 26. Scraper Pré-Live corrigido (buscar_jogos)")
-    log(" 27. Scraper Pré-Live corrigido (extrair_dados_jogo)")
-    log(" 28. Scraper Pré-Live corrigido (_extrair_estatisticas)")
+    log(" 26. Scraper Pré-Live com navegação por abas")
+    log(" 27. Extração de dados de todas as abas")
+    log(" 28. Seleção dos 4 melhores mercados por partida")
     log(f"📊 Corte HT={CORTE_GOL_HT}% | Corte FT={CORTE_GOL_FT}%")
     log(f"📡 Canais: grátis={FREE_CHANNEL} | completo={COMPLETE_CHANNEL}")
     log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
