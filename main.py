@@ -5325,7 +5325,7 @@ class MultiplePreLive:
 
 
 # =========================================================
-# SCRAPER PRÉ-LIVE
+# SCRAPER PRÉ-LIVE CORRIGIDO (MUDANÇAS 4, 5, 6)
 # =========================================================
 
 class TeoBorgesScraperPreLive:
@@ -5404,165 +5404,219 @@ class TeoBorgesScraperPreLive:
             log(f"❌ Erro no login: {type(e).__name__}: {e}")
             return False
 
+    # MUDANÇA 4: buscar_jogos com múltiplas URLs e timeout maior
     async def buscar_jogos(self, dia: str = "hoje") -> List[str]:
         if not self.logado:
             log("❌ Não está logado!")
             return []
 
         try:
-            url = f"https://clube.theoborges.com/matches?dia={dia}"
-            log(f"🔄 Buscando jogos para: {dia}")
-
-            resp = await self.client.get(url)
-            if resp.status_code != 200:
-                log(f"⚠️ Erro ao buscar jogos: {resp.status_code}")
-                return []
-
-            soup = BeautifulSoup(resp.text, "html.parser")
+            # Tentar múltiplos formatos de URL para resiliência
+            urls_tentar = [
+                f"https://clube.theoborges.com/matches?dia={dia}",
+                f"https://clube.theoborges.com/matches?date={dia}",
+                f"https://clube.theoborges.com/matches/{dia}",
+            ]
+            
             links = []
+            for url in urls_tentar:
+                log(f"🔄 Tentando buscar jogos em: {url}")
+                try:
+                    resp = await self.client.get(url, timeout=60.0)
+                    if resp.status_code == 200:
+                        soup = BeautifulSoup(resp.text, "html.parser")
+                        
+                        # Múltiplos seletores
+                        for selector in [".match-row", ".match-item", "a[href*='/game/']", ".game-link"]:
+                            for link in soup.select(selector):
+                                href = link.get("href")
+                                if href and "/game/" in href:
+                                    # Garantir URL completo
+                                    if href.startswith("http"):
+                                        full_url = href
+                                    elif href.startswith("//"):
+                                        full_url = f"https:{href}"
+                                    else:
+                                        full_url = f"https://clube.theoborges.com{href}"
+                                    if full_url not in links:
+                                        links.append(full_url)
+                        
+                        if links:
+                            log(f"📊 Encontrados {len(links)} links em {url}")
+                            break
+                except Exception as e:
+                    log(f"⚠️ Erro ao tentar {url}: {e}")
+                    continue
+                
+                await asyncio.sleep(2)  # Delay entre tentativas
 
-            for link in soup.select(".match-row"):
-                href = link.get("href")
-                if href and "/game/" in href:
-                    links.append(f"https://clube.theoborges.com{href}")
-
-            if not links:
-                for link in soup.select("a[href*='/game/']"):
-                    href = link.get("href")
-                    if href:
-                        links.append(f"https://clube.theoborges.com{href}")
-
-            if not links:
-                for link in soup.find_all("a", href=True):
-                    href = link.get("href")
-                    if href and "/game/" in href:
-                        links.append(f"https://clube.theoborges.com{href}")
-
-            log(f"📊 Encontrados {len(links)} links de jogos para {dia}")
-            return list(set(links))
+            log(f"📊 Total de {len(links)} links de jogos para {dia}")
+            return links
 
         except Exception as e:
             log(f"❌ Erro ao buscar jogos: {type(e).__name__}: {e}")
             return []
 
+    # MUDANÇA 5: extrair_dados_jogo com retry e timeout maior
     async def extrair_dados_jogo(self, url: str) -> Optional[Dict]:
-        try:
-            await asyncio.sleep(random.uniform(0.5, 1.5))
+        # Delay maior para não sobrecarregar o site
+        await asyncio.sleep(random.uniform(2.0, 4.0))
+        
+        # Tentar até 3 vezes
+        for tentativa in range(1, 4):
+            try:
+                log(f"🔄 Extraindo dados: {url} (tentativa {tentativa}/3)")
+                resp = await self.client.get(url, timeout=60.0)
+                
+                if resp.status_code != 200:
+                    log(f"⚠️ URL {url} retornou status {resp.status_code}")
+                    if tentativa < 3:
+                        await asyncio.sleep(3)
+                        continue
+                    return None
 
-            resp = await self.client.get(url)
-            if resp.status_code != 200:
+                soup = BeautifulSoup(resp.text, "html.parser")
+
+                # Múltiplos seletores para o nome do jogo
+                times = (
+                    soup.select_one(".match-name") or 
+                    soup.select_one(".game-title") or 
+                    soup.select_one("h1") or
+                    soup.select_one(".pg-match-name")
+                )
+                if not times:
+                    log(f"⚠️ Nome do jogo não encontrado em {url}")
+                    # Tentar fallback
+                    alt_times = soup.select(".pg-match-teams")
+                    if alt_times:
+                        texto_alt = alt_times[0].text.strip()
+                        partes_alt = re.split(r"\s+x\s+|\s+vs\s+", texto_alt, maxsplit=1)
+                        if len(partes_alt) >= 2:
+                            time_casa = partes_alt[0].strip()
+                            time_fora = partes_alt[1].strip()
+                        else:
+                            return None
+                    else:
+                        return None
+                else:
+                    nome_jogo = times.text.strip()
+                    partes = re.split(r"\s+x\s+|\s+vs\s+|\s+v\s+|\s+-\s+", nome_jogo, maxsplit=1)
+                    if len(partes) < 2:
+                        log(f"⚠️ Não foi possível dividir o nome do jogo: {nome_jogo}")
+                        return None
+                    time_casa = partes[0].strip()
+                    time_fora = partes[1].strip()
+
+                # Múltiplos seletores para liga
+                liga_elem = (
+                    soup.select_one(".match-competition") or
+                    soup.select_one(".competition-name") or
+                    soup.select_one(".league-name") or
+                    soup.select_one(".pg-competition")
+                )
+                liga = liga_elem.text.strip() if liga_elem else "Desconhecida"
+
+                # Extração de odds com fallback
+                odds = {}
+                odd_rows = soup.select(".odds-row") or soup.select(".pg-odds-row") or soup.select(".pg-odds")
+                for odd_row in odd_rows:
+                    cols = odd_row.select("td") or odd_row.select(".pg-odds-cell")
+                    if len(cols) >= 3:
+                        mercado = cols[0].text.strip()
+                        try:
+                            odd_casa = float(cols[1].text.strip().replace(",", ".")) if cols[1].text.strip() else 0
+                            odd_fora = float(cols[2].text.strip().replace(",", ".")) if cols[2].text.strip() else 0
+                            if odd_casa > 0 and odd_fora > 0:
+                                odds[mercado] = {"casa": odd_casa, "fora": odd_fora}
+                        except ValueError:
+                            continue
+
+                estatisticas = self._extrair_estatisticas(soup, time_casa, time_fora)
+
+                log(f"✅ Dados extraídos: {time_casa} x {time_fora} | Liga: {liga}")
+                
+                return {
+                    "time_casa": time_casa,
+                    "time_fora": time_fora,
+                    "liga": liga,
+                    "url": url,
+                    "odds": odds,
+                    "estatisticas": estatisticas,
+                    "nome_jogo": f"{time_casa} x {time_fora}",
+                }
+
+            except Exception as e:
+                log(f"⚠️ Erro ao extrair dados de {url} (tentativa {tentativa}/3): {type(e).__name__}: {e}")
+                if tentativa < 3:
+                    await asyncio.sleep(5)
+                    continue
                 return None
+        
+        return None
 
-            soup = BeautifulSoup(resp.text, "html.parser")
-
-            times = soup.select_one(".match-name")
-            if not times:
-                return None
-
-            nome_jogo = times.text.strip()
-            partes = re.split(r"\s+x\s+|\s+vs\s+", nome_jogo, maxsplit=1)
-            if len(partes) < 2:
-                return None
-
-            time_casa = partes[0].strip()
-            time_fora = partes[1].strip()
-
-            liga_elem = soup.select_one(".match-competition")
-            liga = liga_elem.text.strip() if liga_elem else "Desconhecida"
-
-            odds = {}
-            for odd_row in soup.select(".odds-row"):
-                cols = odd_row.select("td")
-                if len(cols) >= 3:
-                    mercado = cols[0].text.strip()
-                    odd_casa = cols[1].text.strip()
-                    odd_fora = cols[2].text.strip()
-                    odds[mercado] = {
-                        "casa": float(odd_casa.replace(",", ".")) if odd_casa else 0,
-                        "fora": float(odd_fora.replace(",", ".")) if odd_fora else 0,
-                    }
-
-            estatisticas = self._extrair_estatisticas(soup, time_casa, time_fora)
-
-            return {
-                "time_casa": time_casa,
-                "time_fora": time_fora,
-                "liga": liga,
-                "url": url,
-                "odds": odds,
-                "estatisticas": estatisticas,
-                "nome_jogo": nome_jogo,
-            }
-
-        except Exception as e:
-            log(f"⚠️ Erro ao extrair dados: {type(e).__name__}: {e}")
-            return None
-
+    # MUDANÇA 6: _extrair_estatisticas com mapeamento mais completo
     def _extrair_estatisticas(self, soup: BeautifulSoup, time_casa: str, time_fora: str) -> Dict:
         estat = {"casa": {}, "fora": {}}
-
-        for row in soup.select(".stats-row, .pg-tstable-row"):
-            cols = row.select("td, .pg-tstable-cell")
+        
+        # Mapeamento de labels para campos
+        mapping = {
+            "media gols": "media_gols",
+            "media total de gols": "media_gols",
+            "gols marcados": "gols_marcados",
+            "gols sofridos": "gols_sofridos",
+            "xg": "xg",
+            "xga": "xga",
+            "over 2.5": "over_25",
+            "over 1.5": "over_15",
+            "over 0.5 ht": "over_05_ht",
+            "btts": "btts",
+            "ambos marcam": "btts",
+            "escanteios": "escanteios",
+            "vitorias": "vitorias",
+            "derrotas": "derrotas",
+            "forma": "forma",
+            "posicao": "posicao",
+        }
+        
+        # Procurar em múltiplos seletores
+        rows = soup.select(".stats-row, .pg-tstable-row, .pg-stats-row, .pg-stat-row, .stat-row")
+        
+        for row in rows:
+            cols = row.select("td, .pg-tstable-cell, .pg-stats-cell, .stat-cell")
             if len(cols) >= 3:
                 label = cols[0].text.strip().lower()
                 val_casa = cols[1].text.strip()
                 val_fora = cols[2].text.strip()
-
-                if "media" in label and "gols" in label:
-                    try:
-                        estat["casa"]["media_gols"] = float(val_casa.replace(",", "."))
-                        estat["fora"]["media_gols"] = float(val_fora.replace(",", "."))
-                    except:
-                        pass
-
-                if "xg" in label and "casa" in label.lower():
-                    try:
-                        estat["casa"]["xg"] = float(val_casa.replace(",", "."))
-                        estat["fora"]["xg"] = float(val_fora.replace(",", "."))
-                    except:
-                        pass
-
-                if "over 2.5" in label:
-                    try:
-                        estat["casa"]["over_25"] = float(val_casa.replace("%", "").strip())
-                        estat["fora"]["over_25"] = float(val_fora.replace("%", "").strip())
-                    except:
-                        pass
-
-                if "over 1.5" in label:
-                    try:
-                        estat["casa"]["over_15"] = float(val_casa.replace("%", "").strip())
-                        estat["fora"]["over_15"] = float(val_fora.replace("%", "").strip())
-                    except:
-                        pass
-
-                if "btts" in label or "ambos" in label:
-                    try:
-                        estat["casa"]["btts"] = float(val_casa.replace("%", "").strip())
-                        estat["fora"]["btts"] = float(val_fora.replace("%", "").strip())
-                    except:
-                        pass
-
-                if "escanteios" in label:
-                    try:
-                        estat["casa"]["escanteios"] = float(val_casa.replace(",", "."))
-                        estat["fora"]["escanteios"] = float(val_fora.replace(",", "."))
-                    except:
-                        pass
-
-                if "sofre" in label or "gols contra" in label:
-                    try:
-                        estat["casa"]["gols_sofridos"] = float(val_casa.replace(",", "."))
-                        estat["fora"]["gols_sofridos"] = float(val_fora.replace(",", "."))
-                    except:
-                        pass
-
+                
+                for key, field in mapping.items():
+                    if key in label:
+                        try:
+                            val_casa_float = float(val_casa.replace(",", ".").replace("%", "").strip() or "0")
+                            val_fora_float = float(val_fora.replace(",", ".").replace("%", "").strip() or "0")
+                            estat["casa"][field] = val_casa_float
+                            estat["fora"][field] = val_fora_float
+                        except ValueError:
+                            pass
+                        break
+        
+        # Valores padrão para campos obrigatórios
+        default_fields = ["media_gols", "xg", "over_25", "over_15", "btts", "escanteios"]
+        for field in default_fields:
+            if field not in estat["casa"]:
+                estat["casa"][field] = 0.0
+            if field not in estat["fora"]:
+                estat["fora"][field] = 0.0
+        
         return estat
 
     async def close(self):
         if self.client:
             await self.client.aclose()
 
+
+# =========================================================
+# MATCHUP ENGINE - PRÉ-LIVE
+# =========================================================
 
 class MatchupEnginePreLive:
     def calcular_matchup(self, jogo: JogoPreLive, mercado: str) -> float:
@@ -5624,6 +5678,10 @@ class MatchupEnginePreLive:
         else:
             return min(100, fora.escanteios_favor * 12 + casa.escanteios_contra * 8)
 
+
+# =========================================================
+# MARKET ENGINE - PRÉ-LIVE
+# =========================================================
 
 class MarketEnginePreLive:
     def __init__(self):
@@ -5740,6 +5798,10 @@ class MarketEnginePreLive:
         fora = jogo.estatisticas_fora.team_reliability or 80.0
         return (casa + fora) / 2
 
+
+# =========================================================
+# CANDIDATE SELECTOR - PRÉ-LIVE
+# =========================================================
 
 class CandidateSelectorPreLive:
     def __init__(self):
@@ -6061,6 +6123,9 @@ def logar_versao_inicial() -> None:
     log(" 20. JSON limitado 500")
     log(" 21. Cache robusto")
     log(" 22-25. Refatorações")
+    log(" 26. Scraper Pré-Live corrigido (buscar_jogos)")
+    log(" 27. Scraper Pré-Live corrigido (extrair_dados_jogo)")
+    log(" 28. Scraper Pré-Live corrigido (_extrair_estatisticas)")
     log(f"📊 Corte HT={CORTE_GOL_HT}% | Corte FT={CORTE_GOL_FT}%")
     log(f"📡 Canais: grátis={FREE_CHANNEL} | completo={COMPLETE_CHANNEL}")
     log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
@@ -6127,7 +6192,7 @@ async def main() -> None:
             log("📩 /prelive RECEBIDO (CHAT PRIVADO)")
             await varrer_site_theoborges_prelive()
 
-    # Versão original do varrer_site_theoborges (mantida inalterada)
+    # Versão original do varrer_site_theoborges (mantida inalterada para compatibilidade)
     async def varrer_site_theoborges():
         log("🚀 INICIANDO VARREdura DO SITE THEOBORGES (COMANDO MANUAL)")
 
