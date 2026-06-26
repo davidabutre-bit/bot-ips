@@ -43,6 +43,8 @@ MUDANÇAS IMPLEMENTADAS (VERSÃO ATUALIZADA):
 26. Scraper Pré-Live com navegação por abas
 27. Extração de dados de todas as abas
 28. Sistema Pré-Live V1 com Matchup Engine, DNA ARCE, DNA CHAMA e Score Final
+29. Mapeamento de campos entre scraper e scorer
+30. Correção na extração de odds com múltiplos seletores
 ================================================================================
 """
 
@@ -5277,8 +5279,7 @@ PESO_CONTEXTO = float(os.getenv("PESO_CONTEXTO", "0.15"))
 class EstatisticasTimePreLive:
     nome: str = ""
     gols_marcados: float = 0.0
-    gols_sofridos: float = 0.0
-    xg: float = 0.0
+    gols_sofridos: float = 0.0    xg: float = 0.0
     xga: float = 0.0
     finalizacoes: float = 0.0
     finalizacoes_sofridas: float = 0.0
@@ -5373,6 +5374,153 @@ class MultiplePreLive:
     descricao: str = ""
     num_ancoras: int = 0
     num_complementares: int = 0
+
+
+# =========================================================
+# FUNÇÃO DE MAPEAMENTO DE ESTATÍSTICAS
+# =========================================================
+
+def _mapear_estatisticas_prelive(estat: dict) -> dict:
+    """Normaliza e mapeia os campos extraídos para os nomes esperados pelo PreLiveScorer."""
+    normalizado = {}
+    
+    # Mapeamento completo dos campos do scraper para o scorer
+    mapeamento = {
+        # Gols
+        "gols_marcados": "gols_marcados",
+        "gols_sofridos": "gols_sofridos",
+        "xg": "xg",
+        "xga": "xga",
+        "finalizacoes": "finalizacoes",
+        "finalizacoes_alvo": "finalizacoes_alvo",
+        "finalizacoes_por_gol": "finalizacoes_por_gol",
+        "finalizacoes_sofridas": "finalizacoes_sofridas",
+        "escanteios_favor": "escanteios_favor",
+        "escanteios_contra": "escanteios_contra",
+        "escanteios_total": "escanteios_total",
+        "mais_escanteios": "mais_escanteios",
+        # Over/Under
+        "over_05": "over_05_ht",
+        "over_15": "over_15_ft",
+        "over_25": "over_25_ft",
+        "over_35": "over_35_ft",
+        "over_45": "over_45_ft",
+        "over_55": "over_55_ft",
+        "over_05_ht": "over_05_ht",
+        "over_15_ht": "over_15_ht",
+        "over_25_ht": "over_25_ht",
+        "over_05_2t": "over_05_2t",
+        "over_15_2t": "over_15_2t",
+        "over_25_2t": "over_25_2t",
+        "under_05": "under_05",
+        "under_15": "under_15",
+        "under_25": "under_25",
+        "under_35": "under_35",
+        "under_45": "under_45",
+        "under_55": "under_55",
+        # Escanteios específicos
+        "escanteios_25": "escanteios_25",
+        "escanteios_35": "escanteios_35",
+        "escanteios_45": "escanteios_45",
+        "escanteios_55": "escanteios_55",
+        "escanteios_65": "escanteios_65",
+        "escanteios_75": "escanteios_75",
+        "escanteios_85": "escanteios_85",
+        "escanteios_95": "escanteios_95",
+        "escanteios_105": "escanteios_105",
+        # BTTS
+        "btts": "btts",
+        "ambas_marcam": "btts",
+        # Posse
+        "posse": "posse",
+        "posse_de_bola": "posse",
+        # Desempenho
+        "vitorias": "vitorias",
+        "derrotas": "derrotas",
+        "marcou_primeiro": "marcou_primeiro",
+        "nao_sofreu": "nao_sofreu",
+        "falhou_marcar": "falhou_marcar",
+        "sofreu_primeiro": "sofreu_primeiro",
+        "sem_gols": "sem_gols",
+        "ampliou_placar": "ampliou_placar",
+        "sofreu_empate": "sofreu_empate",
+        "venceu_apos_abrir": "venceu_apos_abrir",
+        "empatou_apos_abrir": "empatou_apos_abrir",
+        "perdeu_apos_abrir": "perdeu_apos_abrir",
+        "buscou_empate": "buscou_empate",
+        "sofreu_novamente": "sofreu_novamente",
+        "virou_venceu": "virou_venceu",
+        "empatou_apos_sair_atras": "empatou_apos_sair_atras",
+        "perdeu_apos_sair_atras": "perdeu_apos_sair_atras",
+        # Gols por período
+        "gols_ht": "gols_ht",
+        "gols_ft": "gols_ft",
+        "sofre_ht": "sofre_ht",
+        "sofre_ft": "sofre_ft",
+        "media_gols": "media_gols",
+        "media_gols_sofridos": "media_gols_sofridos",
+        "media_total_gols": "media_total_gols",
+        "media_gols_marcados": "media_gols",
+        # Período específico
+        "over_05_ht_casa": "over_05_ht_casa",
+        "over_05_ht_fora": "over_05_ht_fora",
+        "over_15_ft_casa": "over_15_ft_casa",
+        "over_15_ft_fora": "over_15_ft_fora",
+        "over_25_ft_casa": "over_25_ft_casa",
+        "over_25_ft_fora": "over_25_ft_fora",
+        "btts_casa": "btts_casa",
+        "btts_fora": "btts_fora",
+        "escanteios_favor_casa": "escanteios_favor_casa",
+        "escanteios_favor_fora": "escanteios_favor_fora",
+        "escanteios_contra_casa": "escanteios_contra_casa",
+        "escanteios_contra_fora": "escanteios_contra_fora",
+        "vitorias_casa": "vitorias_casa",
+        "vitorias_fora": "vitorias_fora",
+        # Cartões
+        "cartoes_recebidos": "cartoes_recebidos",
+        "cartoes_adversarios": "cartoes_adversarios",
+        "cartoes_total": "cartoes_total",
+        "cartoes_05": "cartoes_05",
+        "cartoes_15": "cartoes_15",
+        "cartoes_25": "cartoes_25",
+        "cartoes_35": "cartoes_35",
+        "cartoes_45": "cartoes_45",
+        "cartoes_55": "cartoes_55",
+        "cartoes_65": "cartoes_65",
+        # Outros
+        "total_jogos": "total_jogos",
+        "ppj": "ppj",
+        "posicao": "posicao",
+    }
+    
+    for key, value in estat.items():
+        if key in mapeamento:
+            normalizado[mapeamento[key]] = value
+        else:
+            normalizado[key] = value
+    
+    # Garantir que todos os campos obrigatórios existam
+    campos_obrigatorios = [
+        "gols_marcados", "gols_sofridos", "xg", "xga",
+        "over_05_ht", "over_15_ft", "over_25_ft",
+        "btts", "posse", "vitorias", "derrotas",
+        "marcou_primeiro", "nao_sofreu", "falhou_marcar",
+        "finalizacoes", "escanteios_favor", "escanteios_contra",
+        "gols_ht", "gols_ft", "sofre_ht", "sofre_ft",
+        "over_05_ht_casa", "over_05_ht_fora",
+        "over_15_ft_casa", "over_15_ft_fora",
+        "over_25_ft_casa", "over_25_ft_fora",
+        "btts_casa", "btts_fora",
+        "escanteios_favor_casa", "escanteios_favor_fora",
+        "escanteios_contra_casa", "escanteios_contra_fora",
+        "vitorias_casa", "vitorias_fora",
+    ]
+    
+    for campo in campos_obrigatorios:
+        if campo not in normalizado:
+            normalizado[campo] = 0.0
+    
+    return normalizado
 
 
 # =========================================================
@@ -5814,8 +5962,7 @@ class MultipleBuilderPreLiveV1:
         elif total == 6:
             num_ancoras = 3
             num_complementares = 3
-        else:  # 5 jogos
-            num_ancoras = 2
+        else:  # 5 jogos            num_ancoras = 2
             num_complementares = 3
 
         ancoras = jogos_aprovados[:num_ancoras]
@@ -6052,117 +6199,6 @@ class TeoBorgesScraperPreLive:
             log(f"❌ Erro ao buscar jogos: {type(e).__name__}: {e}")
             return []
 
-    # =========================================================
-    # MAPEAMENTO DE CAMPOS PARA O SCORER
-    # =========================================================
-    
-    def _mapear_estatisticas_prelive(self, estat: dict) -> dict:
-        """Normaliza e mapeia os campos extraídos para os nomes esperados pelo PreLiveScorer."""
-        normalizado = {}
-        
-        # Mapeamento completo dos campos do scraper para o scorer
-        mapeamento = {
-            # Gols
-            "gols_marcados": "gols_marcados",
-            "gols_sofridos": "gols_sofridos",
-            "xg": "xg",
-            "xga": "xga",
-            "finalizacoes": "finalizacoes",
-            "finalizacoes_alvo": "finalizacoes_alvo",
-            "finalizacoes_sofridas": "finalizacoes_sofridas",
-            "escanteios_favor": "escanteios_favor",
-            "escanteios_contra": "escanteios_contra",
-            "escanteios_total": "escanteios_total",
-            # Over/Under
-            "over_05": "over_05_ht",
-            "over_15": "over_15_ft",
-            "over_25": "over_25_ft",
-            "over_35": "over_35_ft",
-            "over_45": "over_45_ft",
-            "over_55": "over_55_ft",
-            "over_05_ht": "over_05_ht",
-            "over_15_ht": "over_15_ht",
-            "over_25_ht": "over_25_ht",
-            "over_05_2t": "over_05_2t",
-            "over_15_2t": "over_15_2t",
-            "over_25_2t": "over_25_2t",
-            "under_05": "under_05",
-            "under_15": "under_15",
-            "under_25": "under_25",
-            "under_35": "under_35",
-            "under_45": "under_45",
-            "under_55": "under_55",
-            # BTTS
-            "btts": "btts",
-            "ambas_marcam": "btts",
-            # Posse
-            "posse": "posse",
-            "posse_de_bola": "posse",
-            # Desempenho
-            "vitorias": "vitorias",
-            "derrotas": "derrotas",
-            "marcou_primeiro": "marcou_primeiro",
-            "nao_sofreu": "nao_sofreu",
-            "falhou_marcar": "falhou_marcar",
-            "sofreu_primeiro": "sofreu_primeiro",
-            # Gols por período
-            "gols_ht": "gols_ht",
-            "gols_ft": "gols_ft",
-            "sofre_ht": "sofre_ht",
-            "sofre_ft": "sofre_ft",
-            "media_gols": "media_gols",
-            "media_gols_sofridos": "media_gols_sofridos",
-            "media_total_gols": "media_total_gols",
-            # Período específico
-            "over_05_ht_casa": "over_05_ht_casa",
-            "over_05_ht_fora": "over_05_ht_fora",
-            "over_15_ft_casa": "over_15_ft_casa",
-            "over_15_ft_fora": "over_15_ft_fora",
-            "over_25_ft_casa": "over_25_ft_casa",
-            "over_25_ft_fora": "over_25_ft_fora",
-            "btts_casa": "btts_casa",
-            "btts_fora": "btts_fora",
-            "escanteios_favor_casa": "escanteios_favor_casa",
-            "escanteios_favor_fora": "escanteios_favor_fora",
-            "escanteios_contra_casa": "escanteios_contra_casa",
-            "escanteios_contra_fora": "escanteios_contra_fora",
-            "vitorias_casa": "vitorias_casa",
-            "vitorias_fora": "vitorias_fora",
-            # Cartões
-            "cartoes_recebidos": "cartoes_recebidos",
-            "cartoes_adversarios": "cartoes_adversarios",
-            "cartoes_total": "cartoes_total",
-        }
-        
-        for key, value in estat.items():
-            if key in mapeamento:
-                normalizado[mapeamento[key]] = value
-            else:
-                normalizado[key] = value
-        
-        # Garantir que todos os campos obrigatórios existam
-        campos_obrigatorios = [
-            "gols_marcados", "gols_sofridos", "xg", "xga",
-            "over_05_ht", "over_15_ft", "over_25_ft",
-            "btts", "posse", "vitorias", "derrotas",
-            "marcou_primeiro", "nao_sofreu", "falhou_marcar",
-            "finalizacoes", "escanteios_favor", "escanteios_contra",
-            "gols_ht", "gols_ft", "sofre_ht", "sofre_ft",
-            "over_05_ht_casa", "over_05_ht_fora",
-            "over_15_ft_casa", "over_15_ft_fora",
-            "over_25_ft_casa", "over_25_ft_fora",
-            "btts_casa", "btts_fora",
-            "escanteios_favor_casa", "escanteios_favor_fora",
-            "escanteios_contra_casa", "escanteios_contra_fora",
-            "vitorias_casa", "vitorias_fora",
-        ]
-        
-        for campo in campos_obrigatorios:
-            if campo not in normalizado:
-                normalizado[campo] = 0.0
-        
-        return normalizado
-
     async def extrair_dados_jogo(self, url: str) -> Optional[Dict]:
         """Extrai dados de todas as abas do jogo."""
         await asyncio.sleep(random.uniform(2.0, 4.0))
@@ -6236,7 +6272,7 @@ class TeoBorgesScraperPreLive:
                         for lado in ["casa", "fora"]:
                             if lado in estat and estat[lado]:
                                 # Aplica o mapeamento para converter os nomes dos campos
-                                estat_mapeada = self._mapear_estatisticas_prelive(estat[lado])
+                                estat_mapeada = _mapear_estatisticas_prelive(estat[lado])
                                 for key, value in estat_mapeada.items():
                                     if value is not None and value != 0:
                                         dados_completos["estatisticas"][lado][key] = value
@@ -6253,7 +6289,7 @@ class TeoBorgesScraperPreLive:
                         log(f"⚠️ Erro ao extrair aba {aba['id']}: {e}")
                         continue
 
-                # Extrai odds da página base também
+                # Extrai odds da página base também - usando o método melhorado
                 odds_base = self._extrair_odds_soup(soup_base)
                 for mercado, odds_val in odds_base.items():
                     if mercado not in dados_completos["odds"]:
@@ -6664,20 +6700,57 @@ class TeoBorgesScraperPreLive:
         return dados
 
     def _extrair_odds_soup(self, soup: BeautifulSoup) -> Dict:
-        """Extrai odds do soup."""
+        """Extrai odds do soup com múltiplos seletores."""
         odds = {}
 
-        odd_elements = soup.select(".pg-odd, .odds, .pg-odds")
-        for elem in odd_elements:
-            text = elem.text.strip()
-            if "x" in text:
-                parts = text.split("x")
-                if len(parts) >= 2:
+        # Tenta diferentes seletores para odds
+        seletores = [
+            ".pg-odd",
+            ".odds",
+            ".pg-odds",
+            ".card-match-odds",
+            ".match-odds",
+            ".game-odds",
+            ".event-odds",
+            "div[class*='odd']",
+            "span[class*='odd']",
+        ]
+
+        for seletor in seletores:
+            elements = soup.select(seletor)
+            for elem in elements:
+                text = elem.text.strip()
+                # Procura padrão de odds: "1.85 x 3.40 x 4.20" ou similar
+                if "x" in text:
+                    parts = text.split("x")
+                    if len(parts) >= 2:
+                        try:
+                            # Limpa e converte
+                            odd_casa = float(parts[0].strip().replace(",", "."))
+                            odd_empate = float(parts[1].strip().replace(",", "."))
+                            odd_fora = 0.0
+                            if len(parts) >= 3:
+                                odd_fora = float(parts[2].strip().replace(",", "."))
+                            if odd_casa > 0 and odd_fora > 0:
+                                odds["1X2"] = {"casa": odd_casa, "empate": odd_empate, "fora": odd_fora}
+                                return odds
+                        except:
+                            pass
+
+        # Tenta encontrar odds em elementos individuais
+        odd_elements = soup.select(".pg-tstable-row:contains('Odd')")
+        for row in odd_elements:
+            label_elem = row.select_one(".pg-tstable-label")
+            if label_elem and "odd" in label_elem.text.lower():
+                valores = row.select(".pgcv")
+                if len(valores) >= 3:
                     try:
-                        odd_casa = float(parts[0].strip().replace(",", "."))
-                        odd_empate = float(parts[1].strip().replace(",", "."))
-                        odd_fora = float(parts[2].strip().replace(",", ".")) if len(parts) >= 3 else 0
-                        odds["1X2"] = {"casa": odd_casa, "empate": odd_empate, "fora": odd_fora}
+                        odd_casa = float(valores[0].text.strip().replace(",", "."))
+                        odd_empate = float(valores[1].text.strip().replace(",", "."))
+                        odd_fora = float(valores[2].text.strip().replace(",", "."))
+                        if odd_casa > 0 and odd_fora > 0:
+                            odds["1X2"] = {"casa": odd_casa, "empate": odd_empate, "fora": odd_fora}
+                            return odds
                     except:
                         pass
 
@@ -6734,10 +6807,10 @@ async def varrer_site_theoborges_prelive() -> None:
                 log(f"⏭️ Jogo {dados['time_casa']} x {dados['time_fora']} descartado: odd favorito {odd_favorito} > {ODD_MAXIMA_FAVORITO_PRELIVE}")
                 continue
 
-            # Verifica se tem dados suficientes
+            # Pega os dados mapeados
             estat_casa = dados["estatisticas"].get("casa", {})
             estat_fora = dados["estatisticas"].get("fora", {})
-            
+
             # Log para debug
             log(f"📊 Estatísticas Casa: {list(estat_casa.keys())}")
             log(f"📊 Estatísticas Fora: {list(estat_fora.keys())}")
@@ -6747,6 +6820,7 @@ async def varrer_site_theoborges_prelive() -> None:
                 log(f"⚠️ Jogo {dados['time_casa']} x {dados['time_fora']} sem estatísticas")
                 continue
 
+            # Cria os objetos com os campos mapeados
             estat_casa_obj = EstatisticasTimePreLive(
                 nome=dados["time_casa"],
                 gols_marcados=estat_casa.get("gols_marcados", 0),
@@ -6772,7 +6846,6 @@ async def varrer_site_theoborges_prelive() -> None:
                 posse=estat_casa.get("posse", 0),
                 team_reliability=80.0,
                 forma=0,
-                # Dados por período
                 over_05_ht_casa=estat_casa.get("over_05_ht_casa", 0),
                 over_05_ht_fora=estat_casa.get("over_05_ht_fora", 0),
                 over_15_ft_casa=estat_casa.get("over_15_ft_casa", 0),
@@ -6814,7 +6887,6 @@ async def varrer_site_theoborges_prelive() -> None:
                 posse=estat_fora.get("posse", 0),
                 team_reliability=80.0,
                 forma=0,
-                # Dados por período
                 over_05_ht_casa=estat_fora.get("over_05_ht_casa", 0),
                 over_05_ht_fora=estat_fora.get("over_05_ht_fora", 0),
                 over_15_ft_casa=estat_fora.get("over_15_ft_casa", 0),
@@ -6971,6 +7043,7 @@ def logar_versao_inicial() -> None:
     log(" 27. Extração de dados de todas as abas")
     log(" 28. Sistema Pré-Live V1 com Matchup Engine, DNA ARCE e DNA CHAMA")
     log(" 29. Mapeamento de campos entre scraper e scorer")
+    log(" 30. Correção na extração de odds com múltiplos seletores")
     log(f"📊 Corte HT={CORTE_GOL_HT}% | Corte FT={CORTE_GOL_FT}%")
     log(f"📡 Canais: grátis={FREE_CHANNEL} | completo={COMPLETE_CHANNEL}")
     log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
