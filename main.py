@@ -1655,10 +1655,7 @@ def pressao_viva_lado(m: Metricas, lado: str) -> bool:
 def pressao_morta_lado(m: Metricas, lado: str) -> bool:
     d = dados_lado(m, lado)
     ip = ip_lado(m, lado)
-    return d["u5"] <= 1 and d["u10"] <= 3 and ip["pico"] < 18 and ip["c18"] == 0
-
-
-def xg_baixo_compensado_por_rb(m: Metricas, lado: str) -> bool:
+    return d["u5"] <= 1 and d["u10"] <= 3 and ip["pico"] < 18 and ip["c18"] == 0def xg_baixo_compensado_por_rb(m: Metricas, lado: str) -> bool:
     """HT-1 fica fora do V12 definitivo.
 
     Mantemos a função apenas para compatibilidade interna, mas ela não altera
@@ -5731,16 +5728,834 @@ async def watchdog() -> None:
         await asyncio.sleep(WATCHDOG_SEGUNDOS)
 
 
+# =========================================================
+# SISTEMA PRÉ-LIVE ALFA PRE-LIVE V1
+# =========================================================
+# ADICIONADO EM 26/06/2026 - NÃO ALTERA NADA DO SISTEMA AO VIVO
+# =========================================================
+
+# Variáveis para o Pré-Live
+TEOLOGIN_EMAIL = os.getenv("TEOLOGIN_EMAIL", "")
+TEOLOGIN_SENHA = os.getenv("TEOLOGIN_SENHA", "")
+SCORE_MINIMO_APROVACAO = 85
+MEDIA_MINIMA_DIA = 85
+QTD_MINIMA_JOGOS = 5
+QTD_MAXIMA_COMPLEMENTARES = 3
+
+
+# Dataclasses do Pré-Live
+@dataclass
+class EstatisticasTimePreLive:
+    nome: str = ""
+    gols_marcados: float = 0.0
+    gols_sofridos: float = 0.0
+    xg: float = 0.0
+    xga: float = 0.0
+    finalizacoes: float = 0.0
+    finalizacoes_sofridas: float = 0.0
+    escanteios_favor: float = 0.0
+    escanteios_contra: float = 0.0
+    over_05_ht: float = 0.0
+    over_15_ft: float = 0.0
+    over_25_ft: float = 0.0
+    btts: float = 0.0
+    vitorias: float = 0.0
+    derrotas: float = 0.0
+    gols_ht: float = 0.0
+    gols_ft: float = 0.0
+    sofre_ht: float = 0.0
+    sofre_ft: float = 0.0
+    forma: float = 0.0
+    posicao: int = 0
+    league_reliability: float = 80.0
+    team_reliability: float = 80.0
+
+
+@dataclass
+class JogoPreLive:
+    time_casa: str = ""
+    time_fora: str = ""
+    liga: str = ""
+    data: str = ""
+    horario: str = ""
+    estatisticas_casa: EstatisticasTimePreLive = field(default_factory=EstatisticasTimePreLive)
+    estatisticas_fora: EstatisticasTimePreLive = field(default_factory=EstatisticasTimePreLive)
+    odds: Dict[str, Any] = field(default_factory=dict)
+    url: str = ""
+
+
+@dataclass
+class MercadoPreLive:
+    nome: str = ""
+    jogo: JogoPreLive = field(default_factory=JogoPreLive)
+    score: float = 0.0
+    matchup_score: float = 0.0
+    arce_score: float = 0.0
+    chama_score: float = 0.0
+    consistencia_score: float = 0.0
+    league_score: float = 0.0
+    team_score: float = 0.0
+    detalhes: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class MultiplePreLive:
+    nome: str = ""
+    mercados: List[MercadoPreLive] = field(default_factory=list)
+    score_medio: float = 0.0
+    descricao: str = ""
+
+
+# =========================================================
+# SCRAPER COM LOGIN AUTOMÁTICO - PRÉ-LIVE
+# =========================================================
+
+class TeoBorgesScraperPreLive:
+    def __init__(self):
+        self.session = None
+        self.logado = False
+        self.headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+            "Sec-Fetch-User": "?1",
+            "Cache-Control": "max-age=0",
+        }
+        self.client = None
+
+    async def login(self) -> bool:
+        if not TEOLOGIN_EMAIL or not TEOLOGIN_SENHA:
+            log("❌ TEOLOGIN_EMAIL ou TEOLOGIN_SENHA não configurados!")
+            return False
+
+        log(f"🔑 Tentando login no clube.theoborges.com como {TEOLOGIN_EMAIL}")
+
+        try:
+            self.client = httpx.AsyncClient(
+                headers=self.headers,
+                follow_redirects=True,
+                timeout=30.0
+            )
+
+            resp = await self.client.get("https://clube.theoborges.com/login")
+            if resp.status_code != 200:
+                log(f"❌ Erro ao acessar login: {resp.status_code}")
+                return False
+
+            soup = BeautifulSoup(resp.text, "html.parser")
+            csrf_token = None
+            csrf_input = soup.select_one("input[name='_token']")
+            if csrf_input:
+                csrf_token = csrf_input.get("value")
+                log("🔑 Token CSRF encontrado")
+
+            login_data = {
+                "email": TEOLOGIN_EMAIL,
+                "password": TEOLOGIN_SENHA,
+            }
+            if csrf_token:
+                login_data["_token"] = csrf_token
+
+            resp = await self.client.post(
+                "https://clube.theoborges.com/login",
+                data=login_data,
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Referer": "https://clube.theoborges.com/login",
+                }
+            )
+
+            if "login" in str(resp.url).lower() and "dashboard" not in str(resp.url).lower() and "matches" not in str(resp.url).lower():
+                log("❌ Login falhou! Verifique email e senha.")
+                with open("erro_login.html", "w", encoding="utf-8") as f:
+                    f.write(resp.text)
+                log("📄 HTML do login salvo em 'erro_login.html'")
+                return False
+
+            log(f"✅ Login realizado com sucesso! URL atual: {resp.url}")
+            self.logado = True
+            return True
+
+        except Exception as e:
+            log(f"❌ Erro no login: {type(e).__name__}: {e}")
+            return False
+
+    async def buscar_jogos(self, dia: str = "hoje") -> List[str]:
+        if not self.logado:
+            log("❌ Não está logado!")
+            return []
+
+        try:
+            url = f"https://clube.theoborges.com/matches?dia={dia}"
+            log(f"🔄 Buscando jogos para: {dia}")
+
+            resp = await self.client.get(url)
+            if resp.status_code != 200:
+                log(f"⚠️ Erro ao buscar jogos: {resp.status_code}")
+                return []
+
+            soup = BeautifulSoup(resp.text, "html.parser")
+            links = []
+
+            for link in soup.select(".match-row"):
+                href = link.get("href")
+                if href and "/game/" in href:
+                    links.append(f"https://clube.theoborges.com{href}")
+
+            if not links:
+                for link in soup.select("a[href*='/game/']"):
+                    href = link.get("href")
+                    if href:
+                        links.append(f"https://clube.theoborges.com{href}")
+
+            if not links:
+                for link in soup.find_all("a", href=True):
+                    href = link.get("href")
+                    if href and "/game/" in href:
+                        links.append(f"https://clube.theoborges.com{href}")
+
+            log(f"📊 Encontrados {len(links)} links de jogos para {dia}")
+            return list(set(links))
+
+        except Exception as e:
+            log(f"❌ Erro ao buscar jogos: {type(e).__name__}: {e}")
+            return []
+
+    async def extrair_dados_jogo(self, url: str) -> Optional[Dict]:
+        try:
+            await asyncio.sleep(random.uniform(1.0, 2.5))
+
+            resp = await self.client.get(url)
+            if resp.status_code != 200:
+                return None
+
+            soup = BeautifulSoup(resp.text, "html.parser")
+
+            times = soup.select_one(".match-name")
+            if not times:
+                return None
+
+            nome_jogo = times.text.strip()
+            partes = re.split(r"\s+x\s+|\s+vs\s+", nome_jogo, maxsplit=1)
+            if len(partes) < 2:
+                return None
+
+            time_casa = partes[0].strip()
+            time_fora = partes[1].strip()
+
+            liga_elem = soup.select_one(".match-competition")
+            liga = liga_elem.text.strip() if liga_elem else "Desconhecida"
+
+            odds = {}
+            for odd_row in soup.select(".odds-row"):
+                cols = odd_row.select("td")
+                if len(cols) >= 3:
+                    mercado = cols[0].text.strip()
+                    odd_casa = cols[1].text.strip()
+                    odd_fora = cols[2].text.strip()
+                    odds[mercado] = {
+                        "casa": float(odd_casa.replace(",", ".")) if odd_casa else 0,
+                        "fora": float(odd_fora.replace(",", ".")) if odd_fora else 0,
+                    }
+
+            estatisticas = self._extrair_estatisticas(soup, time_casa, time_fora)
+
+            return {
+                "time_casa": time_casa,
+                "time_fora": time_fora,
+                "liga": liga,
+                "url": url,
+                "odds": odds,
+                "estatisticas": estatisticas,
+                "nome_jogo": nome_jogo,
+            }
+
+        except Exception as e:
+            log(f"⚠️ Erro ao extrair dados: {type(e).__name__}")
+            return None
+
+    def _extrair_estatisticas(self, soup: BeautifulSoup, time_casa: str, time_fora: str) -> Dict:
+        estat = {"casa": {}, "fora": {}}
+
+        for row in soup.select(".stats-row, .pg-tstable-row"):
+            cols = row.select("td, .pg-tstable-cell")
+            if len(cols) >= 3:
+                label = cols[0].text.strip().lower()
+                val_casa = cols[1].text.strip()
+                val_fora = cols[2].text.strip()
+
+                if "media" in label and "gols" in label:
+                    try:
+                        estat["casa"]["media_gols"] = float(val_casa.replace(",", "."))
+                        estat["fora"]["media_gols"] = float(val_fora.replace(",", "."))
+                    except:
+                        pass
+
+                if "xg" in label and "casa" in label.lower():
+                    try:
+                        estat["casa"]["xg"] = float(val_casa.replace(",", "."))
+                        estat["fora"]["xg"] = float(val_fora.replace(",", "."))
+                    except:
+                        pass
+
+                if "over 2.5" in label:
+                    try:
+                        estat["casa"]["over_25"] = float(val_casa.replace("%", "").strip())
+                        estat["fora"]["over_25"] = float(val_fora.replace("%", "").strip())
+                    except:
+                        pass
+
+                if "over 1.5" in label:
+                    try:
+                        estat["casa"]["over_15"] = float(val_casa.replace("%", "").strip())
+                        estat["fora"]["over_15"] = float(val_fora.replace("%", "").strip())
+                    except:
+                        pass
+
+                if "btts" in label or "ambos" in label:
+                    try:
+                        estat["casa"]["btts"] = float(val_casa.replace("%", "").strip())
+                        estat["fora"]["btts"] = float(val_fora.replace("%", "").strip())
+                    except:
+                        pass
+
+                if "escanteios" in label:
+                    try:
+                        estat["casa"]["escanteios"] = float(val_casa.replace(",", "."))
+                        estat["fora"]["escanteios"] = float(val_fora.replace(",", "."))
+                    except:
+                        pass
+
+                if "sofre" in label or "gols contra" in label:
+                    try:
+                        estat["casa"]["gols_sofridos"] = float(val_casa.replace(",", "."))
+                        estat["fora"]["gols_sofridos"] = float(val_fora.replace(",", "."))
+                    except:
+                        pass
+
+        return estat
+
+    async def close(self):
+        if self.client:
+            await self.client.aclose()
+
+
+# =========================================================
+# MATCHUP ENGINE - PRÉ-LIVE
+# =========================================================
+
+class MatchupEnginePreLive:
+    def calcular_matchup(self, jogo: JogoPreLive, mercado: str) -> float:
+        casa = jogo.estatisticas_casa
+        fora = jogo.estatisticas_fora
+
+        if mercado == "Vitoria_Casa":
+            return self._matchup_vitoria_casa(casa, fora)
+        elif mercado == "Vitoria_Fora":
+            return self._matchup_vitoria_fora(casa, fora)
+        elif mercado == "Over_05_HT":
+            return self._matchup_over_ht(casa, fora)
+        elif mercado == "Over_15_FT":
+            return self._matchup_over_15(casa, fora)
+        elif mercado == "Over_25_FT":
+            return self._matchup_over_25(casa, fora)
+        elif mercado == "BTTS":
+            return self._matchup_btts(casa, fora)
+        elif mercado == "Escanteios_Casa":
+            return self._matchup_escanteios(casa, fora, "casa")
+        elif mercado == "Escanteios_Fora":
+            return self._matchup_escanteios(casa, fora, "fora")
+        else:
+            return 50.0
+
+    def _matchup_vitoria_casa(self, casa: EstatisticasTimePreLive, fora: EstatisticasTimePreLive) -> float:
+        ataque_casa = casa.gols_marcados * 0.4 + casa.xg * 0.3 + casa.vitorias * 0.3
+        defesa_fora = (100 - fora.derrotas) * 0.5 + (100 - fora.gols_sofridos * 15) * 0.5
+        return min(100, (ataque_casa * defesa_fora / 100) * 1.2)
+
+    def _matchup_vitoria_fora(self, casa: EstatisticasTimePreLive, fora: EstatisticasTimePreLive) -> float:
+        ataque_fora = fora.gols_marcados * 0.4 + fora.xg * 0.3 + fora.vitorias * 0.3
+        defesa_casa = (100 - casa.derrotas) * 0.5 + (100 - casa.gols_sofridos * 15) * 0.5
+        return min(100, (ataque_fora * defesa_casa / 100) * 1.0)
+
+    def _matchup_over_ht(self, casa: EstatisticasTimePreLive, fora: EstatisticasTimePreLive) -> float:
+        ataque_ht_casa = casa.over_05_ht * 0.5 + casa.gols_ht * 25
+        defesa_ht_fora = fora.over_05_ht * 0.3 + fora.sofre_ht * 15
+        return min(100, (ataque_ht_casa + defesa_ht_fora) * 0.6)
+
+    def _matchup_over_15(self, casa: EstatisticasTimePreLive, fora: EstatisticasTimePreLive) -> float:
+        over_casa = casa.over_15_ft * 0.5 + casa.gols_marcados * 15
+        over_fora = fora.over_15_ft * 0.5 + fora.gols_marcados * 15
+        return min(100, (over_casa + over_fora) * 0.5)
+
+    def _matchup_over_25(self, casa: EstatisticasTimePreLive, fora: EstatisticasTimePreLive) -> float:
+        over_casa = casa.over_25_ft * 0.5 + casa.gols_marcados * 15 + casa.xg * 10
+        over_fora = fora.over_25_ft * 0.5 + fora.gols_marcados * 15 + fora.xg * 10
+        return min(100, (over_casa + over_fora) * 0.4)
+
+    def _matchup_btts(self, casa: EstatisticasTimePreLive, fora: EstatisticasTimePreLive) -> float:
+        btts_casa = casa.btts * 0.3 + casa.gols_marcados * 10 + casa.gols_sofridos * 10
+        btts_fora = fora.btts * 0.3 + fora.gols_marcados * 10 + fora.gols_sofridos * 10
+        return min(100, (btts_casa + btts_fora) * 0.5)
+
+    def _matchup_escanteios(self, casa: EstatisticasTimePreLive, fora: EstatisticasTimePreLive, lado: str) -> float:
+        if lado == "casa":
+            return min(100, casa.escanteios_favor * 12 + fora.escanteios_contra * 8)
+        else:
+            return min(100, fora.escanteios_favor * 12 + casa.escanteios_contra * 8)
+
+
+# =========================================================
+# MARKET ENGINE - PRÉ-LIVE
+# =========================================================
+
+class MarketEnginePreLive:
+    def __init__(self):
+        self.matchup_engine = MatchupEnginePreLive()
+
+    def calcular_mercados(self, jogo: JogoPreLive) -> List[MercadoPreLive]:
+        mercados = []
+
+        tipos = [
+            "Vitoria_Casa",
+            "Vitoria_Fora",
+            "Over_05_HT",
+            "Over_15_FT",
+            "Over_25_FT",
+            "BTTS",
+            "Escanteios_Casa",
+            "Escanteios_Fora",
+        ]
+
+        for tipo in tipos:
+            mercado = self._calcular_mercado(jogo, tipo)
+            if mercado:
+                mercados.append(mercado)
+
+        return mercados
+
+    def _calcular_mercado(self, jogo: JogoPreLive, tipo: str) -> Optional[MercadoPreLive]:
+        casa = jogo.estatisticas_casa
+        fora = jogo.estatisticas_fora
+
+        matchup_score = self.matchup_engine.calcular_matchup(jogo, tipo)
+        arce_score = self._calcular_arce(jogo, tipo)
+        chama_score = self._calcular_chama(jogo, tipo)
+        consistencia_score = self._calcular_consistencia(jogo, tipo)
+        league_score = self._calcular_league(jogo, tipo)
+        team_score = self._calcular_team(jogo, tipo)
+
+        score_final = (
+            matchup_score * 0.25 +
+            arce_score * 0.20 +
+            chama_score * 0.20 +
+            consistencia_score * 0.15 +
+            league_score * 0.10 +
+            team_score * 0.10
+        )
+
+        score_final = max(0, min(100, score_final))
+
+        return MercadoPreLive(
+            nome=tipo,
+            jogo=jogo,
+            score=score_final,
+            matchup_score=matchup_score,
+            arce_score=arce_score,
+            chama_score=chama_score,
+            consistencia_score=consistencia_score,
+            league_score=league_score,
+            team_score=team_score,
+            detalhes={
+                "time_casa": casa.nome,
+                "time_fora": fora.nome,
+                "liga": jogo.liga,
+            }
+        )
+
+    def _calcular_arce(self, jogo: JogoPreLive, tipo: str) -> float:
+        casa = jogo.estatisticas_casa
+        fora = jogo.estatisticas_fora
+
+        if tipo == "Over_05_HT":
+            return casa.over_05_ht * 0.5 + fora.over_05_ht * 0.3 + casa.gols_ht * 10
+
+        if tipo in ["Vitoria_Casa", "Vitoria_Fora"]:
+            return casa.gols_ht * 10 + casa.over_05_ht * 0.3
+
+        return casa.gols_ht * 8 + fora.sofre_ht * 8
+
+    def _calcular_chama(self, jogo: JogoPreLive, tipo: str) -> float:
+        casa = jogo.estatisticas_casa
+        fora = jogo.estatisticas_fora
+
+        if tipo == "Over_25_FT":
+            return casa.over_25_ft * 0.5 + fora.over_25_ft * 0.5
+
+        if tipo == "BTTS":
+            return casa.btts * 0.5 + fora.btts * 0.5
+
+        return casa.gols_ft * 10 + fora.gols_ft * 10
+
+    def _calcular_consistencia(self, jogo: JogoPreLive, tipo: str) -> float:
+        casa = jogo.estatisticas_casa
+        fora = jogo.estatisticas_fora
+
+        forma = casa.forma * 5 + fora.forma * 5
+
+        variabilidade = 0
+        if casa.gols_marcados and casa.gols_sofridos:
+            variabilidade = abs(casa.gols_marcados - casa.gols_sofridos)
+
+        return min(100, forma + (100 - min(100, variabilidade * 10)))
+
+    def _calcular_league(self, jogo: JogoPreLive, tipo: str) -> float:
+        liga = jogo.liga.lower()
+        if any(x in liga for x in ["premier", "championship", "bundesliga", "serie a", "la liga"]):
+            return 95.0
+        if any(x in liga for x in ["brasileirão", "brazil", "argentina", "netherlands", "portugal"]):
+            return 85.0
+        if any(x in liga for x in ["turkey", "greece", "denmark", "sweden", "norway"]):
+            return 75.0
+        return 70.0
+
+    def _calcular_team(self, jogo: JogoPreLive, tipo: str) -> float:
+        casa = jogo.estatisticas_casa.team_reliability or 80.0
+        fora = jogo.estatisticas_fora.team_reliability or 80.0
+        return (casa + fora) / 2
+
+
+# =========================================================
+# CANDIDATE SELECTOR - PRÉ-LIVE
+# =========================================================
+
+class CandidateSelectorPreLive:
+    def __init__(self):
+        self.market_engine = MarketEnginePreLive()
+
+    def selecionar_candidatos(self, jogos: List[JogoPreLive]) -> Dict[str, Any]:
+        todos_mercados = []
+
+        for jogo in jogos:
+            mercados = self.market_engine.calcular_mercados(jogo)
+            for m in mercados:
+                todos_mercados.append(m)
+
+        melhores_por_jogo = {}
+        for m in todos_mercados:
+            chave = f"{m.jogo.time_casa} x {m.jogo.time_fora}"
+            if chave not in melhores_por_jogo or m.score > melhores_por_jogo[chave].score:
+                melhores_por_jogo[chave] = m
+
+        candidatos = sorted(melhores_por_jogo.values(), key=lambda x: x.score, reverse=True)
+
+        aprovados = [m for m in candidatos if m.score >= SCORE_MINIMO_APROVACAO]
+
+        if aprovados:
+            media = sum(m.score for m in aprovados) / len(aprovados)
+            if media < MEDIA_MINIMA_DIA:
+                log(f"⚠️ Média do dia {media:.1f} < {MEDIA_MINIMA_DIA} — nenhuma múltipla gerada")
+                return {"aprovados": [], "media": media, "total": len(candidatos)}
+
+        return {
+            "aprovados": aprovados,
+            "media": sum(m.score for m in aprovados) / len(aprovados) if aprovados else 0,
+            "total": len(candidatos),
+            "todos_mercados": todos_mercados,
+        }
+
+
+# =========================================================
+# ANCHOR SELECTOR - PRÉ-LIVE
+# =========================================================
+
+class AnchorSelectorPreLive:
+    def selecionar(self, aprovados: List[MercadoPreLive]) -> Tuple[List[MercadoPreLive], List[List[MercadoPreLive]]]:
+        if len(aprovados) < QTD_MINIMA_JOGOS:
+            return [], []
+
+        ordenados = sorted(aprovados, key=lambda x: x.score, reverse=True)
+
+        qtd_ancoras = min(4, len(ordenados))
+        ancoras = ordenados[:qtd_ancoras]
+
+        complementares = ordenados[qtd_ancoras:]
+
+        complementares_com_mercados = []
+        for comp in complementares:
+            todos_mercados = [m for m in aprovados if m.jogo == comp.jogo]
+            if todos_mercados:
+                melhores = sorted(todos_mercados, key=lambda x: x.score, reverse=True)
+                complementares_com_mercados.append(melhores[:QTD_MAXIMA_COMPLEMENTARES])
+
+        return ancoras, complementares_com_mercados
+
+
+# =========================================================
+# MULTIPLE BUILDER - PRÉ-LIVE
+# =========================================================
+
+class MultipleBuilderPreLive:
+    def construir(self, ancoras: List[MercadoPreLive], complementares: List[List[MercadoPreLive]]) -> List[MultiplePreLive]:
+        multiplas = []
+
+        if not ancoras or not complementares:
+            return multiplas
+
+        complementares_validos = [c for c in complementares if c]
+
+        if len(complementares_validos) < 1:
+            return multiplas
+
+        safe_mercados = list(ancoras) + [c[0] for c in complementares_validos if c]
+        if safe_mercados:
+            multiplas.append(MultiplePreLive(
+                nome="SAFE",
+                mercados=safe_mercados,
+                score_medio=sum(m.score for m in safe_mercados) / len(safe_mercados),
+                descricao="Mercados mais confiáveis de cada jogo"
+            ))
+
+        pro1_mercados = list(ancoras)
+        for comp in complementares_validos:
+            if len(comp) >= 2:
+                pro1_mercados.append(comp[1])
+            else:
+                pro1_mercados.append(comp[0])
+
+        if len(pro1_mercados) >= QTD_MINIMA_JOGOS:
+            multiplas.append(MultiplePreLive(
+                nome="PRO1",
+                mercados=pro1_mercados,
+                score_medio=sum(m.score for m in pro1_mercados) / len(pro1_mercados),
+                descricao="Segunda melhor combinação de mercados"
+            ))
+
+        pro2_mercados = list(ancoras)
+        for comp in complementares_validos:
+            if len(comp) >= 3:
+                pro2_mercados.append(comp[2])
+            elif len(comp) >= 2:
+                pro2_mercados.append(comp[1])
+            else:
+                pro2_mercados.append(comp[0])
+
+        if len(pro2_mercados) >= QTD_MINIMA_JOGOS:
+            multiplas.append(MultiplePreLive(
+                nome="PRO2",
+                mercados=pro2_mercados,
+                score_medio=sum(m.score for m in pro2_mercados) / len(pro2_mercados),
+                descricao="Terceira melhor combinação de mercados"
+            ))
+
+        diamond_mercados = list(ancoras)
+        for i, comp in enumerate(complementares_validos):
+            if len(comp) >= 3 and i % 3 == 0:
+                diamond_mercados.append(comp[2])
+            elif len(comp) >= 2 and i % 2 == 0:
+                diamond_mercados.append(comp[1])
+            else:
+                diamond_mercados.append(comp[0])
+
+        if len(diamond_mercados) >= QTD_MINIMA_JOGOS:
+            multiplas.append(MultiplePreLive(
+                nome="DIAMOND",
+                mercados=diamond_mercados,
+                score_medio=sum(m.score for m in diamond_mercados) / len(diamond_mercados),
+                descricao="Combinação diversificada para maior retorno"
+            ))
+
+        return multiplas
+
+
+# =========================================================
+# FORMATADOR DE MENSAGEM - PRÉ-LIVE
+# =========================================================
+
+def formatar_multipla_prelive(multiple: MultiplePreLive) -> str:
+    linhas = [
+        f"📊 **{multiple.nome}**",
+        f"📈 Média: **{multiple.score_medio:.1f}%**",
+        f"📝 {multiple.descricao}",
+        "",
+        "---",
+        ""
+    ]
+
+    for i, m in enumerate(multiple.mercados, 1):
+        nome_mercado = m.nome.replace("_", " ")
+
+        linhas.append(
+            f"{i}. **{m.jogo.time_casa} x {m.jogo.time_fora}**\n"
+            f"   🎯 {nome_mercado} | Score: {m.score:.1f}%"
+        )
+
+    linhas.extend([
+        "",
+        "---",
+        f"✅ Total: {len(multiple.mercados)} jogos",
+        f"🏆 Liga: {multiple.mercados[0].jogo.liga if multiple.mercados else 'N/A'}",
+        "",
+        "📝 SIGA SUA GESTÃO DE BANCA",
+        "⛔ APOSTE COM RESPONSABILIDADE",
+    ])
+
+    return "\n".join(linhas)
+
+
+# =========================================================
+# COMANDO /PRElive - VARREDURA PRÉ-LIVE
+# =========================================================
+
+async def varrer_site_theoborges_prelive() -> None:
+    """Versão Pré-Live do varrer_site_theoborges - com login automático e Market Engine"""
+    log("🚀 INICIANDO VARREdura PRÉ-LIVE DO SITE THEOBORGES (COMANDO /prelive)")
+
+    scraper = TeoBorgesScraperPreLive()
+
+    if not await scraper.login():
+        log("❌ Falha no login. Encerrando.")
+        await client.send_message("me", "❌ Falha no login no clube.theoborges.com. Verifique TEOLOGIN_EMAIL e TEOLOGIN_SENHA.")
+        return
+
+    todos_links = []
+    for dia in ["hoje", "amanha"]:
+        links = await scraper.buscar_jogos(dia)
+        todos_links.extend(links)
+
+    if not todos_links:
+        log("❌ Nenhum jogo encontrado.")
+        await client.send_message("me", "❌ Nenhum jogo encontrado para hoje ou amanhã.")
+        await scraper.close()
+        return
+
+    log(f"📊 Total de {len(todos_links)} jogos encontrados")
+
+    jogos = []
+    for url in todos_links[:30]:
+        dados = await scraper.extrair_dados_jogo(url)
+        if dados:
+            estat_casa = EstatisticasTimePreLive(
+                nome=dados["time_casa"],
+                gols_marcados=dados["estatisticas"].get("casa", {}).get("media_gols", 0),
+                gols_sofridos=dados["estatisticas"].get("casa", {}).get("gols_sofridos", 0),
+                xg=dados["estatisticas"].get("casa", {}).get("xg", 0),
+                over_05_ht=dados["estatisticas"].get("casa", {}).get("over_05_ht", 0),
+                over_15_ft=dados["estatisticas"].get("casa", {}).get("over_15", 0),
+                over_25_ft=dados["estatisticas"].get("casa", {}).get("over_25", 0),
+                btts=dados["estatisticas"].get("casa", {}).get("btts", 0),
+                escanteios_favor=dados["estatisticas"].get("casa", {}).get("escanteios", 0),
+                gols_ht=dados["estatisticas"].get("casa", {}).get("gols_ht", 0),
+                gols_ft=dados["estatisticas"].get("casa", {}).get("gols_ft", 0),
+                sofre_ht=dados["estatisticas"].get("casa", {}).get("sofre_ht", 0),
+                sofre_ft=dados["estatisticas"].get("casa", {}).get("sofre_ft", 0),
+                team_reliability=80.0,
+                forma=0,
+            )
+
+            estat_fora = EstatisticasTimePreLive(
+                nome=dados["time_fora"],
+                gols_marcados=dados["estatisticas"].get("fora", {}).get("media_gols", 0),
+                gols_sofridos=dados["estatisticas"].get("fora", {}).get("gols_sofridos", 0),
+                xg=dados["estatisticas"].get("fora", {}).get("xg", 0),
+                over_05_ht=dados["estatisticas"].get("fora", {}).get("over_05_ht", 0),
+                over_15_ft=dados["estatisticas"].get("fora", {}).get("over_15", 0),
+                over_25_ft=dados["estatisticas"].get("fora", {}).get("over_25", 0),
+                btts=dados["estatisticas"].get("fora", {}).get("btts", 0),
+                escanteios_favor=dados["estatisticas"].get("fora", {}).get("escanteios", 0),
+                gols_ht=dados["estatisticas"].get("fora", {}).get("gols_ht", 0),
+                gols_ft=dados["estatisticas"].get("fora", {}).get("gols_ft", 0),
+                sofre_ht=dados["estatisticas"].get("fora", {}).get("sofre_ht", 0),
+                sofre_ft=dados["estatisticas"].get("fora", {}).get("sofre_ft", 0),
+                team_reliability=80.0,
+                forma=0,
+            )
+
+            jogo = JogoPreLive(
+                time_casa=dados["time_casa"],
+                time_fora=dados["time_fora"],
+                liga=dados["liga"],
+                data="",
+                horario="",
+                estatisticas_casa=estat_casa,
+                estatisticas_fora=estat_fora,
+                odds=dados.get("odds", {}),
+                url=dados["url"],
+            )
+            jogos.append(jogo)
+
+    log(f"📊 Dados extraídos de {len(jogos)} jogos")
+
+    await scraper.close()
+
+    if len(jogos) < 2:
+        log("❌ Poucos jogos com dados disponíveis")
+        await client.send_message("me", "❌ Dados insuficientes para montar múltiplas.")
+        return
+
+    selector = CandidateSelectorPreLive()
+    resultado = selector.selecionar_candidatos(jogos)
+    aprovados = resultado["aprovados"]
+
+    log(f"📊 {len(aprovados)} jogos aprovados (Score ≥ {SCORE_MINIMO_APROVACAO})")
+
+    if len(aprovados) < QTD_MINIMA_JOGOS:
+        log(f"❌ Menos de {QTD_MINIMA_JOGOS} jogos aprovados")
+        await client.send_message(
+            "me",
+            f"❌ Apenas {len(aprovados)} jogos aprovados. Mínimo: {QTD_MINIMA_JOGOS}."
+        )
+        return
+
+    anchor_selector = AnchorSelectorPreLive()
+    ancoras, complementares = anchor_selector.selecionar(aprovados)
+
+    if not ancoras or not complementares:
+        log("❌ Não foi possível selecionar âncoras ou complementares")
+        await client.send_message("me", "❌ Não foi possível montar múltiplas.")
+        return
+
+    log(f"📊 {len(ancoras)} âncoras, {len(complementares)} complementares")
+
+    builder = MultipleBuilderPreLive()
+    multiplas = builder.construir(ancoras, complementares)
+
+    if not multiplas:
+        log("❌ Nenhuma múltipla construída")
+        await client.send_message("me", "❌ Não foi possível construir múltiplas.")
+        return
+
+    log(f"✅ {len(multiplas)} múltiplas construídas")
+
+    for multiple in multiplas:
+        msg = formatar_multipla_prelive(multiple)
+        await client.send_message("me", msg)
+        log(f"📤 {multiple.nome} enviada")
+        await asyncio.sleep(1)
+
+    log("✅ Processo Pré-Live concluído!")
+
+
+# =========================================================
+# MAIN
+# =========================================================
+
 async def main() -> None:
     global tarefa_envio
     logar_versao_inicial()
     garantir_csv()
-    v17_carregar_estado()  # V17 — carrega do disco (fallback local)
+    v17_carregar_estado()
 
     tarefa_envio = asyncio.create_task(trabalhador_fila_envio())
     asyncio.create_task(watchdog())
     if HABILITAR_V13_AUDITORIA_HTML:
-        asyncio.create_task(v13_agendador())  # V13 — envio diário às 00:05
+        asyncio.create_task(v13_agendador())
 
     @client.on(events.NewMessage(incoming=True))
     async def handler(event):
@@ -5748,12 +6563,8 @@ async def main() -> None:
 
     @client.on(events.MessageEdited(incoming=True))
     async def handler_edit(event):
-        # V19 — edições da CornerPro não reprocessam alerta.
-        # Evita duplicar CSV/HTML/OpenAI quando a mensagem original é corrigida.
         return
 
-    # V24 — handler para comando auditoria em canal.
-    # Escuta mensagens outgoing normais.
     @client.on(events.NewMessage(outgoing=True))
     async def handler_outgoing(event):
         try:
@@ -5763,9 +6574,7 @@ async def main() -> None:
         except Exception as e:
             log(f"⚠️ V24 handler_outgoing erro | {type(e).__name__}: {e}")
 
-    # =========================================================
-    # COMANDO /teste — VARREDURA MANUAL DO SITE THEOBORGES
-    # =========================================================
+    # COMANDO /teste (ao vivo - inalterado)
     @client.on(events.NewMessage(incoming=True))
     async def handler_teste(event):
         texto = event.raw_text or ""
@@ -5780,13 +6589,28 @@ async def main() -> None:
             log("📩 /teste RECEBIDO (CHAT PRIVADO)")
             await varrer_site_theoborges()
 
+    # COMANDO /prelive (novo - sistema Pré-Live)
+    @client.on(events.NewMessage(incoming=True))
+    async def handler_prelive(event):
+        texto = event.raw_text or ""
+        if texto.strip().lower() == "/prelive":
+            log("📩 /prelive RECEBIDO (INCOMING)")
+            await varrer_site_theoborges_prelive()
+
+    @client.on(events.NewMessage(from_users='me'))
+    async def handler_prelive_me(event):
+        texto = event.raw_text or ""
+        if texto.strip().lower() == "/prelive":
+            log("📩 /prelive RECEBIDO (CHAT PRIVADO)")
+            await varrer_site_theoborges_prelive()
+
+    # Versão original do varrer_site_theoborges (mantida inalterada)
     async def varrer_site_theoborges():
         log("🚀 INICIANDO VARREdura DO SITE THEOBORGES (COMANDO MANUAL)")
         
         import httpx
         from bs4 import BeautifulSoup
         
-        # Tenta buscar "hoje" e "amanhã"
         dias_para_tentar = ["hoje", "amanha"]
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
@@ -5811,7 +6635,6 @@ async def main() -> None:
             
             links_jogos = []
             
-            # TENTATIVA 1: Procurar links com a classe .match-row (mais provável)
             for link in soup.select(".match-row"):
                 href = link.get("href")
                 if href and "/game/" in href:
@@ -5819,7 +6642,6 @@ async def main() -> None:
                     if url_completa not in links_jogos:
                         links_jogos.append(url_completa)
 
-            # TENTATIVA 2: Se não achou, tenta procurar qualquer link que contenha "/game/"
             if not links_jogos:
                 for link in soup.select("a[href*='/game/']"):
                     href = link.get("href")
@@ -5828,7 +6650,6 @@ async def main() -> None:
                         if url_completa not in links_jogos:
                             links_jogos.append(url_completa)
 
-            # TENTATIVA 3: Se ainda não achou, tenta um seletor mais genérico
             if not links_jogos:
                 for link in soup.find_all("a", href=True):
                     href = link.get("href")
@@ -5839,12 +6660,11 @@ async def main() -> None:
 
             if not links_jogos:
                 log(f"ℹ️ Nenhum link de jogo encontrado para {dia}.")
-                # Salva o HTML para diagnóstico caso não encontre nada em nenhum dia
                 if dia == dias_para_tentar[-1]:
                     with open("erro_diagnostico.html", "w", encoding="utf-8") as f:
                         f.write(response.text)
                     log("📄 HTML da última tentativa salvo em 'erro_diagnostico.html'.")
-                continue  # Tenta o próximo dia
+                continue
 
             log(f"📊 Encontrados {len(links_jogos)} jogos para analisar em {dia}.")
             jogos_filtrados = []
@@ -5918,23 +6738,19 @@ async def main() -> None:
 
                 await client.send_message("me", mensagem)
                 log(f"✅ Múltipla enviada com base em {dia}.")
-                break  # Para o loop, pois encontrou jogos
+                break
 
         if not encontrou_jogos:
             await client.send_message("me", "❌ Nenhum jogo encontrado para hoje ou amanhã. Verifique o arquivo 'erro_diagnostico.html' no Railway.")
             log("❌ Nenhum jogo encontrado para hoje ou amanhã. HTML salvo para diagnóstico.")
 
-    # V24 — captura posts de canal via handler incoming geral.
-    # auditoria_autorizada() filtra por ID — só o dono recebe os HTMLs.
-    # O handler incoming já existia; o filtro por texto e ID é feito dentro de receber_mensagem.
-
     log("🚀 INICIANDO BOT")
     await client.start()
     log("✅ TELEGRAM CONECTADO COM SUCESSO")
-    # V26 — carrega estado do Telegram após conexão (backup que sobrevive a restarts)
     await v26_carregar_estado_telegram()
     log(f"🤖 OpenAI {'ATIVA' if OPENAI_HABILITADO and OPENAI_API_KEY else 'DESATIVADA'} ({OPENAI_MODEL})")
     log(f"📡 Canais ativos: principal={TARGET_CHANNEL} | confirmação={CONFIRMATION_CHANNEL}")
+    log("📡 Comandos disponíveis: /teste (ao vivo) | /prelive (pré-live) | /auditoria")
     await client.run_until_disconnected()
 
 
