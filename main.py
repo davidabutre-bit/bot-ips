@@ -1,3 +1,12 @@
+Entendido perfeitamente. Você não vai colar pedaços, e eu não vou mais te pedir para fazer isso. 
+
+Para resolver isso de uma vez por todas, eu **peguei o seu código completo, atualizei a função `varrer_site_theoborges()` com as 3 soluções, o User-Agent e o salvamento de diagnóstico**, e mantive **100% do seu sistema ao vivo intacto**.
+
+Você só precisa copiar o código inteiro abaixo, substituir o seu `main.py` no Railway e reiniciar. Se o bot falhar, ele vai te dar a resposta exata no arquivo que ele mesmo vai gerar.
+
+Aqui está o seu **código completo e corrigido**:
+
+```python
 # -*- coding: utf-8 -*-
 """
 COUTIPS / ALFA — DC01.2
@@ -5786,19 +5795,20 @@ async def main() -> None:
         import httpx
         from bs4 import BeautifulSoup
         
-        # Tenta buscar "hoje" primeiro. Se não achar, tenta "amanha".
+        # Tenta buscar "hoje" e "amanhã"
         dias_para_tentar = ["hoje", "amanha"]
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+        }
         encontrou_jogos = False
         
         for dia in dias_para_tentar:
             url_lista = f"https://clube.theoborges.com/matches?dia={dia}"
-            headers = {"User-Agent": "Mozilla/5.0"}
-            
             log(f"🔄 Tentando buscar jogos para: {dia}")
             
-            async with httpx.AsyncClient(follow_redirects=True) as client_http:
+            async with httpx.AsyncClient(follow_redirects=True, timeout=30) as client_http:
                 try:
-                    response = await client_http.get(url_lista, headers=headers, timeout=15)
+                    response = await client_http.get(url_lista, headers=headers)
                     if response.status_code != 200:
                         log(f"⚠️ Erro ao acessar lista de jogos ({dia}): {response.status_code}")
                         continue
@@ -5809,15 +5819,40 @@ async def main() -> None:
             soup = BeautifulSoup(response.text, "html.parser")
             
             links_jogos = []
-            for link in soup.select("a.match-row"):
+            
+            # TENTATIVA 1: Procurar links com a classe .match-row (mais provável)
+            for link in soup.select(".match-row"):
                 href = link.get("href")
                 if href and "/game/" in href:
                     url_completa = f"https://clube.theoborges.com{href}"
                     if url_completa not in links_jogos:
                         links_jogos.append(url_completa)
 
+            # TENTATIVA 2: Se não achou, tenta procurar qualquer link que contenha "/game/"
+            if not links_jogos:
+                for link in soup.select("a[href*='/game/']"):
+                    href = link.get("href")
+                    if href:
+                        url_completa = f"https://clube.theoborges.com{href}"
+                        if url_completa not in links_jogos:
+                            links_jogos.append(url_completa)
+
+            # TENTATIVA 3: Se ainda não achou, tenta um seletor mais genérico
+            if not links_jogos:
+                for link in soup.find_all("a", href=True):
+                    href = link.get("href")
+                    if href and "/game/" in href:
+                        url_completa = f"https://clube.theoborges.com{href}"
+                        if url_completa not in links_jogos:
+                            links_jogos.append(url_completa)
+
             if not links_jogos:
                 log(f"ℹ️ Nenhum link de jogo encontrado para {dia}.")
+                # Salva o HTML para diagnóstico caso não encontre nada em nenhum dia
+                if dia == dias_para_tentar[-1]:
+                    with open("erro_diagnostico.html", "w", encoding="utf-8") as f:
+                        f.write(response.text)
+                    log("📄 HTML da última tentativa salvo em 'erro_diagnostico.html'.")
                 continue  # Tenta o próximo dia
 
             log(f"📊 Encontrados {len(links_jogos)} jogos para analisar em {dia}.")
@@ -5825,10 +5860,10 @@ async def main() -> None:
 
             for url in links_jogos[:20]:
                 try:
-                    response = await client_http.get(url, headers=headers, timeout=15)
-                    if response.status_code != 200:
+                    response_jogo = await client_http.get(url, headers=headers, timeout=15)
+                    if response_jogo.status_code != 200:
                         continue
-                    soup_jogo = BeautifulSoup(response.text, "html.parser")
+                    soup_jogo = BeautifulSoup(response_jogo.text, "html.parser")
                     
                     titulo = soup_jogo.select_one(".match-name")
                     nome_jogo = titulo.text.strip() if titulo else "Jogo não identificado"
@@ -5895,8 +5930,8 @@ async def main() -> None:
                 break  # Para o loop, pois encontrou jogos
 
         if not encontrou_jogos:
-            await client.send_message("me", "❌ Nenhum jogo encontrado para hoje ou amanhã.")
-            log("❌ Nenhum jogo encontrado para hoje ou amanhã.")
+            await client.send_message("me", "❌ Nenhum jogo encontrado para hoje ou amanhã. Verifique o arquivo 'erro_diagnostico.html' no Railway.")
+            log("❌ Nenhum jogo encontrado para hoje ou amanhã. HTML salvo para diagnóstico.")
 
     # V24 — captura posts de canal via handler incoming geral.
     # auditoria_autorizada() filtra por ID — só o dono recebe os HTMLs.
@@ -5921,3 +5956,4 @@ if __name__ == "__main__":
         log(f"❌ FALHA FATAL: {type(exc).__name__}: {exc}")
         log(traceback.format_exc())
         raise
+```
