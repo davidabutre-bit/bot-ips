@@ -6052,6 +6052,117 @@ class TeoBorgesScraperPreLive:
             log(f"❌ Erro ao buscar jogos: {type(e).__name__}: {e}")
             return []
 
+    # =========================================================
+    # MAPEAMENTO DE CAMPOS PARA O SCORER
+    # =========================================================
+    
+    def _mapear_estatisticas_prelive(self, estat: dict) -> dict:
+        """Normaliza e mapeia os campos extraídos para os nomes esperados pelo PreLiveScorer."""
+        normalizado = {}
+        
+        # Mapeamento completo dos campos do scraper para o scorer
+        mapeamento = {
+            # Gols
+            "gols_marcados": "gols_marcados",
+            "gols_sofridos": "gols_sofridos",
+            "xg": "xg",
+            "xga": "xga",
+            "finalizacoes": "finalizacoes",
+            "finalizacoes_alvo": "finalizacoes_alvo",
+            "finalizacoes_sofridas": "finalizacoes_sofridas",
+            "escanteios_favor": "escanteios_favor",
+            "escanteios_contra": "escanteios_contra",
+            "escanteios_total": "escanteios_total",
+            # Over/Under
+            "over_05": "over_05_ht",
+            "over_15": "over_15_ft",
+            "over_25": "over_25_ft",
+            "over_35": "over_35_ft",
+            "over_45": "over_45_ft",
+            "over_55": "over_55_ft",
+            "over_05_ht": "over_05_ht",
+            "over_15_ht": "over_15_ht",
+            "over_25_ht": "over_25_ht",
+            "over_05_2t": "over_05_2t",
+            "over_15_2t": "over_15_2t",
+            "over_25_2t": "over_25_2t",
+            "under_05": "under_05",
+            "under_15": "under_15",
+            "under_25": "under_25",
+            "under_35": "under_35",
+            "under_45": "under_45",
+            "under_55": "under_55",
+            # BTTS
+            "btts": "btts",
+            "ambas_marcam": "btts",
+            # Posse
+            "posse": "posse",
+            "posse_de_bola": "posse",
+            # Desempenho
+            "vitorias": "vitorias",
+            "derrotas": "derrotas",
+            "marcou_primeiro": "marcou_primeiro",
+            "nao_sofreu": "nao_sofreu",
+            "falhou_marcar": "falhou_marcar",
+            "sofreu_primeiro": "sofreu_primeiro",
+            # Gols por período
+            "gols_ht": "gols_ht",
+            "gols_ft": "gols_ft",
+            "sofre_ht": "sofre_ht",
+            "sofre_ft": "sofre_ft",
+            "media_gols": "media_gols",
+            "media_gols_sofridos": "media_gols_sofridos",
+            "media_total_gols": "media_total_gols",
+            # Período específico
+            "over_05_ht_casa": "over_05_ht_casa",
+            "over_05_ht_fora": "over_05_ht_fora",
+            "over_15_ft_casa": "over_15_ft_casa",
+            "over_15_ft_fora": "over_15_ft_fora",
+            "over_25_ft_casa": "over_25_ft_casa",
+            "over_25_ft_fora": "over_25_ft_fora",
+            "btts_casa": "btts_casa",
+            "btts_fora": "btts_fora",
+            "escanteios_favor_casa": "escanteios_favor_casa",
+            "escanteios_favor_fora": "escanteios_favor_fora",
+            "escanteios_contra_casa": "escanteios_contra_casa",
+            "escanteios_contra_fora": "escanteios_contra_fora",
+            "vitorias_casa": "vitorias_casa",
+            "vitorias_fora": "vitorias_fora",
+            # Cartões
+            "cartoes_recebidos": "cartoes_recebidos",
+            "cartoes_adversarios": "cartoes_adversarios",
+            "cartoes_total": "cartoes_total",
+        }
+        
+        for key, value in estat.items():
+            if key in mapeamento:
+                normalizado[mapeamento[key]] = value
+            else:
+                normalizado[key] = value
+        
+        # Garantir que todos os campos obrigatórios existam
+        campos_obrigatorios = [
+            "gols_marcados", "gols_sofridos", "xg", "xga",
+            "over_05_ht", "over_15_ft", "over_25_ft",
+            "btts", "posse", "vitorias", "derrotas",
+            "marcou_primeiro", "nao_sofreu", "falhou_marcar",
+            "finalizacoes", "escanteios_favor", "escanteios_contra",
+            "gols_ht", "gols_ft", "sofre_ht", "sofre_ft",
+            "over_05_ht_casa", "over_05_ht_fora",
+            "over_15_ft_casa", "over_15_ft_fora",
+            "over_25_ft_casa", "over_25_ft_fora",
+            "btts_casa", "btts_fora",
+            "escanteios_favor_casa", "escanteios_favor_fora",
+            "escanteios_contra_casa", "escanteios_contra_fora",
+            "vitorias_casa", "vitorias_fora",
+        ]
+        
+        for campo in campos_obrigatorios:
+            if campo not in normalizado:
+                normalizado[campo] = 0.0
+        
+        return normalizado
+
     async def extrair_dados_jogo(self, url: str) -> Optional[Dict]:
         """Extrai dados de todas as abas do jogo."""
         await asyncio.sleep(random.uniform(2.0, 4.0))
@@ -6120,12 +6231,14 @@ class TeoBorgesScraperPreLive:
                         dados_aba = self._extrair_aba(soup_aba, aba["id"], dados_completos["time_casa"], dados_completos["time_fora"])
                         dados_completos["aba"][aba["id"]] = dados_aba
 
-                        # Processa estatísticas
+                        # Processa estatísticas com mapeamento
                         estat = dados_aba.get("estatisticas", {})
                         for lado in ["casa", "fora"]:
-                            if lado in estat:
-                                for key, value in estat[lado].items():
-                                    if value:
+                            if lado in estat and estat[lado]:
+                                # Aplica o mapeamento para converter os nomes dos campos
+                                estat_mapeada = self._mapear_estatisticas_prelive(estat[lado])
+                                for key, value in estat_mapeada.items():
+                                    if value is not None and value != 0:
                                         dados_completos["estatisticas"][lado][key] = value
 
                         # Processa odds
@@ -6159,7 +6272,17 @@ class TeoBorgesScraperPreLive:
                         dados_completos["lado_favorito"] = "FORA"
                         dados_completos["odd_favorito"] = odd_fora
 
-                log(f"✅ Dados extraídos de {len(dados_completos['aba'])} abas: {list(dados_completos['aba'].keys())}")
+                # LOG DE DEBUG - Mostra o que foi extraído
+                log(f"📊 DADOS EXTRAÍDOS DO JOGO:")
+                log(f"   Time Casa: {dados_completos['time_casa']}")
+                log(f"   Time Fora: {dados_completos['time_fora']}")
+                log(f"   Liga: {dados_completos['liga']}")
+                log(f"   Estatísticas Casa: {list(dados_completos['estatisticas']['casa'].keys())}")
+                log(f"   Estatísticas Fora: {list(dados_completos['estatisticas']['fora'].keys())}")
+                log(f"   Odds: {dados_completos['odds']}")
+                log(f"   Odd Favorito: {dados_completos.get('odd_favorito', 'N/A')}")
+                log(f"   Abas extraídas: {len(dados_completos['aba'])}")
+
                 return dados_completos
 
             except Exception as e:
@@ -6611,88 +6734,101 @@ async def varrer_site_theoborges_prelive() -> None:
                 log(f"⏭️ Jogo {dados['time_casa']} x {dados['time_fora']} descartado: odd favorito {odd_favorito} > {ODD_MAXIMA_FAVORITO_PRELIVE}")
                 continue
 
-            estat_casa = EstatisticasTimePreLive(
+            # Verifica se tem dados suficientes
+            estat_casa = dados["estatisticas"].get("casa", {})
+            estat_fora = dados["estatisticas"].get("fora", {})
+            
+            # Log para debug
+            log(f"📊 Estatísticas Casa: {list(estat_casa.keys())}")
+            log(f"📊 Estatísticas Fora: {list(estat_fora.keys())}")
+
+            # Verifica se tem dados mínimos
+            if not estat_casa and not estat_fora:
+                log(f"⚠️ Jogo {dados['time_casa']} x {dados['time_fora']} sem estatísticas")
+                continue
+
+            estat_casa_obj = EstatisticasTimePreLive(
                 nome=dados["time_casa"],
-                gols_marcados=dados["estatisticas"].get("casa", {}).get("gols_marcados", 0),
-                gols_sofridos=dados["estatisticas"].get("casa", {}).get("gols_sofridos", 0),
-                xg=dados["estatisticas"].get("casa", {}).get("xg", 0),
-                xga=dados["estatisticas"].get("casa", {}).get("xga", 0),
-                over_05_ht=dados["estatisticas"].get("casa", {}).get("over_05_ht", 0),
-                over_15_ft=dados["estatisticas"].get("casa", {}).get("over_15", 0),
-                over_25_ft=dados["estatisticas"].get("casa", {}).get("over_25", 0),
-                btts=dados["estatisticas"].get("casa", {}).get("btts", 0),
-                escanteios_favor=dados["estatisticas"].get("casa", {}).get("escanteios_favor", 0),
-                escanteios_contra=dados["estatisticas"].get("casa", {}).get("escanteios_contra", 0),
-                finalizacoes=dados["estatisticas"].get("casa", {}).get("finalizacoes", 0),
-                finalizacoes_sofridas=dados["estatisticas"].get("casa", {}).get("finalizacoes_sofridas", 0),
-                gols_ht=dados["estatisticas"].get("casa", {}).get("gols_ht", 0),
-                gols_ft=dados["estatisticas"].get("casa", {}).get("gols_ft", 0),
-                sofre_ht=dados["estatisticas"].get("casa", {}).get("sofre_ht", 0),
-                sofre_ft=dados["estatisticas"].get("casa", {}).get("sofre_ft", 0),
-                vitorias=dados["estatisticas"].get("casa", {}).get("vitorias", 0),
-                derrotas=dados["estatisticas"].get("casa", {}).get("derrotas", 0),
-                marcou_primeiro=dados["estatisticas"].get("casa", {}).get("marcou_primeiro", 0),
-                nao_sofreu=dados["estatisticas"].get("casa", {}).get("nao_sofreu", 0),
-                posse=dados["estatisticas"].get("casa", {}).get("posse", 0),
+                gols_marcados=estat_casa.get("gols_marcados", 0),
+                gols_sofridos=estat_casa.get("gols_sofridos", 0),
+                xg=estat_casa.get("xg", 0),
+                xga=estat_casa.get("xga", 0),
+                over_05_ht=estat_casa.get("over_05_ht", 0),
+                over_15_ft=estat_casa.get("over_15_ft", 0),
+                over_25_ft=estat_casa.get("over_25_ft", 0),
+                btts=estat_casa.get("btts", 0),
+                escanteios_favor=estat_casa.get("escanteios_favor", 0),
+                escanteios_contra=estat_casa.get("escanteios_contra", 0),
+                finalizacoes=estat_casa.get("finalizacoes", 0),
+                finalizacoes_sofridas=estat_casa.get("finalizacoes_sofridas", 0),
+                gols_ht=estat_casa.get("gols_ht", 0),
+                gols_ft=estat_casa.get("gols_ft", 0),
+                sofre_ht=estat_casa.get("sofre_ht", 0),
+                sofre_ft=estat_casa.get("sofre_ft", 0),
+                vitorias=estat_casa.get("vitorias", 0),
+                derrotas=estat_casa.get("derrotas", 0),
+                marcou_primeiro=estat_casa.get("marcou_primeiro", 0),
+                nao_sofreu=estat_casa.get("nao_sofreu", 0),
+                posse=estat_casa.get("posse", 0),
                 team_reliability=80.0,
                 forma=0,
                 # Dados por período
-                over_05_ht_casa=dados["estatisticas"].get("casa", {}).get("over_05_ht_casa", 0),
-                over_05_ht_fora=dados["estatisticas"].get("casa", {}).get("over_05_ht_fora", 0),
-                over_15_ft_casa=dados["estatisticas"].get("casa", {}).get("over_15_ft_casa", 0),
-                over_15_ft_fora=dados["estatisticas"].get("casa", {}).get("over_15_ft_fora", 0),
-                over_25_ft_casa=dados["estatisticas"].get("casa", {}).get("over_25_ft_casa", 0),
-                over_25_ft_fora=dados["estatisticas"].get("casa", {}).get("over_25_ft_fora", 0),
-                btts_casa=dados["estatisticas"].get("casa", {}).get("btts_casa", 0),
-                btts_fora=dados["estatisticas"].get("casa", {}).get("btts_fora", 0),
-                escanteios_favor_casa=dados["estatisticas"].get("casa", {}).get("escanteios_favor_casa", 0),
-                escanteios_favor_fora=dados["estatisticas"].get("casa", {}).get("escanteios_favor_fora", 0),
-                escanteios_contra_casa=dados["estatisticas"].get("casa", {}).get("escanteios_contra_casa", 0),
-                escanteios_contra_fora=dados["estatisticas"].get("casa", {}).get("escanteios_contra_fora", 0),
-                vitorias_casa=dados["estatisticas"].get("casa", {}).get("vitorias_casa", 0),
-                vitorias_fora=dados["estatisticas"].get("casa", {}).get("vitorias_fora", 0),
+                over_05_ht_casa=estat_casa.get("over_05_ht_casa", 0),
+                over_05_ht_fora=estat_casa.get("over_05_ht_fora", 0),
+                over_15_ft_casa=estat_casa.get("over_15_ft_casa", 0),
+                over_15_ft_fora=estat_casa.get("over_15_ft_fora", 0),
+                over_25_ft_casa=estat_casa.get("over_25_ft_casa", 0),
+                over_25_ft_fora=estat_casa.get("over_25_ft_fora", 0),
+                btts_casa=estat_casa.get("btts_casa", 0),
+                btts_fora=estat_casa.get("btts_fora", 0),
+                escanteios_favor_casa=estat_casa.get("escanteios_favor_casa", 0),
+                escanteios_favor_fora=estat_casa.get("escanteios_favor_fora", 0),
+                escanteios_contra_casa=estat_casa.get("escanteios_contra_casa", 0),
+                escanteios_contra_fora=estat_casa.get("escanteios_contra_fora", 0),
+                vitorias_casa=estat_casa.get("vitorias_casa", 0),
+                vitorias_fora=estat_casa.get("vitorias_fora", 0),
             )
 
-            estat_fora = EstatisticasTimePreLive(
+            estat_fora_obj = EstatisticasTimePreLive(
                 nome=dados["time_fora"],
-                gols_marcados=dados["estatisticas"].get("fora", {}).get("gols_marcados", 0),
-                gols_sofridos=dados["estatisticas"].get("fora", {}).get("gols_sofridos", 0),
-                xg=dados["estatisticas"].get("fora", {}).get("xg", 0),
-                xga=dados["estatisticas"].get("fora", {}).get("xga", 0),
-                over_05_ht=dados["estatisticas"].get("fora", {}).get("over_05_ht", 0),
-                over_15_ft=dados["estatisticas"].get("fora", {}).get("over_15", 0),
-                over_25_ft=dados["estatisticas"].get("fora", {}).get("over_25", 0),
-                btts=dados["estatisticas"].get("fora", {}).get("btts", 0),
-                escanteios_favor=dados["estatisticas"].get("fora", {}).get("escanteios_favor", 0),
-                escanteios_contra=dados["estatisticas"].get("fora", {}).get("escanteios_contra", 0),
-                finalizacoes=dados["estatisticas"].get("fora", {}).get("finalizacoes", 0),
-                finalizacoes_sofridas=dados["estatisticas"].get("fora", {}).get("finalizacoes_sofridas", 0),
-                gols_ht=dados["estatisticas"].get("fora", {}).get("gols_ht", 0),
-                gols_ft=dados["estatisticas"].get("fora", {}).get("gols_ft", 0),
-                sofre_ht=dados["estatisticas"].get("fora", {}).get("sofre_ht", 0),
-                sofre_ft=dados["estatisticas"].get("fora", {}).get("sofre_ft", 0),
-                vitorias=dados["estatisticas"].get("fora", {}).get("vitorias", 0),
-                derrotas=dados["estatisticas"].get("fora", {}).get("derrotas", 0),
-                marcou_primeiro=dados["estatisticas"].get("fora", {}).get("marcou_primeiro", 0),
-                nao_sofreu=dados["estatisticas"].get("fora", {}).get("nao_sofreu", 0),
-                posse=dados["estatisticas"].get("fora", {}).get("posse", 0),
+                gols_marcados=estat_fora.get("gols_marcados", 0),
+                gols_sofridos=estat_fora.get("gols_sofridos", 0),
+                xg=estat_fora.get("xg", 0),
+                xga=estat_fora.get("xga", 0),
+                over_05_ht=estat_fora.get("over_05_ht", 0),
+                over_15_ft=estat_fora.get("over_15_ft", 0),
+                over_25_ft=estat_fora.get("over_25_ft", 0),
+                btts=estat_fora.get("btts", 0),
+                escanteios_favor=estat_fora.get("escanteios_favor", 0),
+                escanteios_contra=estat_fora.get("escanteios_contra", 0),
+                finalizacoes=estat_fora.get("finalizacoes", 0),
+                finalizacoes_sofridas=estat_fora.get("finalizacoes_sofridas", 0),
+                gols_ht=estat_fora.get("gols_ht", 0),
+                gols_ft=estat_fora.get("gols_ft", 0),
+                sofre_ht=estat_fora.get("sofre_ht", 0),
+                sofre_ft=estat_fora.get("sofre_ft", 0),
+                vitorias=estat_fora.get("vitorias", 0),
+                derrotas=estat_fora.get("derrotas", 0),
+                marcou_primeiro=estat_fora.get("marcou_primeiro", 0),
+                nao_sofreu=estat_fora.get("nao_sofreu", 0),
+                posse=estat_fora.get("posse", 0),
                 team_reliability=80.0,
                 forma=0,
                 # Dados por período
-                over_05_ht_casa=dados["estatisticas"].get("fora", {}).get("over_05_ht_casa", 0),
-                over_05_ht_fora=dados["estatisticas"].get("fora", {}).get("over_05_ht_fora", 0),
-                over_15_ft_casa=dados["estatisticas"].get("fora", {}).get("over_15_ft_casa", 0),
-                over_15_ft_fora=dados["estatisticas"].get("fora", {}).get("over_15_ft_fora", 0),
-                over_25_ft_casa=dados["estatisticas"].get("fora", {}).get("over_25_ft_casa", 0),
-                over_25_ft_fora=dados["estatisticas"].get("fora", {}).get("over_25_ft_fora", 0),
-                btts_casa=dados["estatisticas"].get("fora", {}).get("btts_casa", 0),
-                btts_fora=dados["estatisticas"].get("fora", {}).get("btts_fora", 0),
-                escanteios_favor_casa=dados["estatisticas"].get("fora", {}).get("escanteios_favor_casa", 0),
-                escanteios_favor_fora=dados["estatisticas"].get("fora", {}).get("escanteios_favor_fora", 0),
-                escanteios_contra_casa=dados["estatisticas"].get("fora", {}).get("escanteios_contra_casa", 0),
-                escanteios_contra_fora=dados["estatisticas"].get("fora", {}).get("escanteios_contra_fora", 0),
-                vitorias_casa=dados["estatisticas"].get("fora", {}).get("vitorias_casa", 0),
-                vitorias_fora=dados["estatisticas"].get("fora", {}).get("vitorias_fora", 0),
+                over_05_ht_casa=estat_fora.get("over_05_ht_casa", 0),
+                over_05_ht_fora=estat_fora.get("over_05_ht_fora", 0),
+                over_15_ft_casa=estat_fora.get("over_15_ft_casa", 0),
+                over_15_ft_fora=estat_fora.get("over_15_ft_fora", 0),
+                over_25_ft_casa=estat_fora.get("over_25_ft_casa", 0),
+                over_25_ft_fora=estat_fora.get("over_25_ft_fora", 0),
+                btts_casa=estat_fora.get("btts_casa", 0),
+                btts_fora=estat_fora.get("btts_fora", 0),
+                escanteios_favor_casa=estat_fora.get("escanteios_favor_casa", 0),
+                escanteios_favor_fora=estat_fora.get("escanteios_favor_fora", 0),
+                escanteios_contra_casa=estat_fora.get("escanteios_contra_casa", 0),
+                escanteios_contra_fora=estat_fora.get("escanteios_contra_fora", 0),
+                vitorias_casa=estat_fora.get("vitorias_casa", 0),
+                vitorias_fora=estat_fora.get("vitorias_fora", 0),
             )
 
             jogo = JogoPreLive(
@@ -6701,8 +6837,8 @@ async def varrer_site_theoborges_prelive() -> None:
                 liga=dados["liga"],
                 data="",
                 horario="",
-                estatisticas_casa=estat_casa,
-                estatisticas_fora=estat_fora,
+                estatisticas_casa=estat_casa_obj,
+                estatisticas_fora=estat_fora_obj,
                 odds=dados.get("odds", {}),
                 url=dados["url"],
                 dados_raw=dados,
@@ -6834,6 +6970,7 @@ def logar_versao_inicial() -> None:
     log(" 26. Scraper Pré-Live com navegação por abas")
     log(" 27. Extração de dados de todas as abas")
     log(" 28. Sistema Pré-Live V1 com Matchup Engine, DNA ARCE e DNA CHAMA")
+    log(" 29. Mapeamento de campos entre scraper e scorer")
     log(f"📊 Corte HT={CORTE_GOL_HT}% | Corte FT={CORTE_GOL_FT}%")
     log(f"📡 Canais: grátis={FREE_CHANNEL} | completo={COMPLETE_CHANNEL}")
     log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
