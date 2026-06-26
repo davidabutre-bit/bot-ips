@@ -1655,7 +1655,10 @@ def pressao_viva_lado(m: Metricas, lado: str) -> bool:
 def pressao_morta_lado(m: Metricas, lado: str) -> bool:
     d = dados_lado(m, lado)
     ip = ip_lado(m, lado)
-    return d["u5"] <= 1 and d["u10"] <= 3 and ip["pico"] < 18 and ip["c18"] == 0def xg_baixo_compensado_por_rb(m: Metricas, lado: str) -> bool:
+    return d["u5"] <= 1 and d["u10"] <= 3 and ip["pico"] < 18 and ip["c18"] == 0
+
+
+def xg_baixo_compensado_por_rb(m: Metricas, lado: str) -> bool:
     """HT-1 fica fora do V12 definitivo.
 
     Mantemos a função apenas para compatibilidade interna, mas ela não altera
@@ -5977,7 +5980,7 @@ class TeoBorgesScraperPreLive:
             }
 
         except Exception as e:
-            log(f"⚠️ Erro ao extrair dados: {type(e).__name__}")
+            log(f"⚠️ Erro ao extrair dados: {type(e).__name__}: {e}")
             return None
 
     def _extrair_estatisticas(self, soup: BeautifulSoup, time_casa: str, time_fora: str) -> Dict:
