@@ -1,12 +1,3 @@
-Entendido perfeitamente. Você não vai colar pedaços, e eu não vou mais te pedir para fazer isso. 
-
-Para resolver isso de uma vez por todas, eu **peguei o seu código completo, atualizei a função `varrer_site_theoborges()` com as 3 soluções, o User-Agent e o salvamento de diagnóstico**, e mantive **100% do seu sistema ao vivo intacto**.
-
-Você só precisa copiar o código inteiro abaixo, substituir o seu `main.py` no Railway e reiniciar. Se o bot falhar, ele vai te dar a resposta exata no arquivo que ele mesmo vai gerar.
-
-Aqui está o seu **código completo e corrigido**:
-
-```python
 # -*- coding: utf-8 -*-
 """
 COUTIPS / ALFA — DC01.2
@@ -5956,4 +5947,3 @@ if __name__ == "__main__":
         log(f"❌ FALHA FATAL: {type(exc).__name__}: {exc}")
         log(traceback.format_exc())
         raise
-```
