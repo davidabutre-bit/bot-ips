@@ -18,6 +18,33 @@ Nota: SNIPER V2 e HT_PLACAR_LARGO já estavam implementados em DC01.1.
 Não foram recriados — flags existentes controlam o comportamento.
 
 Start command: python main.py
+
+================================================================================
+MUDANÇAS IMPLEMENTADAS (VERSÃO ATUALIZADA):
+================================================================================
+1. V29 cooldown universal com persistência em arquivo
+2. V17 salvamento com atomicidade (arquivo temporário)
+3. V26 backup no Telegram com canal secundário
+4. Sniper bloqueios vão para auditoria
+5. v29_trava_decaimento_pressao_2p usa U5/U10 como proxy (corrigido)
+6. dc01_1_zebra_ameaca_real exige 3 provas (aumentado de 2)
+7. extrair_jogo mais robusto (não confunde com odds)
+8. extrair_odds aceita múltiplos formatos
+9. extrair_pressao_alfa aceita múltiplos nomes
+10. Sniper processado antes dos filtros V29
+11. V26 penalidade aplicada ANTES do score Python
+12. score_confirmacao IP usa > em vez de >=
+13. Penalidade PRESSAO_PREMIADA_MORREU reduzida de -14 para -10
+14. v29_trava_conf_placar_largo com exceção para pressão extrema
+15. Validação de variáveis de ambiente na inicialização
+16. HTML escapado com html.escape()
+17. CSV sanitizado contra injection
+18. Prompt da IA sanitizado
+19. FloodWait com backoff exponencial
+20. Limite de 500 registros nos JSON do V13
+21. Cache com classe robusta
+22-25. Refatorações organizacionais (processar_alerta dividida, etc.)
+================================================================================
 """
 
 from __future__ import annotations
@@ -26,9 +53,12 @@ import asyncio
 import csv
 import html
 import hashlib
+import json
 import logging
 import os
+import random
 import re
+import threading as _threading
 import time
 import traceback
 import unicodedata
@@ -45,7 +75,7 @@ from telethon.sessions import StringSession
 
 try:
     from telethon.errors.common import TypeNotFoundError
-except Exception:  # pragma: no cover
+except Exception:
     class TypeNotFoundError(Exception):
         pass
 
@@ -54,7 +84,7 @@ except Exception:  # pragma: no cover
 # VERSÃO / CONFIGURAÇÃO BASE
 # =========================================================
 
-VERSAO_COUTIPS = "ALFA_COUTIPS_2026_06_18_V29_MELHORIAS"
+VERSAO_COUTIPS = "ALFA_COUTIPS_2026_06_18_V29_MELHORIAS_ATUALIZADO"
 
 load_dotenv()
 
@@ -97,9 +127,6 @@ AUDIT_HT_NO = os.getenv("AUDIT_HT_NO", "")
 AUDIT_FT_OK = os.getenv("AUDIT_FT_OK", "")
 AUDIT_FT_NO = os.getenv("AUDIT_FT_NO", "")
 
-# V019 — segurança do comando de auditoria.
-# Por padrão, somente comandos OUTGOING do próprio usuário são aceitos.
-# Se quiser liberar chat/user específico, configure AUDITORIA_CHAT_IDS com IDs separados por vírgula.
 AUDITORIA_CHAT_IDS_RAW = os.getenv("AUDITORIA_CHAT_IDS", "").strip()
 AUDITORIA_CHAT_IDS = {
     int(x.strip())
@@ -131,18 +158,55 @@ CSV_PATH = Path(os.getenv("CSV_PATH", "auditoria_alfa.csv"))
 ODD_MINIMA_CLIENTE = os.getenv("ODD_MINIMA_CLIENTE", "1.65")
 
 # =========================================================
+# VALIDAÇÃO DE VARIÁVEIS DE AMBIENTE (MUDANÇA 15)
+# =========================================================
+
+REQUIRED_ENV = [
+    "API_ID", "API_HASH", "SESSION_STRING",
+    "TARGET_CHANNEL", "CONFIRMATION_CHANNEL",
+]
+
+OPTIONAL_ENV = [
+    "TEOLOGIN_EMAIL", "TEOLOGIN_SENHA",
+    "FREE_CHANNEL", "AUDIT_HT_OK", "AUDIT_HT_NO",
+    "AUDIT_FT_OK", "AUDIT_FT_NO", "BACKUP_CHANNEL",
+    "OPENAI_API_KEY", "OPENAI_MODEL",
+]
+
+
+def validar_env() -> None:
+    """Valida todas as variáveis de ambiente críticas (Mudança 15)."""
+    faltando = []
+    for var in REQUIRED_ENV:
+        if not os.getenv(var):
+            faltando.append(var)
+
+    if faltando:
+        log(f"❌ Variáveis obrigatórias faltando: {', '.join(faltando)}")
+        raise RuntimeError(f"Variáveis obrigatórias faltando: {', '.join(faltando)}")
+
+    try:
+        int(os.getenv("API_ID"))
+    except ValueError:
+        raise RuntimeError("API_ID deve ser um número inteiro")
+
+    # Verificar canais
+    for canal in [TARGET_CHANNEL, CONFIRMATION_CHANNEL]:
+        if canal and not canal.startswith("@"):
+            log(f"⚠️ Canal sem @: {canal}")
+
+    log("✅ Variáveis de ambiente validadas")
+
+
+# =========================================================
 # V008 — FLAGS DE ROLLBACK / SEGURANÇA OPERACIONAL
 # =========================================================
-# Mantém o V8 seguro para teste em canal técnico. Se algo se comportar mal,
-# é possível desligar apenas a camada nova sem reverter o arquivo inteiro.
 
 HABILITAR_CONFIRMACAO_V2 = os.getenv("HABILITAR_CONFIRMACAO_V2", "true").lower() == "true"
 HABILITAR_BLOQUEIO_BASE_SEM_MERCADO = os.getenv("HABILITAR_BLOQUEIO_BASE_SEM_MERCADO", "true").lower() == "true"
 HABILITAR_BLOQUEIO_PARSER_CRITICO = os.getenv("HABILITAR_BLOQUEIO_PARSER_CRITICO", "true").lower() == "true"
 HABILITAR_HT_PREMIUM_V2 = os.getenv("HABILITAR_HT_PREMIUM_V2", "true").lower() == "true"
 
-# V009 — freio de inflação do score.
-# Mantém o cérebro/fluxo do V8 e apenas impede que jogos medianos virem 90/96.
 HABILITAR_SCORE_V9 = os.getenv("HABILITAR_SCORE_V9", "true").lower() == "true"
 V9_CAP_JOGO_ABERTO = int(os.getenv("V9_CAP_JOGO_ABERTO", "90"))
 V9_CAP_APROVADO_COMUM = int(os.getenv("V9_CAP_APROVADO_COMUM", "88"))
@@ -151,37 +215,18 @@ V9_CAP_LIGA_UNDER_FRACA = int(os.getenv("V9_CAP_LIGA_UNDER_FRACA", "80"))
 V9_CAP_FINALIZACAO_BAIXA = int(os.getenv("V9_CAP_FINALIZACAO_BAIXA", "86"))
 V9_CAP_PRESSAO_RECENTE_FRACA = int(os.getenv("V9_CAP_PRESSAO_RECENTE_FRACA", "86"))
 
-# V010 — trava de prova extra para ligas UNDER/Sul-Americanas problemáticas.
-# Argentina excluída da régua rígida por comportamento melhor na auditoria.
 HABILITAR_UNDER_PROVA_EXTRA = os.getenv("HABILITAR_UNDER_PROVA_EXTRA", "true").lower() == "true"
 
-# V013 — auditoria HTML automática.
-# Gera JSON diário + HTML diário em /data (ou pasta local como fallback).
-# Envia HTMLs às 00:05 para CONFIRMATION_CHANNEL. Zero impacto no score/funil.
 HABILITAR_V13_AUDITORIA_HTML = os.getenv("HABILITAR_V13_AUDITORIA_HTML", "true").lower() == "true"
 
-# V014 — VOLUME_FT: radar interno da CornerPro com filtro exclusivo antes do score.
-# Reprovados morrem silenciosamente. Aprovados seguem fluxo ALFA normal.
 HABILITAR_VOLUME_FT = os.getenv("HABILITAR_VOLUME_FT", "true").lower() == "true"
 
-# V026 — FAV_NAO_PRESSIONANTE: penaliza score FT onde favorito não é o lado pressionante.
-# Modo auditoria: não bloqueia — penaliza -8 no score e registra motivo no CSV/HTML.
-# Baseado em auditoria: 7 reds eliminados com custo de 11 greens (72% → 74.4%).
-# Aplica-se ao FT geral (ALFA_FT, CHAMA_FT). Não afeta HT nem CONF.
 HABILITAR_V26_FAV_NAO_PRESSIONANTE = os.getenv("HABILITAR_V26_FAV_NAO_PRESSIONANTE", "true").lower() == "true"
 V26_FAV_NAO_PRESSIONANTE_PENALIDADE = int(os.getenv("V26_FAV_NAO_PRESSIONANTE_PENALIDADE", "8"))
 
-# V026 — PERSISTENCIA_TELEGRAM: salva estado dos contadores do grupo grátis e auditoria
-# via mensagem no canal interno, sobrevivendo a restarts do Railway sem precisar de Volume.
 HABILITAR_V26_PERSISTENCIA_TELEGRAM = os.getenv("HABILITAR_V26_PERSISTENCIA_TELEGRAM", "true").lower() == "true"
-# Tag usada para identificar mensagens de estado no canal interno.
 V26_ESTADO_TAG = "#COUTIPS_ESTADO_V26"
 
-# =========================================================
-# V027 — REDUÇÃO DE VOLUME / DISCIPLINA CONTEXTUAL
-# Camada cirúrgica pós-auditoria de 195 jogos.
-# Não altera o núcleo do score; aplica portões/limites com rollback por flag.
-# =========================================================
 HABILITAR_V27_POS70_OFF = os.getenv("HABILITAR_V27_POS70_OFF", "true").lower() == "true"
 HABILITAR_V27_ALAVANCAGEM_SO_FT = os.getenv("HABILITAR_V27_ALAVANCAGEM_SO_FT", "true").lower() == "true"
 HABILITAR_V27_HT_MODERADO_ALAV_OBS = os.getenv("HABILITAR_V27_HT_MODERADO_ALAV_OBS", "true").lower() == "true"
@@ -192,13 +237,6 @@ HABILITAR_V27_EMPATE_MAIS_RIGIDO = os.getenv("HABILITAR_V27_EMPATE_MAIS_RIGIDO",
 HABILITAR_V27_PERDEDOR_UM_EXIGE_REACAO = os.getenv("HABILITAR_V27_PERDEDOR_UM_EXIGE_REACAO", "true").lower() == "true"
 V27_UNDER_TETO_SCORE = int(os.getenv("V27_UNDER_TETO_SCORE", "82"))
 
-# =========================================================
-# V028 — FILTRO DE QUALIDADE CONTEXTUAL
-# Base: V27 com refinamentos adicionais.
-# Baseado na auditoria 01-07/06 (195 jogos) e simulacao de 217 alertas.
-# Taxa simulada: 94,3% (82G/5R em 87 aprovados).
-# Nao reconstroi o score. Reforça funil e adiciona DNA projetado como ajuste leve.
-# =========================================================
 HABILITAR_V28 = os.getenv("HABILITAR_V28", "true").lower() == "true"
 HABILITAR_V28_HT_MODERADO_BLOQUEIO = os.getenv("HABILITAR_V28_HT_MODERADO_BLOQUEIO", "true").lower() == "true"
 HABILITAR_V28_UNDER_BLOQUEIO_FORTE = os.getenv("HABILITAR_V28_UNDER_BLOQUEIO_FORTE", "true").lower() == "true"
@@ -206,118 +244,55 @@ HABILITAR_V28_DNA_PROJETADO = os.getenv("HABILITAR_V28_DNA_PROJETADO", "true").l
 HABILITAR_V28_RELOGIO_FT = os.getenv("HABILITAR_V28_RELOGIO_FT", "true").lower() == "true"
 V28_UNDER_TETO_SCORE = int(os.getenv("V28_UNDER_TETO_SCORE", str(V27_UNDER_TETO_SCORE)))
 
-# =========================================================
-# DC01 — CHAMA_FT PLACAR ELÁSTICO
-# Camada exclusiva para CHAMA_FT quando a diferença do placar é 3+ gols.
-# Não altera score central, VOLUME, SNIPER, ARCE, IA ou grupo grátis.
-# Estados possíveis: MORTO -> bloqueia | MEIO_TERMO -> confirmação | CAOS -> aprova.
-# =========================================================
 HABILITAR_DC01_CHAMA_PLACAR_ELASTICO = os.getenv("HABILITAR_DC01_CHAMA_PLACAR_ELASTICO", "true").lower() == "true"
 DC01_CHAMA_DIF_MIN_PLACAR_ELASTICO = int(os.getenv("DC01_CHAMA_DIF_MIN_PLACAR_ELASTICO", "3"))
 
-# =========================================================
-# DC01.1 — FILOSOFIA DA NECESSIDADE
-# Ajuste final: SNIPER só aceita favorito em necessidade real.
-# ARCE/HT com placar largo só passa se ainda existir jogo vivo/ameaça real.
-# =========================================================
 HABILITAR_DC01_1_SNIPER_NECESSIDADE = os.getenv("HABILITAR_DC01_1_SNIPER_NECESSIDADE", "true").lower() == "true"
 HABILITAR_DC01_1_HT_PLACAR_LARGO_NECESSIDADE = os.getenv("HABILITAR_DC01_1_HT_PLACAR_LARGO_NECESSIDADE", "true").lower() == "true"
 DC01_1_HT_DIF_MIN_PLACAR_LARGO = int(os.getenv("DC01_1_HT_DIF_MIN_PLACAR_LARGO", "3"))
 
-
-# =========================================================
-# DC01.2 — AJUSTES PÓS-AUDITORIA
-# Cinco ajustes isolados sem tocar score, V27, V28, DC01, CHAMA_FT.
-# Cada ajuste tem flag própria para rollback individual.
-# =========================================================
-
-# DC01.2 — CONF01: BOT_FT CONFIRMAÇÃO com lógica de necessidade explícita.
-# Bloqueia confirmação quando favorito já vence por 1 e zebra está morta.
 HABILITAR_DC01_2_CONF01 = os.getenv("HABILITAR_DC01_2_CONF01", "true").lower() == "true"
+HABILITAR_DC01_2_V26_CAOS_BIDIRECIONAL = os.getenv("HABILITAR_DC01_2_V26_CAOS_BIDIRECIONAL", "true").lower() == "true"
 
-# DC01.2 — SNIPER V2: bot de necessidade. Já implementado em DC01.1.
-# Flag mantida para consistência de nomenclatura. Controlado por HABILITAR_DC01_1_SNIPER_NECESSIDADE.
-
-# DC01.2 — HT placar largo sem necessidade. Já implementado em DC01.1.
-# Flag mantida para consistência. Controlado por HABILITAR_DC01_1_HT_PLACAR_LARGO_NECESSIDADE.
-
-# DC01.2 — V26 CAOS BIDIRECIONAL: reduz penalidade FAV_NAO_PRESSIONANTE em jogos de trocação.
-
-# DC01.3 — TRÊS AJUSTES PÓS-AUDITORIA (12/06/2026)
-# Ajuste 1: gol de empate do favorito reduz exigência de provas em v27_continuidade_pos_gol.
-# Ajuste 2: favorito vencendo 1x0 passa com 3/4 critérios em vez de 4/4.
-# Ajuste 3: favorito perdendo por 1 aceita pressão simples (U5>=4 OU U10>=7).
 HABILITAR_DC01_3_EMPATE_FAVORITO = os.getenv("HABILITAR_DC01_3_EMPATE_FAVORITO", "true").lower() == "true"
 HABILITAR_DC01_3_1X0_TRES_DE_QUATRO = os.getenv("HABILITAR_DC01_3_1X0_TRES_DE_QUATRO", "true").lower() == "true"
 HABILITAR_DC01_3_PERDEDOR_PRESSAO_SIMPLES = os.getenv("HABILITAR_DC01_3_PERDEDOR_PRESSAO_SIMPLES", "true").lower() == "true"
 
-# DC01.4 — AJUSTES PÓS-AUDITORIA 13/06/2026
-# Ajuste A: GOL_RECENTE pressionante que continua dominando AP não bloqueia.
-#   Se pressionante marcou E AP diff ainda positivo E não esfriou (U5>0 OU RB>0 OU IP>=10),
-#   reduz exigência de provas: delta<=3 = 1 prova, delta>3 = 1 prova.
-#   Rollback: HABILITAR_DC01_4_GOL_RECENTE_PRESSIONANTE_AP=false
-# Ajuste B: CHAMA_FT placar elástico — perdedor forte + vencedor vivo = APROVAR direto.
-#   Remove espera de confirmação nesse cenário específico.
-#   Rollback: HABILITAR_DC01_4_CHAMA_ELASTICO_PERDEDOR_DIRETO=false
 HABILITAR_DC01_4_GOL_RECENTE_PRESSIONANTE_AP = os.getenv("HABILITAR_DC01_4_GOL_RECENTE_PRESSIONANTE_AP", "true").lower() == "true"
 HABILITAR_DC01_4_CHAMA_ELASTICO_PERDEDOR_DIRETO = os.getenv("HABILITAR_DC01_4_CHAMA_ELASTICO_PERDEDOR_DIRETO", "true").lower() == "true"
 
-# =========================================================
-# V29 — PACOTE DE MELHORIAS 18/06/2026
-# Flag única controla todo o pacote de código.
-# Flag separada controla o pacote IA (modelo + prompt).
-# Rollback: setar HABILITAR_V29_MELHORIAS=false ou HABILITAR_V29_IA_NOVA=false no Railway.
-# =========================================================
 HABILITAR_V29_MELHORIAS = os.getenv("HABILITAR_V29_MELHORIAS", "true").lower() == "true"
 HABILITAR_V29_IA_NOVA = os.getenv("HABILITAR_V29_IA_NOVA", "true").lower() == "true"
 
-# V29 — Thresholds configuráveis para as novas travas
-# Item 1: trava confirmação favorito vencendo + gol recente
 V29_CONF_FAV_VENCENDO_GOL_RECENTE_JANELA = int(os.getenv("V29_CONF_FAV_VENCENDO_GOL_RECENTE_JANELA", "15"))
 V29_CONF_FAV_VENCENDO_U10_MIN = int(os.getenv("V29_CONF_FAV_VENCENDO_U10_MIN", "10"))
 V29_CONF_FAV_VENCENDO_RB_MIN = int(os.getenv("V29_CONF_FAV_VENCENDO_RB_MIN", "6"))
 V29_CONF_FAV_VENCENDO_XG_MIN = float(os.getenv("V29_CONF_FAV_VENCENDO_XG_MIN", "2.0"))
-# Item 2: trava confirmação placar largo adversário
 V29_CONF_PLACAR_LARGO_MIN_DIFF = int(os.getenv("V29_CONF_PLACAR_LARGO_MIN_DIFF", "3"))
-# Item 10: decaimento de pressão no 2ºP
 V29_DECAIMENTO_XG_MIN = float(os.getenv("V29_DECAIMENTO_XG_MIN", "1.5"))
 V29_DECAIMENTO_U10_MIN = int(os.getenv("V29_DECAIMENTO_U10_MIN", "8"))
-# Item 11: DC01 massacre absoluto do vencedor
 V29_MASSACRE_IP_MIN = float(os.getenv("V29_MASSACRE_IP_MIN", "25.0"))
 V29_MASSACRE_RB_MIN = int(os.getenv("V29_MASSACRE_RB_MIN", "10"))
 V29_MASSACRE_CHANCE_MIN = int(os.getenv("V29_MASSACRE_CHANCE_MIN", "12"))
 V29_MASSACRE_DIFF_MIN = int(os.getenv("V29_MASSACRE_DIFF_MIN", "3"))
 V29_MASSACRE_GOL_ANTES_MIN = int(os.getenv("V29_MASSACRE_GOL_ANTES_MIN", "60"))
 
-# Médio: penalidade -2 (em vez de -8). Forte: penalidade 0.
-# Nunca cria nova camada — apenas modifica a intensidade da penalidade V26.
-HABILITAR_DC01_2_V26_CAOS_BIDIRECIONAL = os.getenv("HABILITAR_DC01_2_V26_CAOS_BIDIRECIONAL", "true").lower() == "true"
-
-# V012 — camadas cirúrgicas: grupo grátis, ALAVANCAGEM, Austrália especial e HT-2.
-# Mantém score, funil, IA e parser centrais preservados.
 HABILITAR_V11_GRUPO_GRATUITO = os.getenv("HABILITAR_V11_GRUPO_GRATUITO", "true").lower() == "true"
 HABILITAR_V11_ALAVANCAGEM = os.getenv("HABILITAR_V11_ALAVANCAGEM", "true").lower() == "true"
 HABILITAR_V11_AUSTRALIA = os.getenv("HABILITAR_V11_AUSTRALIA", "true").lower() == "true"
 HABILITAR_V11_HT_CORRECOES = os.getenv("HABILITAR_V11_HT_CORRECOES", "true").lower() == "true"
 HABILITAR_HT_BONUS_SUPER_FAV_VENCENDO = os.getenv("HABILITAR_HT_BONUS_SUPER_FAV_VENCENDO", "true").lower() == "true"
 
-# Canal completo = recebe todos os aprovados. Por padrão reaproveita o antigo canal de confirmação.
 COMPLETE_CHANNEL = os.getenv("COMPLETE_CHANNEL") or CONFIRMATION_CHANNEL
 FREE_CHANNEL = os.getenv("FREE_CHANNEL") or TARGET_CHANNEL
 
-# Janelas do grupo grátis.
-V11_FREE_J1_LIMITE = int(os.getenv("V11_FREE_J1_LIMITE", "3"))   # 06:30–12:00
-V11_FREE_J2_LIMITE = int(os.getenv("V11_FREE_J2_LIMITE", "4"))   # 12:00–18:00
-V11_FREE_J3_LIMITE = int(os.getenv("V11_FREE_J3_LIMITE", "4"))   # 18:00–23:00
+V11_FREE_J1_LIMITE = int(os.getenv("V11_FREE_J1_LIMITE", "3"))
+V11_FREE_J2_LIMITE = int(os.getenv("V11_FREE_J2_LIMITE", "4"))
+V11_FREE_J3_LIMITE = int(os.getenv("V11_FREE_J3_LIMITE", "4"))
 V11_FREE_GOL_VANTAGEM_MIN = int(os.getenv("V11_FREE_GOL_VANTAGEM_MIN", "10"))
 V11_FREE_COOLDOWN_JOGO_HORAS = int(os.getenv("V11_FREE_COOLDOWN_JOGO_HORAS", "24"))
 V11_TZ_OFFSET_HORAS = int(os.getenv("V11_TZ_OFFSET_HORAS", "-4"))
 
-# V12: HT-2 corrigido. HT-3 fica fora desta versão operacional.
-# V12_2: bônus cirúrgico para super favorito vencendo por 1 no HT com pressão extrema.
-
-# Segurança do parser: abaixo disso o dado está provavelmente quebrado,
-# não apenas com rótulo errado. Rótulo errado corrigível segue normalmente.
 PARSER_CONFIANCA_CRITICA = int(os.getenv("PARSER_CONFIANCA_CRITICA", "2"))
 
 client = TelegramClient(
@@ -340,118 +315,40 @@ pendentes_por_jogo: Dict[str, List[Dict[str, Any]]] = {}
 tarefas_decisao: Dict[str, asyncio.Task] = {}
 locks_por_jogo: Dict[str, asyncio.Lock] = {}
 
-# V007 — estado específico para jogos FT aguardando confirmação pós-gol.
-# Não substitui a janela curta de decisão; é memória operacional entre CHAMA_FT/ALFA_FT e BOT_FT CONFIRMAÇÃO.
 pendentes_confirmacao_ft: Dict[str, Dict[str, Any]] = {}
 tarefas_timeout_confirmacao_ft: Dict[str, asyncio.Task] = {}
 
-# V29 — cooldown universal por jogo.
-# Registra qualquer jogo que foi aprovado e enviado. Chave = normalizar_chave_jogo(jogo).
-# Impede segunda entrada do mesmo jogo independente do bot.
 v29_aprovados_por_jogo: Dict[str, float] = {}
 
-# V011 — estado do grupo grátis.
-# V017 — contadores e cooldowns persistidos em JSON para sobreviver a restarts.
 v11_gratis_contadores: Dict[str, int] = {}
 v11_gratis_enviados_por_jogo: Dict[str, float] = {}
 
 _V17_ESTADO_FILE = "v17_gratis_estado.json"
+_V29_COOLDOWN_FILE = "v29_cooldowns.json"
+
+
+# =========================================================
+# FUNÇÕES DE UTILIDADE / LOG
+# =========================================================
+
+def _data_dir() -> Path:
+    d = Path(os.getenv("DATA_DIR", "/data"))
+    if not d.exists():
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            d = Path("auditoria_html")
+            d.mkdir(parents=True, exist_ok=True)
+    return d
 
 
 def _v17_estado_path() -> Path:
-    """Caminho do arquivo de estado persistente — usa /data ou fallback local."""
     return _data_dir() / _V17_ESTADO_FILE
 
 
-def v17_carregar_estado() -> None:
-    """Carrega contadores e cooldowns do JSON ao iniciar/reiniciar."""
-    global v11_gratis_contadores, v11_gratis_enviados_por_jogo
-    try:
-        p = _v17_estado_path()
-        if not p.exists():
-            log("📂 V17 estado grátis: arquivo não encontrado, iniciando zerado")
-            return
-        dados = json.loads(p.read_text(encoding="utf-8"))
-        v11_gratis_contadores = {k: int(v) for k, v in dados.get("contadores", {}).items()}
-        v11_gratis_enviados_por_jogo = {k: float(v) for k, v in dados.get("cooldowns", {}).items()}
-        log(f"📂 V17 estado grátis carregado | contadores={len(v11_gratis_contadores)} | cooldowns={len(v11_gratis_enviados_por_jogo)}")
-    except Exception as e:
-        log(f"⚠️ V17 carregar_estado erro | {type(e).__name__}: {e}")
+def _v29_cooldown_path() -> Path:
+    return _data_dir() / _V29_COOLDOWN_FILE
 
-
-def v17_salvar_estado() -> None:
-    """Persiste contadores e cooldowns imediatamente após cada envio."""
-    try:
-        dados = {
-            "contadores": dict(v11_gratis_contadores),
-            "cooldowns": dict(v11_gratis_enviados_por_jogo),
-            "atualizado_em": datetime.now().isoformat(),
-        }
-        _v17_estado_path().write_text(json.dumps(dados, ensure_ascii=False, indent=2), encoding="utf-8")
-    except Exception as e:
-        log(f"⚠️ V17 salvar_estado erro | {type(e).__name__}: {e}")
-
-
-# =========================================================
-# V026 — PERSISTÊNCIA VIA TELEGRAM
-# Salva estado dos contadores no canal interno como backup.
-# Sobrevive a restarts mesmo sem Volume /data no Railway.
-# Lê a última mensagem com tag V26_ESTADO_TAG ao iniciar.
-# =========================================================
-
-_v26_msg_estado_id: Optional[int] = None  # ID da mensagem de estado no Telegram
-
-
-async def v26_salvar_estado_telegram() -> None:
-    """Salva estado dos contadores como mensagem no canal interno."""
-    if not HABILITAR_V26_PERSISTENCIA_TELEGRAM:
-        return
-    global _v26_msg_estado_id
-    try:
-        dados = {
-            "contadores": dict(v11_gratis_contadores),
-            "cooldowns": dict(v11_gratis_enviados_por_jogo),
-            "atualizado_em": datetime.now().isoformat(),
-        }
-        texto = f"{V26_ESTADO_TAG}\n{json.dumps(dados, ensure_ascii=False)}"
-        if _v26_msg_estado_id:
-            try:
-                await client.edit_message(CONFIRMATION_CHANNEL, _v26_msg_estado_id, texto)
-                return
-            except Exception:
-                pass  # Se não conseguir editar, envia nova
-        msg = await client.send_message(CONFIRMATION_CHANNEL, texto)
-        _v26_msg_estado_id = msg.id
-        log(f"💾 V26 estado salvo no Telegram | msg_id={_v26_msg_estado_id}")
-    except Exception as e:
-        log(f"⚠️ V26 salvar_estado_telegram erro | {type(e).__name__}: {e}")
-
-
-async def v26_carregar_estado_telegram() -> None:
-    """Lê o último estado salvo no canal interno ao iniciar."""
-    if not HABILITAR_V26_PERSISTENCIA_TELEGRAM:
-        return
-    global v11_gratis_contadores, v11_gratis_enviados_por_jogo, _v26_msg_estado_id
-    try:
-        async for msg in client.iter_messages(CONFIRMATION_CHANNEL, limit=50):
-            if msg.text and V26_ESTADO_TAG in msg.text:
-                linhas = msg.text.split("\n", 1)
-                if len(linhas) < 2:
-                    continue
-                dados = json.loads(linhas[1])
-                v11_gratis_contadores = {k: int(v) for k, v in dados.get("contadores", {}).items()}
-                v11_gratis_enviados_por_jogo = {k: float(v) for k, v in dados.get("cooldowns", {}).items()}
-                _v26_msg_estado_id = msg.id
-                log(f"📂 V26 estado carregado do Telegram | msg_id={msg.id} | contadores={len(v11_gratis_contadores)} | cooldowns={len(v11_gratis_enviados_por_jogo)}")
-                return
-        log("📂 V26 estado Telegram: nenhuma mensagem encontrada, iniciando zerado")
-    except Exception as e:
-        log(f"⚠️ V26 carregar_estado_telegram erro | {type(e).__name__}: {e}")
-
-
-# =========================================================
-# LOG / UTILITÁRIOS
-# =========================================================
 
 def log(msg: str) -> None:
     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
@@ -461,71 +358,6 @@ def log(msg: str) -> None:
         logging.warning(msg)
     else:
         logging.info(msg)
-
-
-def logar_versao_inicial() -> None:
-    log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    log(f"🚀 VERSAO_COUTIPS_ATIVA = {VERSAO_COUTIPS}")
-    log("✅ GOAT V12 FINAL — correção HT-2 + grupo grátis + ALAVANCAGEM + Austrália")
-    log("🛡️ Parser: minuto manda no período + observações internas")
-    log(f"🛡️ Confirmação V2: {'ATIVA' if HABILITAR_CONFIRMACAO_V2 else 'DESATIVADA'}")
-    log(f"🛡️ Bloqueio base U18/U19/U20: {'ATIVO' if HABILITAR_BLOQUEIO_BASE_SEM_MERCADO else 'DESATIVADO'}")
-    log(f"🛡️ Parser crítico: {'BLOQUEIA' if HABILITAR_BLOQUEIO_PARSER_CRITICO else 'SÓ OBSERVA'}")
-    log(f"🛡️ HT Premium V2: {'ATIVO' if HABILITAR_HT_PREMIUM_V2 else 'DESATIVADO'}")
-    log(f"🧮 Score V9 anti-inflação: {'ATIVO' if HABILITAR_SCORE_V9 else 'DESATIVADO'}")
-    log(f"🛡️ UNDER prova extra: {'ATIVA' if HABILITAR_UNDER_PROVA_EXTRA else 'DESATIVADA'}")
-    log("🛡️ Teto Python 96 / IA 95")
-    log(f"📊 Corte HT={CORTE_GOL_HT}% | Corte FT={CORTE_GOL_FT}%")
-    log(f"📤 Canal grátis: {FREE_CHANNEL}")
-    log(f"🧪 Canal completo: {COMPLETE_CHANNEL}")
-    log(f"🆓 V12 grupo grátis: {'ATIVO' if HABILITAR_V11_GRUPO_GRATUITO else 'DESATIVADO'} | limites={V11_FREE_J1_LIMITE}/{V11_FREE_J2_LIMITE}/{V11_FREE_J3_LIMITE}")
-    log(f"🔺 V12 ALAVANCAGEM: {'ATIVA' if HABILITAR_V11_ALAVANCAGEM else 'DESATIVADA'}")
-    log(f"🇦🇺 V12 Austrália especial: {'ATIVA' if HABILITAR_V11_AUSTRALIA else 'DESATIVADA'}")
-    log(f"🧰 V12 HT-2 ap_diff por lado avaliado: {'ATIVO' if HABILITAR_V11_HT_CORRECOES else 'DESATIVADO'}")
-    log(f"➕ V12_2 bônus HT super favorito vencendo por 1: {'ATIVO' if HABILITAR_HT_BONUS_SUPER_FAV_VENCENDO else 'DESATIVADO'}")
-    log(f"📄 V13 auditoria HTML automática: {'ATIVA' if HABILITAR_V13_AUDITORIA_HTML else 'DESATIVADA'} | dir={_data_dir()}")
-    log(f"🔊 V14 VOLUME_FT: {'ATIVO' if HABILITAR_VOLUME_FT else 'DESATIVADO'}")
-    log(f"📋 V15 comando auditoria: ATIVO | /auditoria ou 'auditoria' no canal interno")
-    log(f"📤 V16 handler outgoing: ATIVO | exclusivo para comando auditoria")
-    log(f"💾 V17 persistência contadores grátis: ATIVA | arquivo={_V17_ESTADO_FILE}")
-    log("🧱 V18 regra volume/grátis: favorito vencendo só passa em cenário EXTREMO")
-    log("🧭 V20 detector estratégia robusto: VOLUME_FT não cai mais como ALFA_FT/HT")
-    log("🧱 V21 VOLUME_FT: favorito vencendo por 1+ só passa em cenário EXTREMO")
-    log(f"📡 V24 handler canal auditoria: ATIVO | IDs autorizados={AUDITORIA_CHAT_IDS}")
-    log("🔧 V25 fixes: link CornerPro, botões HTML, HT duplicado, alavancagem HT restrita")
-    log(f"🚫 V26 FAV_NAO_PRESSIONANTE FT: {'ATIVO' if HABILITAR_V26_FAV_NAO_PRESSIONANTE else 'DESATIVADO'}")
-    log(f"💾 V26 persistência Telegram: {'ATIVA' if HABILITAR_V26_PERSISTENCIA_TELEGRAM else 'DESATIVADA'} | tag={V26_ESTADO_TAG}")
-    log(f"🧹 V27 POS70 OFF: {'ATIVO' if HABILITAR_V27_POS70_OFF else 'DESATIVADO'}")
-    log(f"🔺 V27 ALAVANCAGEM só FT: {'ATIVA' if HABILITAR_V27_ALAVANCAGEM_SO_FT else 'DESATIVADA'}")
-    log(f"💎 V27 HT_MODERADO→HT_ALAVANCAGEM observação: {'ATIVO' if HABILITAR_V27_HT_MODERADO_ALAV_OBS else 'DESATIVADO'}")
-    log(f"🟡 V27 UNDER teto {V27_UNDER_TETO_SCORE}: {'ATIVO' if HABILITAR_V27_UNDER_TETO_82 else 'DESATIVADO'}")
-    log(f"🧬 V27 continuidade pós-gol: {'ATIVA' if HABILITAR_V27_CONTINUIDADE_POS_GOL else 'DESATIVADA'}")
-    log(f"🎯 V27 refino placar/empate/perdedor+1 FT: {'ATIVO' if HABILITAR_V27_REFINO_PLACAR_FT else 'DESATIVADO'}")
-    log(f"⛔ V28 HT_MODERADO bloqueio total: {'ATIVO' if HABILITAR_V28 and HABILITAR_V28_HT_MODERADO_BLOQUEIO else 'DESATIVADO'}")
-    log(f"🚫 V28 UNDER bloqueio forte: {'ATIVO' if HABILITAR_V28 and HABILITAR_V28_UNDER_BLOQUEIO_FORTE else 'DESATIVADO'}")
-    log(f"🧬 V28 DNA projetado: {'ATIVO' if HABILITAR_V28 and HABILITAR_V28_DNA_PROJETADO else 'DESATIVADO'}")
-    log(f"⏱ V28 relógio FT janela 81: {'ATIVO' if HABILITAR_V28 and HABILITAR_V28_RELOGIO_FT else 'DESATIVADO'}")
-    log(f"🧱 DC01 CHAMA placar elástico 3+: {'ATIVO' if HABILITAR_DC01_CHAMA_PLACAR_ELASTICO else 'DESATIVADO'}")
-    log(f"🎯 DC01.1 SNIPER necessidade real: {'ATIVO' if HABILITAR_DC01_1_SNIPER_NECESSIDADE else 'DESATIVADO'}")
-    log(f"⚡ DC01.1 HT placar largo com necessidade: {'ATIVO' if HABILITAR_DC01_1_HT_PLACAR_LARGO_NECESSIDADE else 'DESATIVADO'}")
-    log(f"🔐 DC01.2 CONF01 zebra morta: {'ATIVO' if HABILITAR_DC01_2_CONF01 else 'DESATIVADO'}")
-    log(f"🔥 DC01.2 V26 caos bidirecional: {'ATIVO' if HABILITAR_DC01_2_V26_CAOS_BIDIRECIONAL else 'DESATIVADO'}")
-    log(f"⚽ DC01.3 empate favorito reduz provas: {'ATIVO' if HABILITAR_DC01_3_EMPATE_FAVORITO else 'DESATIVADO'}")
-    log(f"🎯 DC01.3 1x0 exige 3/4 critérios: {'ATIVO' if HABILITAR_DC01_3_1X0_TRES_DE_QUATRO else 'DESATIVADO'}")
-    log(f"⚡ DC01.3 perdedor por 1 pressão simples: {'ATIVO' if HABILITAR_DC01_3_PERDEDOR_PRESSAO_SIMPLES else 'DESATIVADO'}")
-    log(f"🔄 DC01.4 gol recente pressionante AP: {'ATIVO' if HABILITAR_DC01_4_GOL_RECENTE_PRESSIONANTE_AP else 'DESATIVADO'}")
-    log(f"🔓 DC01.4 CHAMA elástico perdedor direto: {'ATIVO' if HABILITAR_DC01_4_CHAMA_ELASTICO_PERDEDOR_DIRETO else 'DESATIVADO'}")
-    log("🎯 SNIPER V2: ATIVO | leitura separada, pressão premiada/gol contra fluxo/necessidade")
-    log("🏷️ Auditoria visual: ⚡ ARCE HT | 1T / 🔥 CHAMA FT | 2T / 📊 VOLUME FT | 2T / 🎯 SNIPER | 2T")
-    log(f"🆕 V29 melhorias código: {'ATIVO' if HABILITAR_V29_MELHORIAS else 'DESATIVADO'}")
-    log(f"🤖 V29 IA nova (gpt-5.5 + prompt conservador): {'ATIVO' if HABILITAR_V29_IA_NOVA else 'DESATIVADO'}")
-    log(f"🛡️ V29 trava conf favorito vencendo+gol recente: janela={V29_CONF_FAV_VENCENDO_GOL_RECENTE_JANELA}min u10≥{V29_CONF_FAV_VENCENDO_U10_MIN} rb≥{V29_CONF_FAV_VENCENDO_RB_MIN} xg≥{V29_CONF_FAV_VENCENDO_XG_MIN}")
-    log(f"🛡️ V29 trava conf placar largo: dif≥{V29_CONF_PLACAR_LARGO_MIN_DIFF}")
-    log(f"🛡️ V29 trava RB=0 liga fraca (NEUTRA/PERIGOSA): {'ATIVA' if HABILITAR_V29_MELHORIAS else 'DESATIVADA'}")
-    log(f"🛡️ V29 trava decaimento pressão 2ºP: xg≥{V29_DECAIMENTO_XG_MIN} u10≥{V29_DECAIMENTO_U10_MIN}")
-    log(f"🔺 V29 massacre absoluto vencedor: ip≥{V29_MASSACRE_IP_MIN} rb≥{V29_MASSACRE_RB_MIN} chance≥{V29_MASSACRE_CHANCE_MIN} dif≥{V29_MASSACRE_DIFF_MIN} gol_antes_min{V29_MASSACRE_GOL_ANTES_MIN}")
-    log(f"⏳ V29 cooldown universal por jogo: {'ATIVO' if HABILITAR_V29_MELHORIAS else 'DESATIVADO'}")
-    log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
 
 def remover_acentos(texto: Any) -> str:
@@ -603,6 +435,186 @@ def lock_jogo(chave: str) -> asyncio.Lock:
     return locks_por_jogo[chave]
 
 
+# =========================================================
+# FUNÇÃO AUXILIAR PARA XG TOTAL (MUDANÇA 24)
+# =========================================================
+
+def get_xg_total(m: "Metricas") -> float:
+    """Retorna o xG total do jogo (soma casa + fora)."""
+    if isinstance(m.xg, tuple) and len(m.xg) >= 2:
+        return float(m.xg[0] + m.xg[1])
+    return 0.0
+
+
+# =========================================================
+# PERSISTÊNCIA V17 COM ATOMICIDADE (MUDANÇA 2)
+# =========================================================
+
+def v17_carregar_estado() -> None:
+    global v11_gratis_contadores, v11_gratis_enviados_por_jogo
+    try:
+        p = _v17_estado_path()
+        if not p.exists():
+            log("📂 V17 estado grátis: arquivo não encontrado, iniciando zerado")
+            return
+        dados = json.loads(p.read_text(encoding="utf-8"))
+        v11_gratis_contadores = {k: int(v) for k, v in dados.get("contadores", {}).items()}
+        v11_gratis_enviados_por_jogo = {k: float(v) for k, v in dados.get("cooldowns", {}).items()}
+        log(f"📂 V17 estado grátis carregado | contadores={len(v11_gratis_contadores)} | cooldowns={len(v11_gratis_enviados_por_jogo)}")
+    except Exception as e:
+        log(f"⚠️ V17 carregar_estado erro | {type(e).__name__}: {e}")
+
+
+def v17_salvar_estado() -> None:
+    """Persiste contadores com atomicidade (Mudança 2)."""
+    try:
+        dados = {
+            "contadores": dict(v11_gratis_contadores),
+            "cooldowns": dict(v11_gratis_enviados_por_jogo),
+            "atualizado_em": datetime.now().isoformat(),
+        }
+        path = _v17_estado_path()
+        temp_path = path.with_suffix(".tmp")
+        temp_path.write_text(json.dumps(dados, ensure_ascii=False, indent=2), encoding="utf-8")
+        temp_path.replace(path)
+    except Exception as e:
+        log(f"⚠️ V17 salvar_estado erro | {type(e).__name__}: {e}")
+
+
+# =========================================================
+# PERSISTÊNCIA V29 COOLDOWN (MUDANÇA 1)
+# =========================================================
+
+def v29_carregar_cooldowns() -> None:
+    global v29_aprovados_por_jogo
+    try:
+        p = _v29_cooldown_path()
+        if not p.exists():
+            log("📂 V29 cooldowns: arquivo não encontrado, iniciando zerado")
+            v29_aprovados_por_jogo = {}
+            return
+        dados = json.loads(p.read_text(encoding="utf-8"))
+        v29_aprovados_por_jogo = {k: float(v) for k, v in dados.get("cooldowns", {}).items()}
+        log(f"📂 V29 cooldowns carregados | {len(v29_aprovados_por_jogo)} jogos")
+    except Exception as e:
+        log(f"⚠️ V29 carregar_cooldowns erro | {type(e).__name__}: {e}")
+        v29_aprovados_por_jogo = {}
+
+
+def v29_salvar_cooldowns() -> None:
+    """Persiste cooldowns do V29 (Mudança 1)."""
+    try:
+        dados = {
+            "cooldowns": dict(v29_aprovados_por_jogo),
+            "atualizado_em": datetime.now().isoformat(),
+        }
+        path = _v29_cooldown_path()
+        temp_path = path.with_suffix(".tmp")
+        temp_path.write_text(json.dumps(dados, ensure_ascii=False, indent=2), encoding="utf-8")
+        temp_path.replace(path)
+    except Exception as e:
+        log(f"⚠️ V29 salvar_cooldowns erro | {type(e).__name__}: {e}")
+
+
+# =========================================================
+# PERSISTÊNCIA V26 COM BACKUP (MUDANÇA 3)
+# =========================================================
+
+_v26_msg_estado_id: Optional[int] = None
+
+
+async def v26_salvar_estado_telegram() -> None:
+    """Salva estado com backup em canal secundário (Mudança 3)."""
+    if not HABILITAR_V26_PERSISTENCIA_TELEGRAM:
+        return
+    global _v26_msg_estado_id
+    try:
+        dados = {
+            "contadores": dict(v11_gratis_contadores),
+            "cooldowns": dict(v11_gratis_enviados_por_jogo),
+            "atualizado_em": datetime.now().isoformat(),
+        }
+        texto = f"{V26_ESTADO_TAG}\n{json.dumps(dados, ensure_ascii=False)}"
+
+        if _v26_msg_estado_id:
+            try:
+                await client.edit_message(CONFIRMATION_CHANNEL, _v26_msg_estado_id, texto)
+            except Exception:
+                pass
+
+        msg = await client.send_message(CONFIRMATION_CHANNEL, texto)
+        _v26_msg_estado_id = msg.id
+
+        backup_channel = os.getenv("BACKUP_CHANNEL")
+        if backup_channel:
+            await client.send_message(backup_channel, f"{V26_ESTADO_TAG}_BACKUP\n{json.dumps(dados, ensure_ascii=False)}")
+
+        log(f"💾 V26 estado salvo no Telegram | msg_id={_v26_msg_estado_id}")
+    except Exception as e:
+        log(f"⚠️ V26 salvar_estado_telegram erro | {type(e).__name__}: {e}")
+
+
+async def v26_carregar_estado_telegram() -> None:
+    if not HABILITAR_V26_PERSISTENCIA_TELEGRAM:
+        return
+    global v11_gratis_contadores, v11_gratis_enviados_por_jogo, _v26_msg_estado_id
+    try:
+        async for msg in client.iter_messages(CONFIRMATION_CHANNEL, limit=50):
+            if msg.text and V26_ESTADO_TAG in msg.text:
+                linhas = msg.text.split("\n", 1)
+                if len(linhas) < 2:
+                    continue
+                dados = json.loads(linhas[1])
+                v11_gratis_contadores = {k: int(v) for k, v in dados.get("contadores", {}).items()}
+                v11_gratis_enviados_por_jogo = {k: float(v) for k, v in dados.get("cooldowns", {}).items()}
+                _v26_msg_estado_id = msg.id
+                log(f"📂 V26 estado carregado do Telegram | msg_id={msg.id}")
+                return
+        log("📂 V26 estado Telegram: nenhuma mensagem encontrada, iniciando zerado")
+    except Exception as e:
+        log(f"⚠️ V26 carregar_estado_telegram erro | {type(e).__name__}: {e}")
+
+
+# =========================================================
+# CACHE COM CLASSE ROBUSTA (MUDANÇA 21)
+# =========================================================
+
+class CacheComLimpeza:
+    def __init__(self, max_size: int = 1000, max_age: int = 3600):
+        self._cache: Dict[str, Tuple[Any, float]] = {}
+        self.max_size = max_size
+        self.max_age = max_age
+        self._lock = asyncio.Lock()
+
+    async def set(self, key: str, value: Any) -> None:
+        async with self._lock:
+            self._cache[key] = (value, time.time())
+            if len(self._cache) > self.max_size * 1.2:
+                await self._limpar()
+
+    async def get(self, key: str) -> Optional[Any]:
+        async with self._lock:
+            if key not in self._cache:
+                return None
+            value, ts = self._cache[key]
+            if time.time() - ts > self.max_age:
+                del self._cache[key]
+                return None
+            return value
+
+    async def _limpar(self) -> None:
+        agora = time.time()
+        for key in list(self._cache.keys()):
+            _, ts = self._cache[key]
+            if agora - ts > self.max_age:
+                del self._cache[key]
+
+        if len(self._cache) > self.max_size:
+            sorted_keys = sorted(self._cache.keys(), key=lambda k: self._cache[k][1])
+            for key in sorted_keys[:len(self._cache) - self.max_size]:
+                del self._cache[key]
+
+
 def limpar_memoria_interna() -> None:
     agora = time.time()
     for cache in (ultimos_enviados, mensagens_processadas, ultimas_leituras_por_jogo):
@@ -632,7 +644,6 @@ def limpar_memoria_interna() -> None:
             tarefas_decisao.pop(k, None)
             locks_por_jogo.pop(k, None)
 
-    # V011 — limpeza do cooldown do grupo grátis.
     removidos = 0
     for k in list(v11_gratis_enviados_por_jogo.keys()):
         ts = float(v11_gratis_enviados_por_jogo.get(k, 0) or 0)
@@ -640,9 +651,8 @@ def limpar_memoria_interna() -> None:
             v11_gratis_enviados_por_jogo.pop(k, None)
             removidos += 1
     if removidos > 0:
-        v17_salvar_estado()  # V17 — persiste após limpeza de expirados
+        v17_salvar_estado()
 
-    # Pendências FT precisam durar mais que a janela curta, pois aguardam confirmação até ~81/82.
     for k in list(pendentes_confirmacao_ft.keys()):
         item = pendentes_confirmacao_ft.get(k, {})
         ts = float(item.get("recebido_em", 0) or 0)
@@ -689,7 +699,6 @@ class Metricas:
     cornerpro: str = ""
     texto_bruto: str = ""
 
-    # campos calculados
     liga: str = "NEUTRA"
     lado_favorito: str = "DESCONHECIDO"
     odd_favorito: float = 0.0
@@ -699,14 +708,11 @@ class Metricas:
     valor_pos_evento_classe: str = "SEM_VALOR_ESPECIAL"
     valor_pos_evento_motivo: str = ""
     protecao_ia_ativa: bool = False
-    # Confiança do parser: quantos campos críticos vieram com valor real (0–8).
-    # Usado para detectar silenciosamente falhas de formato da CornerPro.
     parser_confianca: int = 0
     parser_observacoes: List[str] = field(default_factory=list)
     fluxo_decisao: str = "NORMAL"
     fluxo_motivo: str = ""
 
-    # V011 — campos auxiliares para logs/CSV/roteamento.
     previsao_over05_ht: float = 0.0
     grupo_gratuito: str = "NAO"
     motivo_grupo_gratuito: str = ""
@@ -715,6 +721,8 @@ class Metricas:
     australia_leitura: str = ""
     motivo_australia: str = ""
     destino_final: str = ""
+
+    penalidade_v26_fav_nao_press: int = 0
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -753,11 +761,6 @@ class Alerta:
 # =========================================================
 
 def contem_volume_ft_bruto(texto: str) -> bool:
-    """Detector defensivo de VOLUME_FT no texto bruto/cabeçalho.
-
-    Aceita VOLUME_FT, VOLUME FT, VOLUME-FT, VOLUMEFT, BOT_VOLUME_FT.
-    Usado em duas camadas: detector principal e fail-safe antes do processamento.
-    """
     raw = remover_acentos(texto or "").upper()
     primeiros = raw[:350].replace("_", " ")
     compacto = re.sub(r"[^A-Z0-9]+", "", primeiros)
@@ -769,11 +772,6 @@ def contem_volume_ft_bruto(texto: str) -> bool:
 
 
 def contem_pos70_bruto(texto: str) -> bool:
-    """V27 — identifica alertas POS70/Pós 70 antes do score.
-
-    POS70 foi considerado redundante na auditoria operacional. A flag
-    HABILITAR_V27_POS70_OFF permite desligar essa porta sem mexer nos demais FT.
-    """
     raw = remover_acentos(texto or "").upper()
     primeiros = raw[:350].replace("_", " ")
     compacto = re.sub(r"[^A-Z0-9]+", "", primeiros)
@@ -786,40 +784,22 @@ def contem_pos70_bruto(texto: str) -> bool:
 
 
 def contem_ht_moderado_bruto(texto: str) -> bool:
-    """V27 — identifica HT_MODERADO para transformá-lo em HT_ALAVANCAGEM em observação."""
     raw = remover_acentos(texto or "").upper()[:350].replace("_", " ")
     compacto = re.sub(r"[^A-Z0-9]+", "", raw)
     return "HTMODERADO" in compacto or bool(re.search(r"\bHT\s*[-_ ]*MODERADO\b", raw))
 
 
 def contem_sniper_bruto(texto: str) -> bool:
-    """SNIPER V2 — identifica o bot 🎯 SNIPER sem depender do emoji.
-
-    Aceita: SNIPER, SNIPER_FT, 🎯 SNIPER, BOT_SNIPER.
-    """
     raw = remover_acentos(texto or "").upper()[:350].replace("_", " ")
     compacto = re.sub(r"[^A-Z0-9]+", "", raw)
     return "SNIPER" in compacto or bool(re.search(r"\b(?:BOT\s*)?SNIPER\s*[-_ ]*(?:FT|2T)?\b", raw))
 
 
 def detectar_estrategia(texto: str) -> str:
-    """Detecta a estratégia de forma robusta, priorizando a linha do bot.
-
-    V20 — correção crítica:
-    - normalizar() remove underscore, então VOLUME_FT podia virar VOLUMEFT;
-    - a presença de "Intervalo" no alerta podia empurrar fallback para HT;
-    - agora o detector lê primeiro a linha "Alerta Estratégia" e usa uma
-      versão compacta sem espaços/underscore/hífen para reconhecer variações.
-
-    Exemplos aceitos para Volume:
-    VOLUME_FT, VOLUME FT, VOLUME-FT, VOLUMEFT, BOT_VOLUME_FT, BOT VOLUME FT.
-    """
     raw = remover_acentos(texto or "").upper()
     raw = raw.replace("_", " ")
     raw = re.sub(r"\s+", " ", raw)
 
-    # Usa primeiro a linha/cabeçalho da estratégia, para não confundir com
-    # "Intervalo", "1ºP", "2ºP" ou outros termos do corpo do alerta.
     estrategia_txt = raw
     m = re.search(
         r"ALERTA\s+ESTRATEGIA\s*:\s*(.*?)(?:\s+JOGO\s*:|\s+COMPETICAO\s*:|\s+TEMPO\s*:|$)",
@@ -829,21 +809,15 @@ def detectar_estrategia(texto: str) -> str:
     if m and m.group(1).strip():
         estrategia_txt = m.group(1).strip()
 
-    # Remove emojis/símbolos e deixa só letras/números para matching definitivo.
     compacto = re.sub(r"[^A-Z0-9]+", "", estrategia_txt)
     compacto_full = re.sub(r"[^A-Z0-9]+", "", raw)
 
-    # V20 — VOLUME_FT tem prioridade absoluta antes de HT/FT normal.
-    # Isso evita VOLUME_FT cair em ALFA_HT/ALFA_FT por causa de underscore removido
-    # ou por causa do texto "Intervalo" no corpo do alerta.
     if contem_volume_ft_bruto(estrategia_txt) or contem_volume_ft_bruto(raw[:350]):
         return "VOLUME_FT"
 
-    # SNIPER V2 — bot separado do FT genérico.
     if contem_sniper_bruto(estrategia_txt) or contem_sniper_bruto(raw[:350]):
         return "SNIPER_FT"
 
-    # Confirmações têm prioridade depois de Volume/Sniper.
     if (
         "BOTHTCONFIRMACAO" in compacto
         or "HTCONFIRMACAO" in compacto
@@ -857,13 +831,11 @@ def detectar_estrategia(texto: str) -> str:
     ):
         return "ALFA_FT_CONFIRMACAO"
 
-    # Radares canônicos.
     if "ARCEHT" in compacto or compacto == "ARCE":
         return "ARCE_HT"
     if "CHAMAFT" in compacto or compacto == "CHAMA":
         return "CHAMA_FT"
 
-    # Nomes antigos/variações de HT.
     if (
         "BOTHT" in compacto
         or "HTPREMIUM" in compacto
@@ -876,7 +848,6 @@ def detectar_estrategia(texto: str) -> str:
     ):
         return "ALFA_HT"
 
-    # Nomes antigos/variações de FT.
     if (
         "BOTFT" in compacto
         or "FTPREMIUM" in compacto
@@ -890,13 +861,12 @@ def detectar_estrategia(texto: str) -> str:
     ):
         return "ALFA_FT"
 
-    # Fallback por período só no texto completo, como último recurso.
-    # Não usa "Intervalo" para forçar HT se o minuto depois corrigir para FT.
     if "SEGUNDOTEMPO" in compacto_full or "2T" in compacto_full:
         return "ALFA_FT"
     if "PRIMEIROTEMPO" in compacto_full or "1T" in compacto_full:
         return "ALFA_HT"
     return "ALFA_FT"
+
 
 def eh_ht(estrategia: str) -> bool:
     return estrategia in {"ALFA_HT", "ALFA_HT_CONFIRMACAO", "ARCE_HT"}
@@ -907,7 +877,6 @@ def eh_ft(estrategia: str) -> bool:
 
 
 def eh_sniper_ft(estrategia: str) -> bool:
-    """SNIPER V2 — leitura FT separada, sem interferir em CHAMA/VOLUME/ARCE."""
     return estrategia == "SNIPER_FT"
 
 
@@ -916,21 +885,10 @@ def eh_confirmacao(estrategia: str) -> bool:
 
 
 def eh_volume_ft(estrategia: str) -> bool:
-    """V014 — radar interno VOLUME_FT."""
     return estrategia == "VOLUME_FT"
 
 
-# =========================================================
-# V007 — NORMALIZAÇÃO DE PERÍODO / PARSER SEGURO
-# =========================================================
-
 def corrigir_estrategia_por_minuto(estrategia: str, tempo: int, observacoes: List[str]) -> str:
-    """Minuto é autoridade para HT/FT.
-
-    Não mata o jogo por erro bobo de rótulo. Corrige internamente e registra
-    observação para auditoria. Isso evita cliente receber FT como HT e evita
-    perder jogo bom por nomenclatura da CornerPro.
-    """
     try:
         t = int(tempo or 0)
     except Exception:
@@ -954,7 +912,6 @@ def minuto_gol_delta(m: "Metricas") -> int:
 
 
 def gol_recente(m: "Metricas", janela: int = 5) -> bool:
-    """Aceita pequena divergência de feed (ex.: tempo 81 e último gol 82)."""
     d = minuto_gol_delta(m)
     return -1 <= d <= janela
 
@@ -971,18 +928,12 @@ def gols_lado(m: "Metricas", lado: str) -> Tuple[int, int]:
 
 
 def ultimo_gol_aumentou_vantagem(m: "Metricas") -> bool:
-    """True quando o último gol foi do lado que já vencia antes do gol.
-
-    Exemplos True: 1x0→2x0, 2x0→3x0, 2x1→3x1.
-    Exemplo False: 0x0→1x0, 0x1→1x1, 0x2→1x2.
-    """
     lado = m.ultimo_gol_lado
     if lado not in {"CASA", "FORA"}:
         return False
     gols_pro, gols_contra = gols_lado(m, lado)
     if gols_pro <= 0:
         return False
-    # Placar antes do último gol: lado tinha um gol a menos.
     return (gols_pro - 1) > gols_contra
 
 
@@ -1002,10 +953,8 @@ def ultimo_gol_empatou_ou_reduziu(m: "Metricas") -> bool:
     if gols_pro <= 0:
         return False
     antes_pro = gols_pro - 1
-    # Empatou: antes perdia por 1, depois empate.
     if antes_pro < gols_contra and gols_pro == gols_contra:
         return True
-    # Reduziu: antes perdia por 2+, depois ainda perde por menos.
     if antes_pro < gols_contra and gols_pro < gols_contra:
         return True
     return False
@@ -1020,12 +969,6 @@ def gol_recente_pressionante_aumentou_vantagem(m: "Metricas", janela: int = 5) -
 
 
 def gol_recente_pressionante_resolveu_confirmacao(m: "Metricas", janela: int = 5) -> bool:
-    """Regra mais rígida para BOT_FT CONFIRMAÇÃO.
-
-    Na confirmação, se o gol saiu praticamente em cima do alerta e foi do lado
-    pressionante, a entrada morre quando esse gol deixa o pressionante vencendo
-    ou amplia vantagem. Exceções: empate/redução de desvantagem.
-    """
     if not gol_recente_do_pressionante(m, janela):
         return False
     if ultimo_gol_empatou_ou_reduziu(m):
@@ -1034,10 +977,6 @@ def gol_recente_pressionante_resolveu_confirmacao(m: "Metricas", janela: int = 5
 
 
 def competicao_base_bloqueada(m: "Metricas") -> bool:
-    """Bloqueia apenas U18/U19/U20/Sub-18/Sub-19/Sub-20.
-
-    Não bloqueia U21, Reserves, B, C ou II.
-    """
     texto = remover_acentos(f"{m.competicao} {m.jogo}").upper()
     padroes = [
         r"\bU\s*-?\s*(18|19|20)\b",
@@ -1049,11 +988,6 @@ def competicao_base_bloqueada(m: "Metricas") -> bool:
 
 
 def massacre_contextual_ht(m: "Metricas", lado: str, pos_gol_recente: bool = False) -> Tuple[bool, str]:
-    """HT/AHT premium: baixa quantidade, muita qualidade.
-
-    Não é score novo; é portão de qualidade. Se houver gol recente, exige
-    números ainda mais fortes porque não existe bot de confirmação no HT.
-    """
     if lado not in {"CASA", "FORA"}:
         return False, "HT_SEM_LADO"
     d = dados_lado(m, lado)
@@ -1072,7 +1006,6 @@ def massacre_contextual_ht(m: "Metricas", lado: str, pos_gol_recente: bool = Fal
         territorio = d["u5"] >= 6 and d["u10"] >= 12 and ap_diff >= 20
         pressao_ip = ip["pico"] >= 24 or ip["c18"] >= 3 or ip["c22"] >= 1
 
-    # Gol cedo da zebra pode ser positivo, mas ainda precisa de reação real do favorito.
     gol_cedo_zebra = bool(m.ultimo_gol and m.ultimo_gol < 10 and m.ultimo_gol_lado == m.lado_zebra and m.lado_favorito == lado)
     if gol_cedo_zebra:
         favorito_ok = True
@@ -1091,14 +1024,23 @@ def mensagem_valida(texto: str) -> bool:
     return "ALERTA ESTRATEGIA" in t and "JOGO:" in t and "TEMPO:" in t
 
 
+# =========================================================
+# EXTRAÇÃO DE DADOS (PARSER) — MUDANÇAS 7, 8, 9
+# =========================================================
+
 def extrair_jogo(texto: str) -> str:
     t = normalizar(texto)
     m = re.search(r"Jogo:\s*(.+)", t, re.IGNORECASE)
     if m:
-        return limpar_linha(m.group(1).split("\n")[0])
+        jogo = limpar_linha(m.group(1).split("\n")[0])
+        if not re.match(r"^\d+(?:\.\d+)?\s*x\s*\d+(?:\.\d+)?$", jogo):
+            return jogo
+
     for linha in t.splitlines():
         if " x " in linha.lower() or " vs " in linha.lower():
-            return limpar_linha(linha)
+            if re.search(r"[A-Za-z]", linha):
+                return limpar_linha(linha)
+
     return "Jogo não identificado"
 
 
@@ -1133,13 +1075,23 @@ def mercado_dinamico(placar: str) -> str:
 
 
 def extrair_odds(texto: str) -> Tuple[float, float, float]:
-    m = re.search(r"Odds.*?:\s*([0-9.,]+)\s*/\s*([0-9.,]+)\s*/\s*([0-9.,]+)", texto, re.IGNORECASE)
-    if not m:
-        return (0.0, 0.0, 0.0)
-    try:
-        return tuple(float(x.replace(",", ".")) for x in m.groups())  # type: ignore
-    except Exception:
-        return (0.0, 0.0, 0.0)
+    """Extrai odds com múltiplos formatos (Mudança 8)."""
+    padroes = [
+        r"Odds.*?:\s*([0-9.,]+)\s*[/\-]\s*([0-9.,]+)\s*[/\-]\s*([0-9.,]+)",
+        r"Odds.*?:\s*([0-9.,]+)\s*/\s*([0-9.,]+)\s*/\s*([0-9.,]+)",
+        r"Odds.*?:\s*([0-9.,]+)\s*-\s*([0-9.,]+)\s*-\s*([0-9.,]+)",
+        r"Odd.*?Casa\s*[:=]\s*([0-9.,]+).*?Fora\s*[:=]\s*([0-9.,]+)",
+    ]
+
+    for padrao in padroes:
+        m = re.search(padrao, texto, re.IGNORECASE)
+        if m:
+            try:
+                return tuple(float(x.replace(",", ".")) for x in m.groups())
+            except Exception:
+                continue
+
+    return (0.0, 0.0, 0.0)
 
 
 def extrair_ultimo_gol_lado(texto: str) -> str:
@@ -1179,7 +1131,6 @@ def extrair_ultimos_cantos_lados(texto: str) -> List[Tuple[int, str]]:
 def extrair_links(texto: str) -> Tuple[str, str]:
     bet365 = ""
     corner = ""
-    # V25 — separa links colados antes do regex (ex: "rnkjghttps://")
     texto_sep = re.sub(r"(https?://)", r" \1", texto)
     for link in re.findall(r"https?://[^\s]+", texto_sep, re.IGNORECASE):
         link = link.strip().rstrip(".")
@@ -1191,18 +1142,41 @@ def extrair_links(texto: str) -> Tuple[str, str]:
 
 
 def extrair_pressao_alfa(texto: str) -> Dict[str, float]:
+    """Extrai IP com múltiplos nomes (Mudança 9)."""
     base = normalizar(texto)
     sem = remover_acentos(base)
-    m = re.search(r"Índice de Pressão:(.+)", base, re.IGNORECASE | re.DOTALL)
-    if not m:
-        m = re.search(r"Indice de Pressao:(.+)", sem, re.IGNORECASE | re.DOTALL)
-    if not m:
+
+    padroes = [
+        r"Índice de Pressão:(.+)",
+        r"Indice de Pressao:(.+)",
+        r"Pressão ALFA:(.+)",
+        r"Pressao ALFA:(.+)",
+        r"IP:(.+)",
+        r"Índice IP:(.+)",
+    ]
+
+    bloco = None
+    for padrao in padroes:
+        m = re.search(padrao, base, re.IGNORECASE | re.DOTALL)
+        if m:
+            bloco = m.group(1)
+            break
+
+    if not bloco:
+        for padrao in padroes:
+            m = re.search(padrao, sem, re.IGNORECASE | re.DOTALL)
+            if m:
+                bloco = m.group(1)
+                break
+
+    if not bloco:
         return _pressao_vazia()
 
-    bloco = m.group(1).split("https://")[0]
+    bloco = bloco.split("https://")[0]
     casa_vals: List[float] = []
     fora_vals: List[float] = []
-    for seg in bloco.split(";"):
+
+    for seg in re.split(r"[;|,]", bloco):
         nums = re.findall(r"\d+(?:[.,]\d+)?", seg)
         if len(nums) == 2:
             try:
@@ -1252,19 +1226,6 @@ def _pressao_vazia() -> Dict[str, float]:
 
 
 def calcular_confianca_parser(m: "Metricas") -> int:
-    """Conta quantos campos críticos vieram com valor real do parser.
-
-    Detecta silenciosamente falhas de formato da CornerPro.
-    Se a CornerPro mudar texto/emojis, o parser retorna zeros e o sistema
-    continua funcionando aparentemente normal — mas com dados falsos.
-
-    Campos avaliados (1 ponto cada, máximo 8):
-      ataques_perigosos, remates_baliza, ultimos5, ultimos10,
-      xg, chance_golo, odds, pressao_alfa
-
-    Score < 4: alerta nos logs — possível falha de parser.
-    Score 0–2: crítico — entrada provavelmente sem dados reais.
-    """
     score = 0
     if m.ataques_perigosos != (0, 0):
         score += 1
@@ -1387,12 +1348,6 @@ LIGAS_PERIGOSAS = {
 }
 
 
-
-# =========================================================
-# TIMES DE ELITE DE TRANSIÇÃO
-# =========================================================
-# Lista herdada da base central. Esses times, quando empatando ou perdendo,
-# costumam manter valor ofensivo mesmo quando um ou outro número não está perfeito.
 _TIMES_ELITE_TRANSICAO = {
     "atletico madrid", "atletico de madrid", "real madrid", "barcelona",
     "paris saint-germain", "psg", "bayern munich", "bayer leverkusen",
@@ -1401,6 +1356,7 @@ _TIMES_ELITE_TRANSICAO = {
     "inter milan", "inter", "napoli", "juventus",
     "flamengo", "palmeiras", "corinthians",
 }
+
 
 def time_elite_transicao_lado(m: Metricas) -> str:
     jogo = remover_acentos(m.jogo).lower()
@@ -1415,15 +1371,16 @@ def time_elite_transicao_lado(m: Metricas) -> str:
             return "FORA"
     return "DESCONHECIDO"
 
+
 def bonus_time_elite_transicao(m: Metricas) -> Tuple[int, str]:
     lado_elite = time_elite_transicao_lado(m)
     if lado_elite not in {"CASA", "FORA"}:
         return 0, "SEM_TIME_ELITE"
     vencedor = lado_vencendo(m)
-    # Aplica apenas se o time elite está empatando ou perdendo.
     if vencedor == "EMPATE" or vencedor != lado_elite:
         return 6, f"TIME_ELITE_TRANSICAO_{lado_elite}"
     return 0, "TIME_ELITE_JA_VENCENDO"
+
 
 def classificar_liga(competicao: str) -> str:
     c = remover_acentos(competicao).lower()
@@ -1530,11 +1487,6 @@ def minutos_desde_ultimo_gol(m: Metricas) -> int:
 
 
 def ap_diff_lado(m: Metricas, lado: str) -> float:
-    """Diferença de AP pela ótica do lado analisado.
-
-    Evita o erro de interpretar AP casa-fora como negativo quando o favorito/
-    pressionante joga fora e domina o jogo.
-    """
     if lado not in {"CASA", "FORA"}:
         return 0.0
     return valor_lado(m, "ataques_perigosos", lado) - valor_lado(m, "ataques_perigosos", lado_oposto(lado))
@@ -1659,25 +1611,10 @@ def pressao_morta_lado(m: Metricas, lado: str) -> bool:
 
 
 def xg_baixo_compensado_por_rb(m: Metricas, lado: str) -> bool:
-    """HT-1 fica fora do V12 definitivo.
-
-    Mantemos a função apenas para compatibilidade interna, mas ela não altera
-    nenhuma decisão nesta versão. O único ajuste HT ativo é o HT-2:
-    ap_diff pela ótica do lado avaliado.
-    """
     return False
 
 
 def ht_bonus_super_fav_vencendo_v12_2(m: Metricas) -> Tuple[bool, str]:
-    """V12_2 — bônus cirúrgico para super favorito vencendo por 1 no HT.
-
-    Não é atalho de aprovação. Só aplica quando:
-    - HT até 37';
-    - favorito fora odd <= 1.55 OU favorito casa odd <= 1.30;
-    - favorito vencendo por exatamente 1 gol;
-    - favorito é o lado pressionante;
-    - pressão extrema confirmada.
-    """
     if not HABILITAR_HT_BONUS_SUPER_FAV_VENCENDO:
         return False, "FLAG_OFF"
     if not eh_ht(m.estrategia):
@@ -1722,12 +1659,6 @@ def vermelho_contra_pressionante(m: Metricas) -> bool:
 
 
 def contexto_emocional_vivo(m: Metricas, lado: str) -> Tuple[bool, str]:
-    """Valida se o placar ainda dá valor real para over.
-
-    Essa função recupera a filosofia do main.py antigo: pressão não basta.
-    O sistema precisa saber se o contexto emocional ainda pede gol ou se a
-    pressão já foi paga pelo jogo.
-    """
     gc, gf = extrair_gols_placar(m.placar)
     if gc is None or gf is None:
         return True, "PLACAR_DESCONHECIDO"
@@ -1738,7 +1669,6 @@ def contexto_emocional_vivo(m: Metricas, lado: str) -> Tuple[bool, str]:
     perdendo = lado_perdendo(m)
     vencendo = lado_vencendo(m)
 
-    # HT: ainda aceita 1x0/0x1, mas evita placar muito aberto cedo sem massacre.
     if eh_ht(m.estrategia):
         if total_gols >= 3 and dif >= 2:
             if lado == vencendo and pressao_extrema_lado(m, lado) and consequencia_real_lado(m, lado):
@@ -1746,7 +1676,6 @@ def contexto_emocional_vivo(m: Metricas, lado: str) -> Tuple[bool, str]:
             return False, "HT_PLACAR_ABERTO_DEMAIS_SEM_VALOR"
         return True, "HT_CONTEXTO_VIVO"
 
-    # FT: empate, diferença de 1 gol e favorito não vencendo são cenários vivos.
     if vencendo == "EMPATE":
         return True, "FT_EMPATE_CONTEXTO_VIVO"
     if dif <= 1:
@@ -1754,15 +1683,11 @@ def contexto_emocional_vivo(m: Metricas, lado: str) -> Tuple[bool, str]:
     if fav in {"CASA", "FORA"} and perdendo == fav:
         return True, "FT_FAVORITO_ATRAS_DO_PLACAR"
 
-    # Se o lado que está vencendo por 2+ é também o pressionante, só aceita
-    # quando existe massacre vivo comprovado; caso contrário é placar resolvido.
     if dif >= 2 and lado == vencendo:
         if pressao_extrema_lado(m, lado) and consequencia_real_lado(m, lado):
             return True, "MASSACRE_CONTINUA_VIVO"
         return False, "PLACAR_RESOLVIDO_SEM_FOME"
 
-    # Se o lado pressionante está perdendo por 2+, ainda há urgência, mas exige
-    # pressão real para não virar entrada emocional vazia.
     if dif >= 2 and lado == perdendo:
         if pressao_viva_lado(m, lado) and consequencia_real_lado(m, lado):
             return True, "TIME_ATRAS_PRECISA_REAGIR_COM_PRESSAO"
@@ -1772,12 +1697,6 @@ def contexto_emocional_vivo(m: Metricas, lado: str) -> Tuple[bool, str]:
 
 
 def consequencia_minima_emocional(m: Metricas, lado: str) -> bool:
-    """Consequência mínima para exceções contextuais.
-
-    Mesmo quando há gol contra o fluxo ou favorito não vencendo, o jogo precisa
-    provar pelo menos algum caminho real de gol. Isso evita liberar contexto
-    emocional sem finalização nenhuma.
-    """
     d = dados_lado(m, lado)
     ip = ip_lado(m, lado)
     return (
@@ -1795,11 +1714,6 @@ def consequencia_minima_emocional(m: Metricas, lado: str) -> bool:
 # =========================================================
 
 def avaliar_valor_pos_evento(m: Metricas) -> Tuple[str, str, int, bool]:
-    """Retorna classe, motivo, ajuste_score, proteger_ia.
-
-    A função não duplica bônus em excesso. Ela é o núcleo humano:
-    quem pressionava, quem marcou e se a pressão ainda vale.
-    """
     lado = m.lado_pressionante
     fav = m.lado_favorito
     zebra = m.lado_zebra
@@ -1814,7 +1728,6 @@ def avaliar_valor_pos_evento(m: Metricas) -> Tuple[str, str, int, bool]:
     fav_nv = favorito_nao_vencendo(m)
     fav_press = fav == lado and pressao_viva_lado(m, lado)
 
-    # Favorito não vencendo e pressão sustentada: caso Rīgas / Donaufeld.
     if fav in {"CASA", "FORA"} and fav_nv and fav_press:
         faixa = faixa_favorito(m)
         if faixa == "SUPER_FAVORITO":
@@ -1826,26 +1739,21 @@ def avaliar_valor_pos_evento(m: Metricas) -> Tuple[str, str, int, bool]:
         if faixa == "FAVORITO_FRACO_SO_EXTREMO" and pressao_extrema_lado(m, lado):
             return "FAVORITO_NAO_VENCE_PRESSAO_SUSTENTADA", "FAVORITO_FRACO_SO_EXTREMO_VALIDADO", 1, True
 
-    # Sem gol recente, não há valor pós-evento de gol.
     if not ultimo or minutos > 12 or ultimo_lado == "DESCONHECIDO":
         return "SEM_VALOR_ESPECIAL", "SEM_GOL_RECENTE_RELEVANTE", 0, fav_press and fav_nv
 
-    # Gol contra fluxo: zebra/adversário marcou enquanto o pressionante/favorito segue vivo.
     if ultimo_lado != lado and pressao_viva_lado(m, lado):
         if fav == lado or ultimo_lado == zebra:
             ajuste = 10 if m.odd_favorito and m.odd_favorito <= 1.30 else 7
             return "GOL_CONTRA_FLUXO_VALORIZA", "ZEBRA_MARCOU_E_PRESSIONANTE_SEGUE_VIVO", ajuste, True
         return "GOL_CONTRA_FLUXO_VALORIZA", "ADVERSARIO_MARCOU_E_PRESSAO_CONTINUA", 5, True
 
-    # Gol do lado pressionante.
     if ultimo_lado == lado:
-        # V010 — quando o gol deixou o pressionante vencendo e o U5/RB/IP já
-        # caíram, força PRESSAO_PREMIADA_MORREU mesmo que U10 ainda esteja alto
-        # (U10 carrega pressão pré-gol por até 10 minutos — contaminação real).
+        # Mudança 13: penalidade reduzida de -14 para -10
         if gol_recente_do_pressionante(m, janela=5) and ultimo_gol_deixou_lado_vencendo(m) and pressao_pos_gol_esfriou(m, lado):
-            return "PRESSAO_PREMIADA_MORREU", "GOL_PREMIOU_PRESSAO_U10_CONTAMINADO_U5_CAIU", -14, False
+            return "PRESSAO_PREMIADA_MORREU", "GOL_PREMIOU_PRESSAO_U10_CONTAMINADO_U5_CAIU", -10, False
         if pressao_morta_lado(m, lado):
-            return "PRESSAO_PREMIADA_MORREU", "GOL_PREMIOU_PRESSAO_E_RITMO_CAIU", -14, False
+            return "PRESSAO_PREMIADA_MORREU", "GOL_PREMIOU_PRESSAO_E_RITMO_CAIU", -10, False
         if pressao_viva_lado(m, lado):
             return "PRESSAO_PREMIADA_MAS_CONTINUA", "GOL_PREMIOU_MAS_PRESSAO_CONTINUA", -2, True
         return "PRESSAO_PREMIADA_MORREU", "GOL_PREMIOU_PRESSAO_SEM_CONTINUIDADE_CLARA", -8, False
@@ -1854,14 +1762,6 @@ def avaliar_valor_pos_evento(m: Metricas) -> Tuple[str, str, int, bool]:
 
 
 def pressao_pos_gol_esfriou(m: "Metricas", lado: str) -> bool:
-    """V10 FINAL — detecta pressão que esfriou após gol premiado.
-
-    O objetivo é evitar que o U10, ainda contaminado pela pressão antes do gol,
-    faça o sistema tratar como viva uma pressão que morreu no pós-gol.
-
-    Critério conservador: só considera que esfriou quando U5, finalização, cantos
-    e IP do lado pressionante estão baixos ao mesmo tempo.
-    """
     if lado not in {"CASA", "FORA"}:
         return False
     d = dados_lado(m, lado)
@@ -1875,12 +1775,6 @@ def pressao_pos_gol_esfriou(m: "Metricas", lado: str) -> bool:
 
 
 def pressao_extrema_lado(m: Metricas, lado: str) -> bool:
-    """Pressão extrema real, usada como exceção de elite no funil.
-
-    Esta função precisa existir no escopo global porque várias camadas do score
-    chamam pressao_extrema_lado(). Sem ela, o bot compila, mas quebra em runtime
-    quando chega um alerta que passa por esses caminhos.
-    """
     if lado not in {"CASA", "FORA"}:
         return False
     d = dados_lado(m, lado)
@@ -1960,8 +1854,6 @@ def score_relogio(m: Metricas) -> int:
         if m.tempo < 15:
             return -4
         return 1
-    # V28 — alarga janela FT: 62-81' retorna bônus pleno.
-    # Alertas chegam até 77'; penalizar 80' era prematuro.
     if HABILITAR_V28 and HABILITAR_V28_RELOGIO_FT:
         if 62 <= m.tempo <= 81:
             return 7
@@ -1970,7 +1862,6 @@ def score_relogio(m: Metricas) -> int:
         if m.tempo > 85:
             return -5
         return 1
-    # V27 e anterior
     if 62 <= m.tempo <= 80:
         return 7
     if 81 <= m.tempo <= 85:
@@ -1980,13 +1871,17 @@ def score_relogio(m: Metricas) -> int:
     return 1
 
 
+# =========================================================
+# SCORE CONFIRMAÇÃO CORRIGIDO (MUDANÇA 12)
+# =========================================================
+
 def score_confirmacao(m: Metricas, chave: str) -> Tuple[int, str]:
     if not eh_confirmacao(m.estrategia):
         return 0, "NAO_E_CONFIRMACAO"
     anterior = ultimas_leituras_por_jogo.get(chave)
     if not anterior:
         return 2, "CONFIRMACAO_SEM_HISTORICO"
-    old: Metricas = anterior.get("metricas")  # type: ignore
+    old: Metricas = anterior.get("metricas")
     if not old:
         return 2, "CONFIRMACAO_SEM_METRICAS_ANTERIORES"
 
@@ -2000,9 +1895,16 @@ def score_confirmacao(m: Metricas, chave: str) -> Tuple[int, str]:
         if valor_lado(m, campo, lado) > valor_lado(old, campo, lado):
             pontos += peso
             motivos.append(f"{campo}_subiu")
-    if ip_lado(m, lado)["pico"] >= ip_lado(old, lado)["pico"]:
+
+    # Mudança 12: usar > em vez de >=
+    if ip_lado(m, lado)["pico"] > ip_lado(old, lado)["pico"]:
         pontos += 2
-        motivos.append("ip_manteve_ou_subiu")
+        motivos.append("ip_subiu")
+    ip_diff = ip_lado(m, lado)["pico"] - ip_lado(old, lado)["pico"]
+    if ip_diff >= 5:
+        pontos += 2
+        motivos.append(f"ip_subiu_{ip_diff:.1f}")
+
     if favorito_nao_vencendo(m):
         pontos += 2
         motivos.append("favorito_ainda_nao_resolveu")
@@ -2020,7 +1922,6 @@ def aplicar_travas_finais(m: Metricas, score: int) -> Tuple[int, str, bool]:
     if pressao_morta_lado(m, lado):
         return min(score, 74), "PRESSAO_MORTA", True
     if not consequencia_real_lado(m, lado):
-        # Exceção para super favorito não vencendo com IP absurdo.
         if not (m.odd_favorito <= 1.30 and favorito_nao_vencendo(m) and pressao_extrema_lado(m, lado)):
             return min(score, 76), "SEM_CONSEQUENCIA_REAL", True
     d = dados_lado(m, lado)
@@ -2033,22 +1934,9 @@ def aplicar_travas_finais(m: Metricas, score: int) -> Tuple[int, str, bool]:
 
 
 def aplicar_teto_score_v9(m: Metricas, score: int, detalhes_funil: Optional[Dict[str, Any]] = None) -> Tuple[int, str]:
-    """V009 — freio contextual de inflação do score.
-
-    Esta camada NÃO muda parser, fluxo, confirmação, gol recente ou funil.
-    Ela só corrige a régua: jogos bons continuam podendo passar, mas nem todo
-    aprovado comum pode virar 90/96.
-
-    Filosofia:
-    - massacre real / super favorito em campo: pode manter 92–96;
-    - jogo aberto produtivo: teto moderado;
-    - liga UNDER + baixa produção: teto forte;
-    - pressão recente fraca/finalização baixa: teto preventivo.
-    """
     if not HABILITAR_SCORE_V9:
         return score, "SCORE_V9_DESATIVADO"
     if eh_ht(m.estrategia):
-        # HT já passa pelo funil premium de massacre; não mexer aqui.
         return score, "SCORE_V9_HT_PRESERVADO"
 
     lado = m.lado_pressionante
@@ -2063,7 +1951,6 @@ def aplicar_teto_score_v9(m: Metricas, score: int, detalhes_funil: Optional[Dict
     ip = ip_lado(m, lado)
     ap_diff = ap_diff_lado(m, lado)
 
-    # Massacre real: preserva elite. Exemplo: Kongsvinger.
     massacre_extremo = (
         d["ap"] >= 60
         and ap_diff >= 30
@@ -2089,12 +1976,10 @@ def aplicar_teto_score_v9(m: Metricas, score: int, detalhes_funil: Optional[Dict
     cap = 96
     motivos: List[str] = []
 
-    # Jogos abertos são bons, mas não devem morar na mesma prateleira do massacre.
     if cenario == "CAOS_PRODUTIVO":
         cap = min(cap, V9_CAP_JOGO_ABERTO)
         motivos.append("JOGO_ABERTO_NAO_MASSACRE")
 
-    # Liga UNDER precisa provar mais; se vier com xG/chance baixa, teto forte.
     if m.liga == "UNDER":
         cap = min(cap, V9_CAP_LIGA_UNDER)
         motivos.append("LIGA_UNDER")
@@ -2102,17 +1987,14 @@ def aplicar_teto_score_v9(m: Metricas, score: int, detalhes_funil: Optional[Dict
             cap = min(cap, V9_CAP_LIGA_UNDER_FRACA)
             motivos.append("UNDER_COM_PRODUCAO_BAIXA")
 
-    # Finalização baixa: evita MP/Fénix/Liniers virarem 90+ sem cara elite.
     if d["rb"] <= 1 and d["chance"] < 8 and d["xg"] < 0.45:
         cap = min(cap, V9_CAP_FINALIZACAO_BAIXA)
         motivos.append("FINALIZACAO_BAIXA")
 
-    # Pressão recente fraca: domínio acumulado não basta no FT.
     if d["u5"] <= 2 and d["u10"] <= 5 and not elite_contextual:
         cap = min(cap, V9_CAP_PRESSAO_RECENTE_FRACA)
         motivos.append("PRESSAO_RECENTE_FRACA")
 
-    # Aprovado comum: passou no funil, mas sem massacre nem elite contextual.
     if not motivos and not massacre_extremo and not elite_contextual:
         cap = min(cap, V9_CAP_APROVADO_COMUM)
         motivos.append("APROVADO_COMUM_SEM_ELITE")
@@ -2122,51 +2004,19 @@ def aplicar_teto_score_v9(m: Metricas, score: int, detalhes_funil: Optional[Dict
     return score, "SCORE_V9_SEM_REDUCAO_" + ("+".join(motivos) if motivos else "FORTE")
 
 
-
 def finalização_minima_lado(m: Metricas, lado: str) -> bool:
-    """Exige pelo menos um sinal de finalização real do lado pressionante.
-
-    Impede que contexto emocional forte (valor_forte=True) libere jogos
-    onde não há nenhuma tentativa real de gol — apenas volume ofensivo
-    sem ruptura da defesa adversária.
-
-    Critério: RB >= 1 OU RDA >= 1 OU xG >= 0.15 OU Chance >= 5.
-    Mais permissivo que consequencia_minima_emocional() de propósito:
-    é o piso mínimo absoluto, não a trava completa.
-    """
     d = dados_lado(m, lado)
     return d["rb"] >= 1 or d["rda"] >= 1 or d["xg"] >= 0.15 or d["chance"] >= 5
 
 
 # =========================================================
-# CAMADA DE CENÁRIO FT — V005
-# Classificação única que agrupa todas as decisões FT em um
-# único ponto de controle. Não toca HT, parser, Telegram.
-#
-# Cenários classificados:
-#   ALFA_REAL          → passa com score cheio
-#   FAKE_PRESSURE      → bloqueia no funil (RB=0 + chance baixa + xG baixo)
-#   PERDEDOR_REAGINDO  → libera se pressão + consequência + xGL ≥ 0.50
-#   PLACAR_RESOLVIDO   → bloqueia vencedor por 2+ sem pressão extrema
-#   U5_MORTO           → bloqueia no funil (U5 ≤ 1 AND U10 ≤ 4)
-#   FAVORITO_VENCENDO_FACIL → bônus de favoritismo reduzido
+# CAMADA DE CENÁRIO FT
 # =========================================================
 
-# Constante de xGL mínimo para perdedor reagindo
 _XGL_MIN_PERDEDOR_REAGINDO = 0.50
 
 
 def v27_continuidade_pos_gol(m: Metricas) -> Tuple[bool, str]:
-    """V27 — valida se o jogo continuou vivo depois de gol recente.
-
-    Resolve o problema central visto na auditoria: dados acumulados bons antes
-    do gol continuarem inflando o alerta quando, depois do gol, o jogo morreu.
-    Como não temos timeline perfeita pós-gol, usamos sinais disponíveis:
-    - U5/U10 do lado pressionante;
-    - remate/pressão recente;
-    - canto posterior ao gol;
-    - IP ainda forte.
-    """
     if not HABILITAR_V27_CONTINUIDADE_POS_GOL:
         return True, "V27_CONT_POS_GOL_OFF"
     if not eh_ft(m.estrategia):
@@ -2185,14 +2035,9 @@ def v27_continuidade_pos_gol(m: Metricas) -> Tuple[bool, str]:
     gol_do_press = m.ultimo_gol_lado == m.lado_pressionante
     gol_do_fav = m.ultimo_gol_lado == m.lado_favorito
 
-    # Só endurece de verdade quando o gol recente é do lado que podia esfriar o jogo:
-    # pressionante/favorito/vencedor. Gol contra fluxo pode abrir o jogo.
     if not (gol_lado_vencedor or gol_do_press or gol_do_fav):
         return True, "V27_GOL_NAO_PREMIOU_PRESSIONANTE"
 
-    # DC01.3 — Ajuste 1: gol de empate do favorito reduz exigência de provas.
-    # O favorito empatou o jogo — isso por si só é evidência de jogo vivo e fome.
-    # U5/U10 ainda não recarregaram mas o contexto é de pressão crescente.
     if HABILITAR_DC01_3_EMPATE_FAVORITO:
         gol_do_fav_empatou = (
             gol_do_fav
@@ -2200,10 +2045,9 @@ def v27_continuidade_pos_gol(m: Metricas) -> Tuple[bool, str]:
             and m.ultimo_gol_lado == m.lado_favorito
         )
         if gol_do_fav_empatou:
-            # Exige só 1 prova em vez de 2/3
             provas_minimas_empate = 1
         else:
-            provas_minimas_empate = None  # usa lógica normal
+            provas_minimas_empate = None
     else:
         provas_minimas_empate = None
 
@@ -2219,9 +2063,6 @@ def v27_continuidade_pos_gol(m: Metricas) -> Tuple[bool, str]:
     if ip["pico"] >= 20 or ip["c18"] >= 1:
         provas += 1
 
-    # DC01.4 — Ajuste A: pressionante marcou e continua dominando AP.
-    # Se o gol foi do lado pressionante E ele ainda tem mais AP que o adversário
-    # E o jogo não esfriou de fato (U5>0 OU RB>0 OU IP>=10), a exigência cai para 1 prova.
     provas_minimas_final = None
     if HABILITAR_DC01_4_GOL_RECENTE_PRESSIONANTE_AP and gol_do_press and provas_minimas_empate is None:
         lado_op = "FORA" if lado == "CASA" else "CASA"
@@ -2234,7 +2075,6 @@ def v27_continuidade_pos_gol(m: Metricas) -> Tuple[bool, str]:
             provas_minimas_final = 1
 
     if delta <= 3:
-        # Gol muito recente: exige mais cuidado porque odds/ritmo podem estar instáveis.
         exige = provas_minimas_final if provas_minimas_final is not None else (provas_minimas_empate if provas_minimas_empate is not None else 3)
         ok = provas >= exige
     else:
@@ -2251,7 +2091,6 @@ def v27_continuidade_pos_gol(m: Metricas) -> Tuple[bool, str]:
 
 
 def v27_empate_tem_prova_suficiente(m: Metricas, lado: str) -> Tuple[bool, str]:
-    """V27 — empate FT precisa de 2 de 4 provas reais."""
     if not HABILITAR_V27_EMPATE_MAIS_RIGIDO:
         return True, "V27_EMPATE_OFF"
     if lado_vencendo(m) != "EMPATE" or not eh_ft(m.estrategia):
@@ -2270,7 +2109,6 @@ def v27_empate_tem_prova_suficiente(m: Metricas, lado: str) -> Tuple[bool, str]:
 
 
 def v27_perdedor_um_tem_reacao(m: Metricas, lado: str) -> Tuple[bool, str]:
-    """V27 — lado perdendo por 1 só passa se há reação viva + consequência."""
     if not HABILITAR_V27_PERDEDOR_UM_EXIGE_REACAO:
         return True, "V27_PERDEDOR_UM_OFF"
     if not eh_ft(m.estrategia):
@@ -2280,9 +2118,6 @@ def v27_perdedor_um_tem_reacao(m: Metricas, lado: str) -> Tuple[bool, str]:
     if lado != lado_perdendo(m):
         return True, "V27_LADO_NAO_E_PERDEDOR"
     d = dados_lado(m, lado)
-    # DC01.3 — Ajuste 3: aceita pressão simples em vez de pressão dupla obrigatória.
-    # Original: u5>=3 AND u10>=6 (ambos obrigatórios)
-    # Novo: u5>=4 OR u10>=7 (qualquer um basta) — resolve reação recente com U10 ainda baixo.
     if HABILITAR_DC01_3_PERDEDOR_PRESSAO_SIMPLES:
         pressao_dupla = d["u5"] >= 3 and d["u10"] >= 6
         pressao_simples = d["u5"] >= 4 or d["u10"] >= 7
@@ -2295,10 +2130,6 @@ def v27_perdedor_um_tem_reacao(m: Metricas, lado: str) -> Tuple[bool, str]:
 
 
 def v27_favorito_vencendo_1x0_exige_extra(m: Metricas, lado: str) -> Tuple[bool, str]:
-    """V27 — 1x0/0x1 no FT é tratado como vantagem curta potencialmente morta.
-
-    2x1/3x2 não são endurecidos aqui porque já carregam evidência de jogo aberto.
-    """
     if not HABILITAR_V27_REFINO_PLACAR_FT:
         return True, "V27_PLACAR_OFF"
     if not eh_ft(m.estrategia):
@@ -2308,7 +2139,6 @@ def v27_favorito_vencendo_1x0_exige_extra(m: Metricas, lado: str) -> Tuple[bool,
         return True, "V27_NAO_1X0_VENCEDOR"
     d = dados_lado(m, lado)
     ip = ip_lado(m, lado)
-    # DC01.3 — Ajuste 2: exige 3/4 critérios em vez de todos os 4 simultaneamente.
     if HABILITAR_DC01_3_1X0_TRES_DE_QUATRO:
         criterios = [
             d["u5"] >= 5,
@@ -2328,15 +2158,7 @@ def v27_favorito_vencendo_1x0_exige_extra(m: Metricas, lado: str) -> Tuple[bool,
     return ok, motivo
 
 
-
-
 def continuidade_pos_gol(m: "Metricas", lado: str) -> Tuple[bool, str]:
-    """V28 — Versão direta da verificacao de continuidade pos-gol por lado especifico.
-
-    Complementa v27_continuidade_pos_gol() que analisa o contexto geral.
-    Esta funcao verifica especificamente o lado indicado com criterio mais simples.
-    Usada internamente no cenario FAV_VENCE_1_GOL_RECENTE_MORTO.
-    """
     if not m.ultimo_gol or lado not in {"CASA", "FORA"}:
         return True, "SEM_GOL_ANTERIOR"
     delta = int(m.tempo or 0) - int(m.ultimo_gol or 0)
@@ -2355,12 +2177,8 @@ def continuidade_pos_gol(m: "Metricas", lado: str) -> Tuple[bool, str]:
         return True, f"CONT_VIVA u5={d['u5']} ip={ip['pico']} cantos_pos={cantos_pos_gol} delta={delta}min"
     return False, f"PRESSAO_MORTA_POS_GOL u5={d['u5']} ip={ip['pico']} cantos_pos={cantos_pos_gol} delta={delta}min"
 
-def v28_dna_projetado(m: "Metricas", lado: str) -> Tuple[int, str]:
-    """V28 — ajuste contextual leve baseado em favoritismo, xG e pressao recente.
 
-    Nao substitui o score. Adiciona pequeno ajuste (+4/+2/-1/-3) para aproximar
-    o sistema do DNA dos melhores greens historicos (odd + xG + U15/L15).
-    """
+def v28_dna_projetado(m: "Metricas", lado: str) -> Tuple[int, str]:
     if not (HABILITAR_V28 and HABILITAR_V28_DNA_PROJETADO):
         return 0, "V28_DNA_OFF"
     if lado not in {"CASA", "FORA"}:
@@ -2383,13 +2201,6 @@ def v28_dna_projetado(m: "Metricas", lado: str) -> Tuple[int, str]:
 
 
 def v28_under_extraordinario(m: "Metricas", lado: str) -> Tuple[bool, str]:
-    """V28 — liga UNDER so passa se for realmente extraordinaria.
-
-    Tres caminhos aceitos (qualquer um basta):
-      1. RB forte + xG solido
-      2. Chance alta + pressao dupla recente
-      3. Pressao extrema + consequencia + IP elite
-    """
     if lado not in {"CASA", "FORA"}:
         return False, "V28_UNDER_SEM_LADO"
     d = dados_lado(m, lado)
@@ -2409,31 +2220,21 @@ def v28_under_extraordinario(m: "Metricas", lado: str) -> Tuple[bool, str]:
 
 @dataclass
 class CenarioFT:
-    codigo: str          # código do cenário (ex: "ALFA_REAL")
-    bloqueia: bool       # True = funil deve barrar
-    teto_score: int      # score máximo permitido (100 = sem teto)
-    bonus_fav_cap: int   # cap do bônus de favoritismo (99 = sem cap)
-    motivo: str          # motivo para log/auditoria
+    codigo: str
+    bloqueia: bool
+    teto_score: int
+    bonus_fav_cap: int
+    motivo: str
 
 
 def classificar_cenario_ft(m: Metricas) -> CenarioFT:
-    """Camada única de cenário FT.
-
-    Chamada APENAS para FT. Retorna um CenarioFT que o funil
-    e o score_python_contextual usam para tomar decisões.
-    Não mexe em nada do HT, parser ou Telegram.
-    """
     if eh_ht(m.estrategia):
-        # Segurança: nunca deve ser chamada para HT, mas retorna neutro se for.
         return CenarioFT("NAO_FT", False, 100, 99, "CHAMADA_INDEVIDA_HT")
 
     lado = m.lado_pressionante
     if lado not in {"CASA", "FORA"}:
         return CenarioFT("SEM_LADO", False, 100, 99, "SEM_LADO_PRESSIONANTE")
 
-    # ── V28 — Bloqueio forte de liga UNDER antes de qualquer cenario ─────────
-    # Taxa historica: 36.4% — sem justificativa para manter no funil.
-    # Excecao: prova extraordinaria (rb+xG ou chance+pressao ou extremo+IP).
     if HABILITAR_V28 and HABILITAR_V28_UNDER_BLOQUEIO_FORTE and m.liga == "UNDER":
         under_ok, under_motivo = v28_under_extraordinario(m, lado)
         if not under_ok:
@@ -2454,7 +2255,6 @@ def classificar_cenario_ft(m: Metricas) -> CenarioFT:
 
     xgl_lado = d.get("xgl", 0.0)
 
-    # ── V27: continuidade pós-gol e refino contextual antes dos cenários clássicos ──
     cont_ok, cont_motivo = v27_continuidade_pos_gol(m)
     if not cont_ok:
         return CenarioFT("V27_SEM_CONTINUIDADE_POS_GOL", True, 78, 99, cont_motivo)
@@ -2471,57 +2271,37 @@ def classificar_cenario_ft(m: Metricas) -> CenarioFT:
     if not placar_ok:
         return CenarioFT("V27_1X0_SEM_PROVA_EXTRA", True, 80, 4, placar_motivo)
 
-    # ── CENÁRIO 1: Jogo morto FT ─────────────────────────────────────────────
-    # Lógica trazida do código antigo (4.436 linhas): jogo realmente morto
-    # exige ausência total nas quatro dimensões simultaneamente.
-    # U5=0 E U10=0 E RB=0 E xG<0.10 — não é pressão baixa, é ausência total.
-    # Mais preciso que U5 ≤ 1: um jogo pode ter U5=1 e ainda ter xG real.
     if d["u5"] == 0 and d["u10"] == 0 and d["rb"] == 0 and d["xg"] < 0.10:
         return CenarioFT(
             "JOGO_MORTO_FT", True, 78, 99,
             f"U5=0_U10=0_RB=0_XG={d['xg']:.2f}_AUSENCIA_TOTAL"
         )
 
-    # ── CENÁRIO 2: Fake pressure — RB=0 + chance baixa + xG baixo ──────────
-    # Volume territorial sem nenhuma finalização real = ilusão de pressão.
     if d["rb"] == 0 and d["chance"] < 8 and d["xg"] < 0.25:
         return CenarioFT(
             "FAKE_PRESSURE", True, 76, 99,
             f"RB=0_CHANCE={d['chance']}_XG={d['xg']:.2f}_SEM_FINALIZACAO_REAL"
         )
 
-    # ── CENÁRIO 3: Referência de pressão dupla ──────────────────────────────
-    # U5 e U10 juntos elevam confiança — mas não são portão de bloqueio.
-    # Um jogo com RB=4, xG=0.90 não deve morrer por U10=5.
-    # pressao_dupla é usada pelos cenários seguintes como sinal, não como trava.
     pressao_dupla = d["u5"] >= 3 and d["u10"] >= 6
 
-    # ── CENÁRIO 4: Caos produtivo — jogo aberto com gols dos dois lados ────
-    # 3x2, 2x2, 4x3: diferença ≤ 1 com volume alto de gols.
-    # Não é placar resolvido — os dois times mostraram que sabem marcar.
-    # Entra ANTES do bloqueio de placar aberto por essa razão.
     if total_gols >= 4 and dif <= 1:
         return CenarioFT(
             "CAOS_PRODUTIVO", False, 100, 99,
             f"JOGO_ABERTO_{gc}x{gf}_DIF={dif}_TOTAL_GOLS={total_gols}"
         )
 
-    # ── CENÁRIO 5: Placar aberto — vencedor sem pressão extrema ─────────────
-    # Vencedor por 2+ não tem fome real. Só passa se pressão extrema.
     if dif >= 2 and lado == vencendo:
         if not pressao_extrema_lado(m, lado):
             return CenarioFT(
                 "PLACAR_RESOLVIDO", True, 78, 3,
                 f"VENCENDO_{gc}x{gf}_SEM_PRESSAO_EXTREMA_PARA_AMPLIAR"
             )
-        # Pressão extrema: passa mas bônus de favoritismo reduzido.
         return CenarioFT(
             "VENCEDOR_EXTREMO", False, 100, 5,
             f"VENCENDO_{gc}x{gf}_PRESSAO_EXTREMA_CONTINUA"
         )
 
-    # ── CENÁRIO 6: Placar aberto — perdedor reagindo ─────────────────────────
-    # Perdedor por 2+ libera SE: pressão + consequência + xGL ≥ 0.50.
     if dif >= 2 and lado == perdendo:
         tem_pressao = pressao_dupla or pressao_viva_lado(m, lado)
         tem_consequencia = consequencia_real_lado(m, lado)
@@ -2536,26 +2316,16 @@ def classificar_cenario_ft(m: Metricas) -> CenarioFT:
             f"PERDENDO_{gc}x{gf}_XGL={xgl_lado:.2f}_FALTA_COMBINACAO"
         )
 
-    # ── CENÁRIO 7: Favorito vencendo fácil (dif=1, mas xGL baixo) ───────────
-    # Favorito vencendo por 1 com xGL < 0.55: pressão histórica fraca.
-    # Não bloqueia, mas reduz bônus de favoritismo.
     if dif == 1 and lado == vencendo and xgl_lado < 0.55:
         return CenarioFT(
             "FAVORITO_VENCENDO_XGL_FRACO", False, 100, 4,
             f"VENCENDO_1_GOL_XGL={xgl_lado:.2f}_HISTORICO_FRACO"
         )
 
-    # ── ALFA REAL ────────────────────────────────────────────────────────────
     return CenarioFT("ALFA_REAL", False, 100, 99, "CENARIO_IDEAL_CONFIRMADO")
 
 
 def liga_under_exige_prova_extra(m: Metricas) -> bool:
-    """V010 — identifica ligas UNDER/Sul-Americanas que precisam de prova extra.
-
-    Argentina excluída: comportamento melhor na auditoria operacional.
-    México incluído mesmo não estando na lista UNDER formal — historicamente
-    problemático nas auditorias.
-    """
     if not HABILITAR_UNDER_PROVA_EXTRA:
         return False
     texto = remover_acentos(f"{m.competicao} {m.jogo}").lower()
@@ -2570,15 +2340,6 @@ def liga_under_exige_prova_extra(m: Metricas) -> bool:
 
 
 def prova_extra_liga_under(m: Metricas, lado: str) -> Tuple[bool, str]:
-    """V010 — exige consequência real comprovada para ligas UNDER/rígidas.
-
-    Cinco caminhos aceitos (qualquer um basta):
-      1. RB forte + pressão recente viva
-      2. xG alto + chance alta
-      3. Pressão elite (U5/U10/IP) + consequência real
-      4. Área + chance (domínio de área comprovado)
-      5. Pressão extrema + xG + RB mínimo
-    """
     if lado not in {"CASA", "FORA"}:
         return False, "UNDER_SEM_LADO"
     d = dados_lado(m, lado)
@@ -2603,37 +2364,13 @@ def prova_extra_liga_under(m: Metricas, lado: str) -> Tuple[bool, str]:
 
 
 # =========================================================
-# FUNIL OBRIGATÓRIO HÍBRIDO — GOAT V004 + V005 + V006
-# Unificação definitiva: melhor do V003 corrigido + melhor do V003 produção.
-#
-# Do V003 produção:
-#   - contexto_emocional_vivo() com lógica apurada (TIME_ATRAS_SEM_PRESSAO_REAL,
-#     HT_MASSACRE_CONTINUA, FT_FAVORITO_ATRAS_DO_PLACAR)
-#   - consequencia_minima_emocional() com limiares HT/FT separados
-#   - FT: excecao_contextual_valida = (valor_forte OR super_fav+extremo) AND consequencia_minima
-#   - HT: trava de favorito fraco odd > 1.50 sem massacre
-#
-# Do V003 corrigido:
-#   - valor_forte_validado: valor_forte só conta se há finalização_minima_lado()
-#     (impede contexto emocional sem nenhum remate/xG passar pelo funil)
-#   - motivo específico FUNIL_FT_VALOR_FORTE_SEM_FINALIZACAO para auditoria
-#
-# V005: classificar_cenario_ft() entra antes do bloco FT do funil.
-#
-# V006: HT exige que favorito seja o lado pressionante (bloqueia zebra dominando)
+# FUNIL OBRIGATÓRIO HÍBRIDO
 # =========================================================
 
 def funil_obrigatorio_hibrido(m: Metricas) -> Tuple[bool, int, str, Dict[str, Any]]:
-    """Portão antes do score aditivo.
-
-    Filosofia: RADAR → VALIDAÇÃO → TRAVAS → CLASSIFICAÇÃO.
-    Um jogo precisa provar pressão viva, consequência real, contexto emocional
-    vivo E finalização mínima antes de chegar ao score aditivo.
-    """
     lado = m.lado_pressionante
     detalhes: Dict[str, Any] = {}
 
-    # ── Bloqueios imediatos ──────────────────────────────────────────────────
     if m.liga == "PERIGOSA":
         return False, 72, "FUNIL_LIGA_PERIGOSA", detalhes
     if lado not in {"CASA", "FORA"}:
@@ -2641,9 +2378,6 @@ def funil_obrigatorio_hibrido(m: Metricas) -> Tuple[bool, int, str, Dict[str, An
     if vermelho_contra_pressionante(m):
         return False, 74, "FUNIL_VERMELHO_CONTRA_PRESSIONANTE", detalhes
 
-    # ── V010 — Prova extra para ligas UNDER/rígidas ──────────────────────────
-    # Roda antes das avaliações base para bloquear cedo e registrar motivo claro.
-    # Argentina excluída. México e Sul-Americanas problemáticas incluídas.
     if liga_under_exige_prova_extra(m):
         under_ok, under_motivo = prova_extra_liga_under(m, lado)
         detalhes["under_prova_extra"] = under_ok
@@ -2651,61 +2385,45 @@ def funil_obrigatorio_hibrido(m: Metricas) -> Tuple[bool, int, str, Dict[str, An
         if not under_ok:
             return False, 78, f"FUNIL_UNDER_SEM_PROVA_EXTRA | {under_motivo}", detalhes
 
-    # ── Avaliações base ──────────────────────────────────────────────────────
-    pressao      = pressao_viva_lado(m, lado)
+    pressao = pressao_viva_lado(m, lado)
     consequencia = consequencia_real_lado(m, lado)
-    extremo      = pressao_extrema_lado(m, lado)
+    extremo = pressao_extrema_lado(m, lado)
     fav_nao_vence = favorito_nao_vencendo(m) and m.lado_favorito == lado
-    super_fav     = bool(m.odd_favorito and m.odd_favorito <= 1.30 and fav_nao_vence)
+    super_fav = bool(m.odd_favorito and m.odd_favorito <= 1.30 and fav_nao_vence)
 
-    # valor_forte cru: contexto emocional favorável.
     valor_forte = m.valor_pos_evento_classe in {
         "GOL_CONTRA_FLUXO_VALORIZA",
         "FAVORITO_NAO_VENCE_PRESSAO_SUSTENTADA",
         "PRESSAO_PREMIADA_MAS_CONTINUA",
     }
 
-    # [V003 corrigido] valor_forte só é operacional com finalização mínima.
-    # Sem remate/xG/chance, contexto emocional não converte — é fake pressure emocional.
-    tem_finalizacao      = finalização_minima_lado(m, lado)
+    tem_finalizacao = finalização_minima_lado(m, lado)
     valor_forte_validado = valor_forte and tem_finalizacao
 
-    # [V003 produção] consequência mínima com limiares HT/FT separados.
     consequencia_minima = consequencia_minima_emocional(m, lado)
-
-    # [V003 produção] contexto emocional apurado — avalia fome pelo placar.
     emocional_vivo, motivo_emocional = contexto_emocional_vivo(m, lado)
 
     detalhes.update({
-        "pressao_viva":               pressao,
-        "consequencia":               consequencia,
-        "pressao_extrema":            extremo,
-        "favorito_nao_vence":         fav_nao_vence,
-        "super_favorito_nao_vence":   super_fav,
-        "valor_pos_evento_forte":     valor_forte,
-        "valor_forte_validado":       valor_forte_validado,
-        "tem_finalizacao_minima":     tem_finalizacao,
+        "pressao_viva": pressao,
+        "consequencia": consequencia,
+        "pressao_extrema": extremo,
+        "favorito_nao_vence": fav_nao_vence,
+        "super_favorito_nao_vence": super_fav,
+        "valor_pos_evento_forte": valor_forte,
+        "valor_forte_validado": valor_forte_validado,
+        "tem_finalizacao_minima": tem_finalizacao,
         "consequencia_minima_emocional": consequencia_minima,
-        "contexto_emocional_vivo":    emocional_vivo,
-        "motivo_emocional":           motivo_emocional,
+        "contexto_emocional_vivo": emocional_vivo,
+        "motivo_emocional": motivo_emocional,
     })
 
-    # Pressão morta bloqueia antes de qualquer outro check.
     if pressao_morta_lado(m, lado):
         return False, 74, "FUNIL_PRESSAO_MORTA", detalhes
 
-    # Contexto emocional morto bloqueia.
-    # Exceção única: super favorito não vencendo com pressão extrema tem fome
-    # institucional suficiente para sobrepor o contexto de placar.
     if not emocional_vivo and not (super_fav and extremo):
         return False, 76, f"FUNIL_CONTEXTO_EMOCIONAL_MORTO_{motivo_emocional}", detalhes
 
-    # ── HT ──────────────────────────────────────────────────────────────────
-    # HT precisa parecer massacre: pressão + consequência.
-    # Favorito fraco (odd > 1.50) bloqueado sem números de massacre.
     if eh_ht(m.estrategia):
-        # V007 — HT/AHT é camada premium. Não buscamos volume.
-        # Só passa com massacre contextual real. Se houve gol recente, a régua sobe.
         ht_morto, ht_motivo_dc01_1 = dc01_1_ht_placar_largo_sem_necessidade(m, lado)
         detalhes["dc01_1_ht_placar_largo"] = ht_morto
         detalhes["dc01_1_ht_placar_largo_motivo"] = ht_motivo_dc01_1
@@ -2732,8 +2450,6 @@ def funil_obrigatorio_hibrido(m: Metricas) -> Tuple[bool, int, str, Dict[str, An
             return False, 78, "FUNIL_HT_SEM_CONSEQUENCIA_MINIMA", detalhes
         return True, 100, "FUNIL_HT_PREMIUM_MASSACRE_APROVADO", detalhes
 
-    # ── FT ──────────────────────────────────────────────────────────────────
-    # [V005] Camada de cenário FT — decisão única antes de qualquer lógica FT.
     cenario = classificar_cenario_ft(m)
     detalhes["cenario_ft"] = cenario.codigo
     detalhes["cenario_ft_motivo"] = cenario.motivo
@@ -2744,27 +2460,21 @@ def funil_obrigatorio_hibrido(m: Metricas) -> Tuple[bool, int, str, Dict[str, An
     if not pressao:
         return False, 76, "FUNIL_FT_SEM_PRESSAO_VIVA", detalhes
 
-    # [V003 produção + V003 corrigido] exceção contextual exige:
-    # (valor_forte_validado OU super_fav+extremo) AND consequencia_minima.
-    # valor_forte sem finalização não é exceção — é fake pressure emocional.
     excecao_contextual_valida = (
         (valor_forte_validado or (super_fav and extremo))
         and consequencia_minima
     )
 
     if not consequencia and not excecao_contextual_valida:
-        # Motivo específico para auditoria: saber se falhou por falta de finalização
-        # ou por ausência total de consequência.
         if valor_forte and not tem_finalizacao:
             return False, 78, "FUNIL_FT_VALOR_FORTE_SEM_FINALIZACAO", detalhes
         return False, 78, "FUNIL_FT_SEM_CONSEQUENCIA_MINIMA", detalhes
 
-    # [V003 produção] favorito fraco/equilibrado só passa com números extremos
-    # ou valor_forte_validado com consequência mínima.
     if m.odd_favorito and m.odd_favorito > 1.85 and not extremo and not (valor_forte_validado and consequencia_minima):
         return False, 80, "FUNIL_FAVORITO_FRACO_SEM_NUMEROS_EXTREMOS", detalhes
 
     return True, 100, "FUNIL_FT_APROVADO", detalhes
+
 
 def score_python_contextual(m: Metricas, chave: str) -> DecisaoPython:
     preencher_contexto_calculado(m)
@@ -2776,9 +2486,11 @@ def score_python_contextual(m: Metricas, chave: str) -> DecisaoPython:
     passou_funil, teto_funil, motivo_funil, detalhes_funil = funil_obrigatorio_hibrido(m)
 
     base = 45
-    # O bônus de time elite já é aplicado dentro de score_favoritismo().
-    # Aqui chamamos novamente apenas para registrar o motivo no log/CSV, sem somar de novo.
     _, elite_motivo = bonus_time_elite_transicao(m)
+
+    # Mudança 11: V26 aplicado ANTES do score
+    penalidade_v26 = getattr(m, 'penalidade_v26_fav_nao_press', 0)
+
     componentes = {
         "pressao_viva": score_pressao_viva(m),
         "consequencia": score_consequencia(m),
@@ -2789,38 +2501,36 @@ def score_python_contextual(m: Metricas, chave: str) -> DecisaoPython:
     }
     conf_score, conf_motivo = score_confirmacao(m, chave)
     componentes["confirmacao"] = conf_score
-    # V28 — DNA projetado: ajuste leve baseado em favoritismo + xG + pressao recente.
-    # Nao altera o score central; apenas adiciona ou remove ate 4 pontos.
+
     dna_ajuste, dna_motivo = v28_dna_projetado(m, m.lado_pressionante)
     if HABILITAR_V28 and HABILITAR_V28_DNA_PROJETADO:
         componentes["dna_v28"] = dna_ajuste
 
     score_bruto = base + sum(componentes.values())
 
+    # Mudança 11: Aplicar penalidade no score bruto
+    if penalidade_v26:
+        score_bruto_original = score_bruto
+        score_bruto = max(0, score_bruto - penalidade_v26)
+        log(f"📉 V26 penalidade aplicada no score bruto | {score_bruto_original} → {score_bruto} | -{penalidade_v26}")
+
     if eh_ht(m.estrategia):
-        # Bônus para pressão extrema no HT — massacre confirmado.
-        # A penalidade de -2 foi removida: o funil já exigiu pressão viva
-        # e consequência real. Punir novamente por não ser extremo é
-        # redundância estatística. Calibração: corte HT ajustado para 86.
         if m.lado_pressionante in {"CASA", "FORA"} and pressao_extrema_lado(m, m.lado_pressionante):
             score_bruto += 4
 
         bonus_super_fav_ok, bonus_super_fav_motivo = ht_bonus_super_fav_vencendo_v12_2(m)
         if bonus_super_fav_ok:
             score_bruto += 5
-        # HT-3 (bônus Over 0.5HT histórico) — reservado para versão futura com auditoria específica.
     else:
-        # [V005] Aplica cap de bônus de favoritismo definido pelo cenário FT.
         cenario_ft = classificar_cenario_ft(m)
         if cenario_ft.bonus_fav_cap < 99:
             componentes["favoritismo"] = min(componentes["favoritismo"], cenario_ft.bonus_fav_cap)
-            # Recalcula score_bruto com bônus de favoritismo limitado.
             score_bruto = base + sum(componentes.values())
 
         if favorito_nao_vencendo(m) and m.lado_favorito == m.lado_pressionante:
             score_bruto += 4
 
-    score = clamp(score_bruto, 0, 96)  # teto Python: nunca 100
+    score = clamp(score_bruto, 0, 96)
 
     if not passou_funil:
         score = min(score, teto_funil)
@@ -2836,6 +2546,7 @@ def score_python_contextual(m: Metricas, chave: str) -> DecisaoPython:
             "time_elite": elite_motivo,
             "ht_bonus_super_fav_vencendo": locals().get("bonus_super_fav_ok", False),
             "ht_bonus_super_fav_motivo": locals().get("bonus_super_fav_motivo", "NAO_AVALIADO"),
+            "penalidade_v26": penalidade_v26,
         }
         return DecisaoPython(score=score, aprovado_pre_ia=False, status="REPROVADO", motivo=motivo_funil, detalhes=detalhes)
 
@@ -2866,8 +2577,10 @@ def score_python_contextual(m: Metricas, chave: str) -> DecisaoPython:
         "ht_bonus_super_fav_motivo": locals().get("bonus_super_fav_motivo", "NAO_AVALIADO"),
         "cenario_ft": detalhes_funil.get("cenario_ft", "N/A"),
         "cenario_ft_motivo": detalhes_funil.get("cenario_ft_motivo", "N/A"),
+        "penalidade_v26": penalidade_v26,
     }
     return DecisaoPython(score=score, aprovado_pre_ia=aprovado, status=status, motivo=motivo, detalhes=detalhes)
+
 
 def corte_por_estrategia(estrategia: str) -> int:
     if estrategia == "ALFA_HT_CONFIRMACAO":
@@ -2880,15 +2593,19 @@ def corte_por_estrategia(estrategia: str) -> int:
 
 
 # =========================================================
-# IA AUDITORA / PROTEÇÃO DA IA
+# IA AUDITORA — COM SANITIZAÇÃO (MUDANÇA 18)
 # =========================================================
 
-def montar_prompt_ia(m: Metricas, decisao_py: DecisaoPython) -> str:
-    """V29 — prompt orientado a eliminar falsos positivos.
+def sanitizar_prompt(texto: str) -> str:
+    """Sanitiza texto para uso em prompts da IA (Mudança 18)."""
+    texto = str(texto or "")
+    texto = texto.replace("'", "").replace('"', "")
+    texto = texto.replace("\n", " ").replace("\r", " ")
+    texto = texto.replace(";", ",").replace("|", ",")
+    return texto[:500]
 
-    Filosofia: a IA procura armadilhas antes de procurar oportunidades.
-    Pergunta central: existe evidência real de que o próximo gol continua vivo?
-    """
+
+def montar_prompt_ia(m: Metricas, decisao_py: DecisaoPython) -> str:
     if HABILITAR_V29_IA_NOVA:
         return f"""
 Você é a IA Auditora do projeto COUTIPS/ALFA. Sua função principal é ELIMINAR FALSOS POSITIVOS.
@@ -2924,34 +2641,33 @@ Responda em UMA linha no formato:
 DECISAO=APROVAR|BLOQUEAR; CONFIANCA=0-100; PRESSAO_SUSTENTAVEL=0-100; RISCO_FAKE_PRESSURE=0-100; CONTINUIDADE_OFENSIVA=0-100; MOTIVACAO_DE_GOL=0-100; MOTIVO=texto curto
 
 DADOS:
-Estratégia: {m.estrategia}
-Jogo: {m.jogo}
-Competição: {m.competicao}
-Minuto: {m.tempo}
-Placar: {m.placar}
-Mercado: {m.mercado}
-Liga: {m.liga}
-Odds: {m.odds}
-Favorito: {m.lado_favorito} odd {m.odd_favorito}
-Dominante: {m.lado_dominante}
-Pressionante: {m.lado_pressionante}
-Último gol: {m.ultimo_gol}' {m.ultimo_gol_lado}
-AP: {m.ataques_perigosos}
-U5: {m.ultimos5}
-U10: {m.ultimos10}
-Cantos: {m.cantos}
-RB: {m.remates_baliza}
-Remates lado: {m.remates_lado}
-RDA: {m.remates_dentro_area}
-Chance gol: {m.chance_golo}
-xG: {m.xg}
-IP: {m.pressao_alfa}
-Valor pós-evento: {m.valor_pos_evento_classe} | {m.valor_pos_evento_motivo}
-Score Python: {decisao_py.score}
-Motivo Python: {decisao_py.motivo}
+Estratégia: {sanitizar_prompt(m.estrategia)}
+Jogo: {sanitizar_prompt(m.jogo)}
+Competição: {sanitizar_prompt(m.competicao)}
+Minuto: {sanitizar_prompt(str(m.tempo))}
+Placar: {sanitizar_prompt(m.placar)}
+Mercado: {sanitizar_prompt(m.mercado)}
+Liga: {sanitizar_prompt(m.liga)}
+Odds: {sanitizar_prompt(str(m.odds))}
+Favorito: {sanitizar_prompt(m.lado_favorito)} odd {sanitizar_prompt(str(m.odd_favorito))}
+Dominante: {sanitizar_prompt(m.lado_dominante)}
+Pressionante: {sanitizar_prompt(m.lado_pressionante)}
+Último gol: {sanitizar_prompt(str(m.ultimo_gol))}' {sanitizar_prompt(m.ultimo_gol_lado)}
+AP: {sanitizar_prompt(str(m.ataques_perigosos))}
+U5: {sanitizar_prompt(str(m.ultimos5))}
+U10: {sanitizar_prompt(str(m.ultimos10))}
+Cantos: {sanitizar_prompt(str(m.cantos))}
+RB: {sanitizar_prompt(str(m.remates_baliza))}
+Remates lado: {sanitizar_prompt(str(m.remates_lado))}
+RDA: {sanitizar_prompt(str(m.remates_dentro_area))}
+Chance gol: {sanitizar_prompt(str(m.chance_golo))}
+xG: {sanitizar_prompt(str(m.xg))}
+IP: {sanitizar_prompt(str(m.pressao_alfa))}
+Valor pós-evento: {sanitizar_prompt(m.valor_pos_evento_classe)} | {sanitizar_prompt(m.valor_pos_evento_motivo)}
+Score Python: {sanitizar_prompt(str(decisao_py.score))}
+Motivo Python: {sanitizar_prompt(decisao_py.motivo)}
 """.strip()
 
-    # Prompt legado (HABILITAR_V29_IA_NOVA=false)
     return f"""
 Você é a IA Auditora do projeto COUTIPS/ALFA.
 Python é o motor principal. Sua função é auditar fake pressure e incoerências, não destruir contexto institucional forte.
@@ -2968,31 +2684,31 @@ Responda obrigatoriamente em UMA linha no formato:
 DECISAO=APROVAR|BLOQUEAR; CONFIANCA=0-100; MOTIVO=texto curto
 
 DADOS:
-Estratégia: {m.estrategia}
-Jogo: {m.jogo}
-Competição: {m.competicao}
-Minuto: {m.tempo}
-Placar: {m.placar}
-Mercado: {m.mercado}
-Liga: {m.liga}
-Odds: {m.odds}
-Favorito: {m.lado_favorito} odd {m.odd_favorito}
-Dominante: {m.lado_dominante}
-Pressionante: {m.lado_pressionante}
-Último gol: {m.ultimo_gol}' {m.ultimo_gol_lado}
-AP: {m.ataques_perigosos}
-U5: {m.ultimos5}
-U10: {m.ultimos10}
-Cantos: {m.cantos}
-RB: {m.remates_baliza}
-Remates lado: {m.remates_lado}
-RDA: {m.remates_dentro_area}
-Chance gol: {m.chance_golo}
-xG: {m.xg}
-IP: {m.pressao_alfa}
-Valor pós-evento: {m.valor_pos_evento_classe} | {m.valor_pos_evento_motivo}
-Score Python: {decisao_py.score}
-Motivo Python: {decisao_py.motivo}
+Estratégia: {sanitizar_prompt(m.estrategia)}
+Jogo: {sanitizar_prompt(m.jogo)}
+Competição: {sanitizar_prompt(m.competicao)}
+Minuto: {sanitizar_prompt(str(m.tempo))}
+Placar: {sanitizar_prompt(m.placar)}
+Mercado: {sanitizar_prompt(m.mercado)}
+Liga: {sanitizar_prompt(m.liga)}
+Odds: {sanitizar_prompt(str(m.odds))}
+Favorito: {sanitizar_prompt(m.lado_favorito)} odd {sanitizar_prompt(str(m.odd_favorito))}
+Dominante: {sanitizar_prompt(m.lado_dominante)}
+Pressionante: {sanitizar_prompt(m.lado_pressionante)}
+Último gol: {sanitizar_prompt(str(m.ultimo_gol))}' {sanitizar_prompt(m.ultimo_gol_lado)}
+AP: {sanitizar_prompt(str(m.ataques_perigosos))}
+U5: {sanitizar_prompt(str(m.ultimos5))}
+U10: {sanitizar_prompt(str(m.ultimos10))}
+Cantos: {sanitizar_prompt(str(m.cantos))}
+RB: {sanitizar_prompt(str(m.remates_baliza))}
+Remates lado: {sanitizar_prompt(str(m.remates_lado))}
+RDA: {sanitizar_prompt(str(m.remates_dentro_area))}
+Chance gol: {sanitizar_prompt(str(m.chance_golo))}
+xG: {sanitizar_prompt(str(m.xg))}
+IP: {sanitizar_prompt(str(m.pressao_alfa))}
+Valor pós-evento: {sanitizar_prompt(m.valor_pos_evento_classe)} | {sanitizar_prompt(m.valor_pos_evento_motivo)}
+Score Python: {sanitizar_prompt(str(decisao_py.score))}
+Motivo Python: {sanitizar_prompt(decisao_py.motivo)}
 """.strip()
 
 
@@ -3002,7 +2718,6 @@ async def consultar_openai(m: Metricas, decisao_py: DecisaoPython) -> Tuple[str,
 
     prompt = montar_prompt_ia(m, decisao_py)
 
-    # V29 — sistema prompt diferente para IA nova
     if HABILITAR_V29_IA_NOVA:
         system_prompt = (
             "Você é uma IA auditora conservadora especializada em eliminar falsos positivos em apostas de futebol ao vivo. "
@@ -3035,7 +2750,6 @@ async def consultar_openai(m: Metricas, decisao_py: DecisaoPython) -> Tuple[str,
         if conf == decisao_py.score:
             conf = pegar_numero(r"CONFIANÇA\s*=\s*(\d+)", content, decisao_py.score)
 
-        # V29 — extrai variáveis adicionais da IA nova para log/CSV
         if HABILITAR_V29_IA_NOVA:
             pressao_sust = pegar_numero(r"PRESSAO_SUSTENTAVEL\s*=\s*(\d+)", content, 0)
             risco_fake = pegar_numero(r"RISCO_FAKE_PRESSURE\s*=\s*(\d+)", content, 0)
@@ -3049,7 +2763,7 @@ async def consultar_openai(m: Metricas, decisao_py: DecisaoPython) -> Tuple[str,
             log(f"🤖 OpenAI | {m.jogo} | {decisao} | confiança={conf}")
 
         motivo = content[:300]
-        return decisao, clamp(conf, 0, 95), motivo  # teto IA: nunca passa de 95
+        return decisao, clamp(conf, 0, 95), motivo
     except Exception as e:
         log(f"⚠️ OpenAI falhou | usando score Python | {type(e).__name__}: {e}")
         return "APROVAR", decisao_py.score, "OPENAI_FALHOU_USANDO_SCORE_PYTHON"
@@ -3073,7 +2787,6 @@ def calcular_protecao_ia(m: Metricas, decisao_py: DecisaoPython, decisao_ia: str
             proteger = True
             motivo = "FAVORITO_NAO_VENCE_COM_PRESSAO_VIVA"
 
-    # Impedimentos de proteção.
     impedimentos = []
     if m.liga == "PERIGOSA":
         impedimentos.append("LIGA_PERIGOSA")
@@ -3124,20 +2837,9 @@ def emoji_score(score: int) -> str:
 
 
 def titulo_periodo(estrategia: str, tempo: int = 0) -> str:
-    """
-    Define o título exibido ao cliente usando o minuto como autoridade.
-
-    Correção crítica:
-    - Se a CornerPro mandar estratégia HT/ARCE_HT por engano aos 70+,
-      o cliente NÃO pode receber "PRIMEIRO TEMPO".
-    - 46' em diante = SEGUNDO TEMPO.
-    - Antes de 46' = PRIMEIRO TEMPO.
-    """
     periodo = "SEGUNDO TEMPO" if int(tempo or 0) >= 46 else "PRIMEIRO TEMPO"
-
     if eh_confirmacao(estrategia):
         return f"ALFA - CONFIRMADO | {periodo}"
-
     return f"ALFA - AO VIVO | {periodo}"
 
 
@@ -3164,13 +2866,6 @@ def formatar_alerta_cliente(m: Metricas, score: int, alavancagem: bool = False) 
 
 
 def formatar_alerta_canal_completo(m: Metricas, score: int, alavancagem: bool = False) -> str:
-    """Mensagem para o canal interno/completo (@ALFA_CON).
-
-    Diferença para o canal grátis/principal:
-    - mantém todo o corpo da mensagem igual;
-    - troca apenas o cabeçalho visual para identificar a família do bot;
-    - não altera parser, score, IA, filtros, grupo grátis ou canal público.
-    """
     link = m.bet365 or ""
     linhas = [
         nome_visual_auditoria(m),
@@ -3197,11 +2892,6 @@ def agora_operacional_v11() -> datetime:
 
 
 def janela_grupo_gratis_v11(dt: Optional[datetime] = None) -> Tuple[Optional[str], int]:
-    """Retorna janela e limite do grupo grátis.
-
-    J1: 06:30–12:00 | J2: 12:00–18:00 | J3: 18:00–23:00.
-    Fora disso retorna (None, 0).
-    """
     dt = dt or agora_operacional_v11()
     minutos = dt.hour * 60 + dt.minute
     if 6 * 60 + 30 <= minutos < 12 * 60:
@@ -3236,8 +2926,8 @@ def marcar_envio_gratis_v11(chave_jogo: str) -> None:
     chave_janela = chave_contador_gratis_v11(janela)
     v11_gratis_contadores[chave_janela] = int(v11_gratis_contadores.get(chave_janela, 0)) + 1
     v11_gratis_enviados_por_jogo[chave_jogo] = time.time()
-    v17_salvar_estado()  # V17 — persiste no disco
-    asyncio.create_task(v26_salvar_estado_telegram())  # V26 — persiste no Telegram como backup
+    v17_salvar_estado()
+    asyncio.create_task(v26_salvar_estado_telegram())
 
 
 def jogo_em_cooldown_gratis_v11(chave_jogo: str) -> bool:
@@ -3246,18 +2936,6 @@ def jogo_em_cooldown_gratis_v11(chave_jogo: str) -> bool:
 
 
 def favorito_vencendo_por_um_extremo_v18(m: Metricas, score: int = 0) -> Tuple[bool, str]:
-    """V18 — exceção rara para favorito vencendo por 1.
-
-    Regra oficial:
-    - padrão do grupo grátis e do VOLUME_FT: favorito empatando ou perdendo;
-    - se o favorito já vence, só pode passar vencendo por 1 e em cenário
-      EXTREMAMENTE absurdo;
-    - gol recente do favorito continua bloqueando, porque pode ser pressão
-      premiada;
-    - score 90+ é exigido quando a função recebe score já calculado
-      (grupo grátis); no VOLUME_FT, que roda antes do score, a prova vem
-      apenas dos dados brutos.
-    """
     fav = m.lado_favorito
     if fav not in {"CASA", "FORA"}:
         return False, "SEM_FAVORITO"
@@ -3313,18 +2991,16 @@ def apto_contexto_grupo_gratuito_v11(m: Metricas, score: int = 0) -> Tuple[bool,
         return False, "SEM_FAVORITO"
     vencedor = lado_vencendo(m)
 
-    # Prioridade normal do grupo grátis: favorito perdendo ou empatando.
     if vencedor != fav and vencedor != "EMPATE":
         return True, "CENARIO_A_FAVORITO_PERDENDO"
     if vencedor == "EMPATE":
         return True, "CENARIO_B_FAVORITO_EMPATANDO"
 
-    # V18 — favorito vencendo deixa de ser cenário comum.
-    # Só passa vencendo por 1 em cenário realmente absurdo.
     ok_c, motivo_c = favorito_vencendo_por_um_extremo_v18(m, score=score)
     if ok_c:
         return True, "CENARIO_C_EXTREMO_" + motivo_c
     return False, motivo_c
+
 
 def liga_australiana_v11(m: Metricas) -> bool:
     texto = remover_acentos(f"{m.competicao} {m.jogo}").lower()
@@ -3332,11 +3008,6 @@ def liga_australiana_v11(m: Metricas) -> bool:
 
 
 def leitura_australia_v11(m: Metricas) -> Tuple[str, str]:
-    """Leitura especial de ligas australianas/abertas.
-
-    Não bloqueia o canal completo. Apenas informa cautela para grupo grátis e
-    ALAVANCAGEM quando placar elástico + gol recente indicam pressão premiada.
-    """
     if not HABILITAR_V11_AUSTRALIA or not liga_australiana_v11(m):
         return "NAO_APLICA", "NAO_AUSTRALIA_OU_FLAG_OFF"
 
@@ -3390,7 +3061,6 @@ def liga_cautela_forte_v11(m: Metricas) -> bool:
 
 
 def tres_pilares_estilo_v11(m: Metricas, lado: str) -> Tuple[bool, str]:
-    """Referência dos antigos três pilares; usado para ALAVANCAGEM, não para aprovar."""
     if lado not in {"CASA", "FORA"}:
         return False, "SEM_LADO"
     d = dados_lado(m, lado)
@@ -3402,10 +3072,8 @@ def tres_pilares_estilo_v11(m: Metricas, lado: str) -> Tuple[bool, str]:
 
 
 def selo_alavancagem_v11(m: Metricas, score: int) -> Tuple[bool, str]:
-    """ALAVANCAGEM é classificação contextual rara, não aprovação."""
     if not HABILITAR_V11_ALAVANCAGEM:
         return False, "V11_ALAVANCAGEM_DESATIVADA"
-    # V27/V28 — ALAVANCAGEM somente FT. HT nao tem contexto suficiente para selo de elite.
     if (HABILITAR_V27_ALAVANCAGEM_SO_FT or HABILITAR_V28) and (not eh_ft(m.estrategia) or eh_confirmacao(m.estrategia)):
         return False, "ALAVANCAGEM_SOMENTE_FT"
     if eh_confirmacao(m.estrategia):
@@ -3432,8 +3100,6 @@ def selo_alavancagem_v11(m: Metricas, score: int) -> Tuple[bool, str]:
     pilares_ok, pilares_motivo = tres_pilares_estilo_v11(m, lado)
 
     if eh_ht(m.estrategia):
-        # V25 — HT: alavancagem só se favorito estiver PERDENDO (não empatando)
-        # e for massacre extremo. Contexto de desespero real.
         gc, gf = extrair_gols_placar(m.placar)
         if gc is None or gf is None:
             return False, "HT_PLACAR_INVALIDO"
@@ -3442,7 +3108,6 @@ def selo_alavancagem_v11(m: Metricas, score: int) -> Tuple[bool, str]:
         if gols_fav >= gols_adv:
             return False, f"HT_FAVORITO_NAO_PERDE | {m.placar}"
         massacre_ok, massacre_motivo = massacre_contextual_ht(m, lado, pos_gol_recente=False)
-        # Exige massacre E pilares — critério mais rígido que antes.
         if massacre_ok and pilares_ok:
             return True, "HT_MASSACRE_ALFA_FAV_PERDENDO|" + massacre_motivo + "|" + pilares_motivo
         return False, "HT_SEM_CONDICAO_ALAVANCAGEM|" + massacre_motivo + "|" + pilares_motivo
@@ -3485,10 +3150,6 @@ def canal_auditoria(m: Metricas, aprovado: bool) -> str:
 
 
 def nome_visual_auditoria(m: Metricas) -> str:
-    """Rótulo visual técnico apenas para canais de auditoria.
-
-    Não altera parser, score, canal normal nem grupo grátis.
-    """
     est = (m.estrategia or "").upper()
     bruto = remover_acentos(m.texto_bruto or "").upper()[:350]
     if "SNIPER" in est or "SNIPER" in bruto:
@@ -3546,50 +3207,66 @@ CSV_FIELDS = [
     "destino_final", "modo_teste",
     "previsao_over05_ht",
     "resultado_manual", "cornerpro", "bet365",
+    "penalidade_v26",
 ]
+
+
+# =========================================================
+# SANITIZAÇÃO CSV (MUDANÇA 17)
+# =========================================================
+
+def sanitizar_csv(texto: str) -> str:
+    """Sanitiza valores para prevenir CSV Injection (Mudança 17)."""
+    if not texto:
+        return ""
+    texto = str(texto)
+    if texto.startswith(("=", "+", "-", "@")):
+        return "'" + texto
+    return texto
 
 
 def registrar_csv(m: Metricas, decisao_py: DecisaoPython, decisao_ia: DecisaoIA, score_medio: int, decisao_final: str, motivo: str) -> None:
     garantir_csv()
     row = {
         "data_hora": now_iso(),
-        "jogo": m.jogo,
-        "estrategia": m.estrategia,
+        "jogo": sanitizar_csv(m.jogo),
+        "estrategia": sanitizar_csv(m.estrategia),
         "minuto": m.tempo,
-        "placar": m.placar,
-        "mercado": m.mercado,
+        "placar": sanitizar_csv(m.placar),
+        "mercado": sanitizar_csv(m.mercado),
         "score_python": decisao_py.score,
         "decisao_ia": decisao_ia.decisao,
         "ia_original": decisao_ia.confianca_original,
         "ia_corrigida": decisao_ia.confianca_corrigida,
         "score_medio": score_medio,
-        "lado_favorito": m.lado_favorito,
+        "lado_favorito": sanitizar_csv(m.lado_favorito),
         "odd_favorito": m.odd_favorito,
-        "lado_pressionante": m.lado_pressionante,
-        "ultimo_gol_lado": m.ultimo_gol_lado,
-        "valor_pos_evento_classe": m.valor_pos_evento_classe,
-        "valor_pos_evento_motivo": m.valor_pos_evento_motivo,
+        "lado_pressionante": sanitizar_csv(m.lado_pressionante),
+        "ultimo_gol_lado": sanitizar_csv(m.ultimo_gol_lado),
+        "valor_pos_evento_classe": sanitizar_csv(m.valor_pos_evento_classe),
+        "valor_pos_evento_motivo": sanitizar_csv(m.valor_pos_evento_motivo),
         "protecao_ia_ativa": m.protecao_ia_ativa,
-        "liga": m.liga,
-        "decisao_final": decisao_final,
-        "motivo_bloqueio": motivo,
+        "liga": sanitizar_csv(m.liga),
+        "decisao_final": sanitizar_csv(decisao_final),
+        "motivo_bloqueio": sanitizar_csv(motivo),
         "parser_confianca": m.parser_confianca,
-        "parser_observacoes": " | ".join(m.parser_observacoes),
-        "fluxo_decisao": m.fluxo_decisao,
-        "fluxo_motivo": m.fluxo_motivo,
+        "parser_observacoes": " | ".join(sanitizar_csv(x) for x in m.parser_observacoes),
+        "fluxo_decisao": sanitizar_csv(m.fluxo_decisao),
+        "fluxo_motivo": sanitizar_csv(m.fluxo_motivo),
         "teto_v9": decisao_py.detalhes.get("teto_v9", ""),
-        "grupo_gratuito": m.grupo_gratuito,
-        "motivo_grupo_gratuito": m.motivo_grupo_gratuito,
-        "alavancagem": m.alavancagem,
-        "motivo_alavancagem": m.motivo_alavancagem,
-        "australia_leitura": m.australia_leitura,
-        "motivo_australia": m.motivo_australia,
-        "destino_final": m.destino_final,
+        "grupo_gratuito": sanitizar_csv(m.grupo_gratuito),
+        "motivo_grupo_gratuito": sanitizar_csv(m.motivo_grupo_gratuito),
+        "alavancagem": sanitizar_csv(m.alavancagem),
+        "motivo_alavancagem": sanitizar_csv(m.motivo_alavancagem),
+        "australia_leitura": sanitizar_csv(m.australia_leitura),
+        "motivo_australia": sanitizar_csv(m.motivo_australia),
+        "destino_final": sanitizar_csv(m.destino_final),
         "modo_teste": str(MODO_TESTE),
         "previsao_over05_ht": m.previsao_over05_ht,
         "resultado_manual": "",
         "cornerpro": m.cornerpro,
         "bet365": m.bet365,
+        "penalidade_v26": getattr(m, 'penalidade_v26_fav_nao_press', 0),
     }
     with CSV_PATH.open("a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
@@ -3597,7 +3274,7 @@ def registrar_csv(m: Metricas, decisao_py: DecisaoPython, decisao_ia: DecisaoIA,
 
 
 # =========================================================
-# ENVIO RESILIENTE / FILA
+# ENVIO RESILIENTE COM BACKOFF (MUDANÇA 19)
 # =========================================================
 
 async def send_resiliente(canal: str, mensagem: str, parse_mode: Optional[str] = None, max_tentativas: int = 3) -> bool:
@@ -3609,11 +3286,11 @@ async def send_resiliente(canal: str, mensagem: str, parse_mode: Optional[str] =
                 await client.send_message(canal, mensagem)
             return True
         except FloodWaitError as e:
-            espera = int(getattr(e, "seconds", 10)) + 1
-            log(f"⚠️ FloodWait {espera}s | canal={canal}")
+            espera = int(getattr(e, "seconds", 10)) * (tentativa + 1)
+            log(f"⚠️ FloodWait {espera}s | tentativa {tentativa}/{max_tentativas}")
             await asyncio.sleep(espera)
         except TypeNotFoundError:
-            log(f"⚠️ TypeNotFoundError envio tent={tentativa}/{max_tentativas} | reconectando")
+            log(f"⚠️ TypeNotFoundError tent={tentativa}/{max_tentativas} | reconectando")
             try:
                 await client.disconnect()
             except Exception:
@@ -3621,8 +3298,8 @@ async def send_resiliente(canal: str, mensagem: str, parse_mode: Optional[str] =
             await asyncio.sleep(2)
             await client.connect()
         except Exception as e:
-            log(f"⚠️ Erro envio tent={tentativa}/{max_tentativas} | {type(e).__name__}: {e}")
-            await asyncio.sleep(1)
+            log(f"⚠️ Erro tent={tentativa}/{max_tentativas} | {type(e).__name__}: {e}")
+            await asyncio.sleep(2 ** tentativa)
     log(f"❌ ALERTA NÃO ENVIADO | canal={canal}")
     return False
 
@@ -3649,32 +3326,11 @@ async def enfileirar_envio(canal: str, mensagem: str, parse_mode: Optional[str] 
         log("❌ FILA CHEIA — alerta descartado por segurança")
 
 
-
 # =========================================================
 # V007 — FLUXO FT CHAMA → ESPERA → CONFIRMAÇÃO
 # =========================================================
 
 def deve_aguardar_confirmacao_ft(m: Metricas) -> Tuple[bool, str]:
-    """Regra do primeiro alerta FT.
-
-    Quando o pressionante marcou recentemente e com esse gol ficou vencendo
-    (seja saindo de empate ou ampliando vantagem já existente), não enviamos
-    direto e não matamos. Aguardamos BOT_FT CONFIRMAÇÃO.
-
-    V010 — corrigido: antes usava gol_recente_pressionante_aumentou_vantagem(),
-    que só pegava ampliação de vantagem (1x0→2x0, 2x1→3x1) mas não pegava
-    o caso de empate→vitória (0x0→1x0, 1x1→2x1, 2x2→3x2).
-    Bug real: Cienciano x Sporting Cristal — gol no 69' fez 3x2, alerta no 73'
-    com pressão pré-gol ainda contaminando U10, score chegou a 90%.
-
-    Casos que DEVEM cair em espera (pressionante vencendo após o gol):
-      0x0 → 1x0 | 1x1 → 2x1 | 2x2 → 3x2 | 1x0 → 2x0 | 2x1 → 3x1
-
-    Casos que NÃO devem cair em espera (pressionante não vencendo):
-      0x1 → 1x1  (empatou — ainda tem jogo)
-      0x2 → 1x2  (reduziu — ainda perdendo)
-      gol da zebra / gol contra o pressionante
-    """
     if not eh_ft(m.estrategia) or eh_confirmacao(m.estrategia):
         return False, "NAO_E_FT_GATILHO"
     if not (gol_recente_do_pressionante(m, janela=5) and ultimo_gol_deixou_lado_vencendo(m)):
@@ -3690,12 +3346,46 @@ def deve_aguardar_confirmacao_ft(m: Metricas) -> Tuple[bool, str]:
     )
 
 
-def confirmacao_isolada_valida(m: Metricas) -> Tuple[bool, str]:
-    """FT_CONFIRMAÇÃO sem CHAMA anterior só entra em urgência nova.
+# =========================================================
+# dc01_1_zebra_ameaca_real COM 3 PROVAS (MUDANÇA 6)
+# =========================================================
 
-    Ex.: favorito empatando/perdendo ou sofreu gol contra fluxo dentro da janela.
-    Limite operacional: até 82'.
-    """
+def dc01_1_zebra_ameaca_real(m: "Metricas", zebra: str) -> Tuple[bool, str]:
+    """DC01.1 — mede se a zebra está viva (Mudança 6: exige 3 provas)."""
+    if zebra not in {"CASA", "FORA"}:
+        return False, "ZEBRA_INVALIDA"
+    d = dados_lado(m, zebra)
+    ip = ip_lado(m, zebra)
+
+    provas = []
+    motivos = []
+
+    if d["rb"] >= 1:
+        provas.append(1.5)
+        motivos.append(f"RB={d['rb']}")
+    if d["rl"] >= 2:
+        provas.append(1.0)
+        motivos.append(f"RL={d['rl']}")
+    if d["cantos"] >= 1:
+        provas.append(0.5)
+        motivos.append(f"CANTOS={d['cantos']}")
+    if d["u5"] >= 2 or d["u10"] >= 4:
+        provas.append(0.8)
+        motivos.append(f"U5={d['u5']}_U10={d['u10']}")
+    if d["chance"] >= 5 or d["xg"] >= 0.20:
+        provas.append(1.0)
+        motivos.append(f"CHANCE={d['chance']}_XG={d['xg']:.2f}")
+    if ip["pico"] >= 16 or ip["c15"] >= 1:
+        provas.append(0.7)
+        motivos.append(f"IP={ip['pico']}_C15={ip['c15']}")
+
+    total = sum(provas)
+    ok = total >= 3.0
+
+    return ok, f"ZEBRA_AMEACA_PROVAS={total:.1f}/3|" + "|".join(motivos)
+
+
+def confirmacao_isolada_valida(m: Metricas) -> Tuple[bool, str]:
     if not eh_confirmacao(m.estrategia) or not eh_ft(m.estrategia):
         return False, "NAO_E_FT_CONFIRMACAO"
     if int(m.tempo or 0) > 82:
@@ -3705,7 +3395,6 @@ def confirmacao_isolada_valida(m: Metricas) -> Tuple[bool, str]:
     if fav not in {"CASA", "FORA"} or lado not in {"CASA", "FORA"}:
         return False, "SEM_FAVORITO_OU_PRESSIONANTE"
 
-    # DC01.2 — CONF01: favorito vencendo por 1 com zebra morta bloqueia confirmação isolada.
     if HABILITAR_DC01_2_CONF01:
         diff_iso = diferenca_placar(m)
         vence_iso = lado_vencendo(m)
@@ -3715,21 +3404,17 @@ def confirmacao_isolada_valida(m: Metricas) -> Tuple[bool, str]:
             if not zebra_viva_iso:
                 return False, f"CONF01_FAVORITO_VENCE_1_ZEBRA_MORTA | {zebra_motivo_iso}"
 
-    # V29 Item 1 — trava favorito vencendo + gol recente do favorito
     bloqueio_v29_1, motivo_v29_1 = v29_trava_conf_favorito_vencendo_gol_recente(m)
     if bloqueio_v29_1:
         return False, motivo_v29_1
 
-    # V29 Item 2 — trava placar largo adversário
     bloqueio_v29_2, motivo_v29_2 = v29_trava_conf_placar_largo(m)
     if bloqueio_v29_2:
         return False, motivo_v29_2
 
-    # Favorito pressionando e ainda não venceu/resolvido.
     if fav == lado and favorito_nao_vencendo(m) and pressao_viva_lado(m, lado) and consequencia_minima_emocional(m, lado):
         return True, "CONF_ISOLADA_FAVORITO_NAO_VENCE_COM_PRESSAO"
 
-    # Gol contra o favorito/pressionante pode criar urgência nova.
     if gol_recente(m, janela=6) and m.ultimo_gol_lado != lado and fav == lado and pressao_viva_lado(m, lado):
         return True, "CONF_ISOLADA_GOL_CONTRA_FLUXO_GEROU_URGENCIA"
 
@@ -3737,37 +3422,25 @@ def confirmacao_isolada_valida(m: Metricas) -> Tuple[bool, str]:
 
 
 def comparar_alertas_confirmacao(old: Metricas, novo: Metricas) -> Tuple[bool, str, Dict[str, Any]]:
-    """Compara alerta 1 e alerta 2.
-
-    Retorna True só quando a confirmação realmente confirmou continuidade.
-    Também bloqueia confirmação com gol recente do pressionante que deixou/ manteve
-    o lado vencendo, pois no minuto 80/81 não há tempo para provar nova pressão.
-    """
     detalhes: Dict[str, Any] = {}
     lado = old.lado_pressionante if old.lado_pressionante in {"CASA", "FORA"} else novo.lado_pressionante
     if lado not in {"CASA", "FORA"}:
         return False, "CONF_SEM_LADO_COMPARAVEL", detalhes
 
-    # Na confirmação, gol recente do pressionante resolvendo/deixando vencendo mata.
     if gol_recente_pressionante_resolveu_confirmacao(novo, janela=5):
         return False, (
             f"CONF_GOL_RECENTE_PRESSIONANTE_RESOLVEU | ultimo={novo.ultimo_gol}' {novo.ultimo_gol_lado} | "
             f"placar={novo.placar} | press={novo.lado_pressionante}"
         ), detalhes
 
-    # V29 Item 1 — trava favorito vencendo + gol recente do favorito
     bloqueio_v29_1, motivo_v29_1 = v29_trava_conf_favorito_vencendo_gol_recente(novo)
     if bloqueio_v29_1:
         return False, motivo_v29_1, detalhes
 
-    # V29 Item 2 — trava placar largo adversário (favorito perdendo por 3+)
     bloqueio_v29_2, motivo_v29_2 = v29_trava_conf_placar_largo(novo)
     if bloqueio_v29_2:
         return False, motivo_v29_2, detalhes
 
-    # DC01.2 — CONF01: bloqueia confirmação quando favorito vence por 1 e zebra está morta.
-    # A confirmação deve aprovar somente quando há melhora forte, necessidade real ou
-    # contexto de massacre extremo. Favorito vencendo por 1 com zebra sem vida = jogo resolvido.
     if HABILITAR_DC01_2_CONF01:
         fav_conf = novo.lado_favorito
         if fav_conf in {"CASA", "FORA"}:
@@ -3801,7 +3474,6 @@ def comparar_alertas_confirmacao(old: Metricas, novo: Metricas) -> Tuple[bool, s
         partes.append(f"{nome}:{anterior}->{atual}({delta:+.1f})")
         if delta > 0:
             melhoras += 1
-        # queda forte em U5/U10/Chance/AP pesa mais.
         if nome in {"AP", "U5", "U10", "CHANCE"} and delta < -1:
             quedas_fortes += 1
 
@@ -3818,8 +3490,6 @@ def comparar_alertas_confirmacao(old: Metricas, novo: Metricas) -> Tuple[bool, s
     if quedas_fortes >= 2:
         return False, "CONFIRMACAO_MOSTROU_QUEDA_DE_PRESSAO | " + " | ".join(partes), detalhes
 
-    # Mantém/libera quando há confirmação objetiva de continuidade. O bot de
-    # confirmação da CornerPro já é mais exigente, mas exigimos prova mínima.
     pressao_ok = pressao_viva_lado(novo, lado)
     consequencia_ok = consequencia_minima_emocional(novo, lado) or consequencia_real_lado(novo, lado)
     if melhoras >= 3 and pressao_ok and consequencia_ok:
@@ -3847,35 +3517,17 @@ async def cancelar_pendente_confirmacao_ft_depois(chave: str, timeout_segundos: 
 
 
 def timeout_confirmacao_segundos(m: Metricas) -> int:
-    # Espera até ~82' com piso/teto operacional. Como o Telegram chega em tempo real,
-    # usamos minutos de jogo como aproximação em segundos.
     tempo = int(m.tempo or 0)
     if tempo >= 82:
         return 90
     return max(120, min(600, (82 - tempo + 1) * 60))
 
+
 # =========================================================
 # DC01 — CHAMA_FT PLACAR ELÁSTICO
-# Regra pequena e isolada para jogos praticamente definidos.
-# Só roda para CHAMA_FT + diferença >= 3 gols.
-# Não mexe no score, IA, VOLUME, SNIPER, ARCE ou grupo grátis.
 # =========================================================
 
 def dc01_chama_placar_elastico(m: "Metricas") -> Tuple[str, str]:
-    """Classifica CHAMA_FT com diferença de 3+ gols em MORTO/MEIO_TERMO/CAOS/APROVAR.
-
-    Retorno:
-      - NAO_APLICA: qualquer coisa fora do alvo da regra.
-      - BLOQUEAR: placar elástico realmente morto.
-      - CONFIRMAR: existe vida, mas não o suficiente para entrada direta.
-      - APROVAR: caos vivo/ataque contra contra-ataque validado.
-
-    Filosofia DC01:
-    - Austrália/liga aberta ajuda como contexto, mas não salva jogo morto.
-    - Perdedor pressionando fraco em 3+ gols não basta.
-    - Perdedor pressionando forte + vencedor vivo = cenário de transição/caos.
-    - Vencedor amassando em placar elástico, principalmente com gol recente, vai para confirmação.
-    """
     if not HABILITAR_DC01_CHAMA_PLACAR_ELASTICO:
         return "NAO_APLICA", "DC01_CHAMA_PLACAR_FLAG_OFF"
     if m.estrategia != "CHAMA_FT":
@@ -3904,7 +3556,6 @@ def dc01_chama_placar_elastico(m: "Metricas") -> Tuple[str, str]:
     delta_gol = minutos_desde_ultimo_gol(m)
     gol_recente_vencedor = bool(m.ultimo_gol_lado == vencedor and -1 <= delta_gol <= 8)
 
-    # Pressão forte do perdedor: não basta IP 12/14 em placar elástico.
     perdedor_pressao_forte = (
         (ip_perd["c18"] >= 3 or ip_perd["c22"] >= 2 or ip_perd["pico"] >= 24)
         and (d_perd["u5"] >= 3 or d_perd["u10"] >= 7)
@@ -3915,7 +3566,6 @@ def dc01_chama_placar_elastico(m: "Metricas") -> Tuple[str, str]:
         and (d_perd["u5"] >= 5 or d_perd["u10"] >= 10)
     )
 
-    # Vencedor vivo: sinais mínimos de contra-ataque/resposta nos últimos 10.
     vencedor_vivo = (
         d_venc["u5"] >= 1
         or d_venc["u10"] >= 3
@@ -3949,22 +3599,15 @@ def dc01_chama_placar_elastico(m: "Metricas") -> Tuple[str, str]:
     if ambos_mortos:
         return "BLOQUEAR", "DC01_CHAMA_PLACAR_ELASTICO_MORTO | " + resumo
 
-    # V29 Item 11 — exceção massacre absoluto do vencedor
-    # Critérios extremos: IP≥25 + RB≥10 + chance≥12 + vencendo por 3+ + gol antes do min 60
-    # Quando ativo: aprova diretamente, sem exigir reação do perdedor
     massacre_ok, massacre_motivo = v29_massacre_absoluto_vencedor(m)
     if massacre_ok:
         return "APROVAR", f"DC01_MASSACRE_VENCEDOR_ABSOLUTO | {massacre_motivo} | {resumo}"
 
-    # Perdedor gera o alerta: só aprova direto se for pressão forte/absurda E o vencedor ainda responde.
     if lado == perdedor:
         if perdedor_pressao_absurda and vencedor_vivo:
             return "APROVAR", "DC01_CHAMA_PLACAR_ELASTICO_CAOS_PERDEDOR_ABSURDO_VENCEDOR_VIVO | " + resumo
         if perdedor_pressao_forte and vencedor_vivo:
             return "APROVAR", "DC01_CHAMA_PLACAR_ELASTICO_CAOS_PERDEDOR_FORTE_VENCEDOR_VIVO | " + resumo
-        # DC01.4 — Ajuste B: perdedor com pressão forte OU vencedor vivo OU perdedor marcou
-        # antes ia para CONFIRMAR aguardando timeout. Agora APROVA diretamente
-        # quando há pelo menos UMA dessas condições — confirmação raramente chega a tempo.
         if HABILITAR_DC01_4_CHAMA_ELASTICO_PERDEDOR_DIRETO:
             if perdedor_pressao_forte or (vencedor_vivo and perdedor_ja_marcou):
                 return "APROVAR", "DC01_CHAMA_PLACAR_ELASTICO_DC014_PERDEDOR_DIRETO | " + resumo
@@ -3975,7 +3618,6 @@ def dc01_chama_placar_elastico(m: "Metricas") -> Tuple[str, str]:
                 return "CONFIRMAR", "DC01_CHAMA_PLACAR_ELASTICO_MEIO_TERMO_PERDEDOR | " + resumo
         return "BLOQUEAR", "DC01_CHAMA_PLACAR_ELASTICO_PERDEDOR_PRESSAO_MORNA_VENCEDOR_MORTO | " + resumo
 
-    # Vencedor gera o alerta: em placar elástico não liberar fácil, principalmente se acabou de marcar.
     if lado == vencedor:
         if vencedor_extremo and not gol_recente_vencedor and d_venc["u5"] >= 4 and d_venc["u10"] >= 8:
             return "APROVAR", "DC01_CHAMA_PLACAR_ELASTICO_VENCEDOR_EXTREMO_SEM_GOL_RECENTE | " + resumo
@@ -3985,16 +3627,12 @@ def dc01_chama_placar_elastico(m: "Metricas") -> Tuple[str, str]:
 
     return "CONFIRMAR", "DC01_CHAMA_PLACAR_ELASTICO_LADO_DIVERGENTE_MEIO_TERMO | " + resumo
 
+
 # =========================================================
 # V29 — FUNÇÕES DE APOIO ÀS NOVAS TRAVAS
 # =========================================================
 
 def v29_massacre_absoluto_vencedor(m: "Metricas") -> Tuple[bool, str]:
-    """Item 11 — verifica se o vencedor está em modo massacre absoluto.
-
-    Critérios: IP pico ≥ 25 + RB ≥ 10 + chance ≥ 12 + vencendo por 3+ + último gol antes do min 60.
-    Quando verdadeiro: aprova sem exigir reação do perdedor E quebra trava de liga PERIGOSA.
-    """
     if not HABILITAR_V29_MELHORIAS:
         return False, "V29_MELHORIAS_OFF"
 
@@ -4006,7 +3644,6 @@ def v29_massacre_absoluto_vencedor(m: "Metricas") -> Tuple[bool, str]:
     if dif < V29_MASSACRE_DIFF_MIN:
         return False, f"V29_DIF_{dif}_ABAIXO_{V29_MASSACRE_DIFF_MIN}"
 
-    # Último gol deve ter ocorrido antes da janela de leitura (minuto 60)
     if m.ultimo_gol and int(m.ultimo_gol) >= V29_MASSACRE_GOL_ANTES_MIN:
         return False, f"V29_GOL_RECENTE_{m.ultimo_gol}_NAO_ANTES_MIN{V29_MASSACRE_GOL_ANTES_MIN}"
 
@@ -4028,10 +3665,6 @@ def v29_massacre_absoluto_vencedor(m: "Metricas") -> Tuple[bool, str]:
 
 
 def v29_trava_conf_favorito_vencendo_gol_recente(novo: "Metricas") -> Tuple[bool, str]:
-    """Item 1 — bloqueia confirmação quando favorito vencendo + gol recente do favorito.
-
-    Favorito vencendo + gol dele nos últimos N min → exige U10 ≥ X ou RB 2ºP ≥ Y ou xG ≥ Z.
-    """
     if not HABILITAR_V29_MELHORIAS:
         return False, "V29_MELHORIAS_OFF"
 
@@ -4043,7 +3676,6 @@ def v29_trava_conf_favorito_vencendo_gol_recente(novo: "Metricas") -> Tuple[bool
     if vencendo != fav:
         return False, "V29_FAV_NAO_VENCENDO"
 
-    # Verifica se o gol recente foi do favorito
     if novo.ultimo_gol_lado != fav:
         return False, "V29_GOL_NAO_DO_FAVORITO"
 
@@ -4051,9 +3683,8 @@ def v29_trava_conf_favorito_vencendo_gol_recente(novo: "Metricas") -> Tuple[bool
     if delta > V29_CONF_FAV_VENCENDO_GOL_RECENTE_JANELA:
         return False, f"V29_GOL_HA_{delta}MIN_FORA_JANELA_{V29_CONF_FAV_VENCENDO_GOL_RECENTE_JANELA}"
 
-    # Gol do favorito dentro da janela — verificar se há justificativa extrema
     d_fav = dados_lado(novo, fav)
-    xg_total = float(sum(novo.xg)) if isinstance(novo.xg, tuple) else 0.0
+    xg_total = get_xg_total(novo)
 
     if d_fav["u10"] >= V29_CONF_FAV_VENCENDO_U10_MIN:
         return False, f"V29_U10_{d_fav['u10']}_JUSTIFICA_CONF"
@@ -4069,7 +3700,9 @@ def v29_trava_conf_favorito_vencendo_gol_recente(novo: "Metricas") -> Tuple[bool
 
 
 def v29_trava_conf_placar_largo(novo: "Metricas") -> Tuple[bool, str]:
-    """Item 2 — bloqueia confirmação quando favorito está perdendo por 3+ gols."""
+    """Item 2 — bloqueia confirmação quando favorito está perdendo por 3+ gols.
+    Mudança 14: exceção para pressão extrema.
+    """
     if not HABILITAR_V29_MELHORIAS:
         return False, "V29_MELHORIAS_OFF"
 
@@ -4085,14 +3718,18 @@ def v29_trava_conf_placar_largo(novo: "Metricas") -> Tuple[bool, str]:
     if dif < V29_CONF_PLACAR_LARGO_MIN_DIFF:
         return False, f"V29_DIF_{dif}_ABAIXO_{V29_CONF_PLACAR_LARGO_MIN_DIFF}"
 
+    # Mudança 14: Exceção para pressão extrema do favorito
+    d_fav = dados_lado(novo, fav)
+    ip_fav = ip_lado(novo, fav)
+    if d_fav["u5"] >= 4 and d_fav["u10"] >= 8 and ip_fav["pico"] >= 24:
+        return False, f"V29_EXCECAO_PRESSAO_EXTREMA | fav={fav} u5={d_fav['u5']} u10={d_fav['u10']} ip={ip_fav['pico']}"
+
     return True, f"V29_TRAVA_CONF_PLACAR_LARGO | fav={fav} perdendo_por={dif} placar={novo.placar}"
 
 
 def v29_trava_decaimento_pressao_2p(m: "Metricas") -> Tuple[bool, str]:
     """Item 10 — bloqueia CHAMA_FT quando favorito vencendo mas relaxou no 2ºP.
-
-    Condição: favorito vencendo + AP 2ºP favorito < AP 2ºP adversário.
-    Exige xG ≥ 1.50 E U10 ≥ 8 para passar. Sem ambos, bloqueia.
+    Mudança 5: usa U5/U10 como proxy de AP do 2ºP.
     """
     if not HABILITAR_V29_MELHORIAS:
         return False, "V29_MELHORIAS_OFF"
@@ -4108,56 +3745,36 @@ def v29_trava_decaimento_pressao_2p(m: "Metricas") -> Tuple[bool, str]:
     if vencendo != fav:
         return False, "V29_FAV_NAO_VENCENDO"
 
-    # Verificar decaimento: AP 2ºP do favorito < AP 2ºP do adversário
-    # Usamos ataques_perigosos totais como proxy (2ºP não está separado no dataclass)
-    # A comparação U5/U10 recentes é o sinal mais confiável de quem domina AGORA
     adv = lado_oposto(fav)
     d_fav = dados_lado(m, fav)
     d_adv = dados_lado(m, adv)
 
-    # AP total: se o favorito tem menos AP total E menos pressão recente, decaiu
-    ap_fav = valor_lado(m, "ataques_perigosos", fav)
-    ap_adv = valor_lado(m, "ataques_perigosos", adv)
-
-    if ap_fav >= ap_adv:
-        return False, f"V29_FAV_AP_{ap_fav}_AINDA_DOMINA_{ap_adv}"
-
-    # Favorito com menos AP total E vencendo = possível decaimento
-    # Confirma com U5/U10 recentes
     u5_fav = d_fav["u5"]
     u10_fav = d_fav["u10"]
     u5_adv = d_adv["u5"]
     u10_adv = d_adv["u10"]
 
-    # Se favorito ainda domina os recentes, não é decaimento real
-    if u5_fav > u5_adv and u10_fav > u10_adv:
+    # Mudança 5: Usar U5/U10 como proxy do 2ºP
+    if not (u5_fav < u5_adv and u10_fav < u10_adv):
         return False, f"V29_FAV_RECENTES_U5={u5_fav}>{u5_adv}_U10={u10_fav}>{u10_adv}_SEM_DECAIMENTO"
 
-    # Decaimento confirmado — verificar se há justificativa extrema
-    xg_total = float(sum(m.xg)) if isinstance(m.xg, tuple) else 0.0
+    xg_total = get_xg_total(m)
 
     if xg_total >= V29_DECAIMENTO_XG_MIN and u10_fav >= V29_DECAIMENTO_U10_MIN:
         return False, f"V29_XG_{xg_total:.2f}_U10={u10_fav}_JUSTIFICA"
 
     return True, (
-        f"V29_TRAVA_DECAIMENTO_2P | fav={fav} ap_fav={ap_fav}<ap_adv={ap_adv} "
-        f"u5={u5_fav}x{u5_adv} u10={u10_fav}x{u10_adv} xg={xg_total:.2f}"
+        f"V29_TRAVA_DECAIMENTO_2P | fav={fav} u5={u5_fav}x{u5_adv} u10={u10_fav}x{u10_adv} xg={xg_total:.2f}"
     )
 
 
 def v29_trava_rb_zero_liga_fraca(m: "Metricas") -> Tuple[bool, str]:
-    """Item 5 — bloqueia quando perdedor tem RB=0 em liga NEUTRA ou PERIGOSA.
-
-    Exceção: item 11 (massacre absoluto) já aprovado — não aplica.
-    Exceção: ligas MODERADA e PREMIUM — não aplica.
-    """
     if not HABILITAR_V29_MELHORIAS:
         return False, "V29_MELHORIAS_OFF"
 
     if m.liga not in {"NEUTRA", "PERIGOSA"}:
         return False, f"V29_LIGA_{m.liga}_NAO_APLICA_RB_ZERO"
 
-    # Verifica se é massacre absoluto — se sim, não bloqueia
     massacre_ok, _ = v29_massacre_absoluto_vencedor(m)
     if massacre_ok:
         return False, "V29_MASSACRE_ABSOLUTO_EXCECAO_RB_ZERO"
@@ -4176,24 +3793,21 @@ def v29_trava_rb_zero_liga_fraca(m: "Metricas") -> Tuple[bool, str]:
 
 
 def v29_cooldown_universal_aprovado(chave_jogo: str) -> bool:
-    """Item 9 — verifica se o jogo já foi aprovado e enviado hoje por qualquer bot."""
     if not HABILITAR_V29_MELHORIAS:
         return False
     ts = v29_aprovados_por_jogo.get(chave_jogo, 0)
     if not ts:
         return False
-    # Cooldown de 24h — mesmo jogo não reentra no dia
     return time.time() - ts < 86400
 
 
 def v29_marcar_aprovado_universal(chave_jogo: str) -> None:
-    """Item 9 — registra que o jogo foi aprovado para cooldown universal."""
     v29_aprovados_por_jogo[chave_jogo] = time.time()
+    v29_salvar_cooldowns()
+
 
 # =========================================================
 # SNIPER V2 — LEITURA SEPARADA FT
-# Módulo isolado: não altera CHAMA, VOLUME, ARCE, score central nem IA V28.
-# Filosofia: favorito forte + necessidade + pressão madura no fim do jogo.
 # =========================================================
 
 def sniper_contexto_placar(m: "Metricas") -> Tuple[str, str]:
@@ -4218,7 +3832,6 @@ def sniper_contexto_placar(m: "Metricas") -> Tuple[str, str]:
 
 
 def sniper_pressao_premiada(m: "Metricas") -> Tuple[bool, str]:
-    """True quando o gol recente pagou a pressão do favorito/pressionante."""
     if not m.ultimo_gol or m.ultimo_gol_lado not in {"CASA", "FORA"}:
         return False, "SNIPER_SEM_GOL_RECENTE"
     delta = minutos_desde_ultimo_gol(m)
@@ -4249,45 +3862,7 @@ def sniper_gol_contra_fluxo(m: "Metricas") -> Tuple[bool, str]:
     return False, "SNIPER_SEM_GOL_CONTRA_FLUXO"
 
 
-
-def dc01_1_zebra_ameaca_real(m: "Metricas", zebra: str) -> Tuple[bool, str]:
-    """DC01.1 — mede se a zebra está viva o bastante para manter necessidade.
-
-    Usada principalmente quando o favorito já vence por 1 no SNIPER.
-    Não basta o favorito estar pressionando; a zebra precisa ameaçar o empate.
-    """
-    if zebra not in {"CASA", "FORA"}:
-        return False, "ZEBRA_INVALIDA"
-    d = dados_lado(m, zebra)
-    ip = ip_lado(m, zebra)
-    provas = 0
-    motivos = []
-    if d["rb"] >= 1:
-        provas += 1; motivos.append(f"RB={d['rb']}")
-    if d["rl"] >= 2:
-        provas += 1; motivos.append(f"RL={d['rl']}")
-    if d["cantos"] >= 1:
-        provas += 1; motivos.append(f"CANTOS={d['cantos']}")
-    if d["u5"] >= 2 or d["u10"] >= 4:
-        provas += 1; motivos.append(f"U5={d['u5']}_U10={d['u10']}")
-    if d["chance"] >= 5 or d["xg"] >= 0.20:
-        provas += 1; motivos.append(f"CHANCE={d['chance']}_XG={d['xg']:.2f}")
-    if ip["pico"] >= 16 or ip["c15"] >= 1:
-        provas += 1; motivos.append(f"IP={ip['pico']}_C15={ip['c15']}")
-
-    ok = provas >= 2
-    return ok, f"ZEBRA_AMEACA_PROVAS={provas}/6|" + "|".join(motivos)
-
-
 def dc01_1_sniper_necessidade_real(m: "Metricas") -> Tuple[bool, str]:
-    """DC01.1 — identidade final do SNIPER.
-
-    SNIPER é bot de necessidade, não de simples pressão.
-    - Favorito perdendo: cenário natural.
-    - Favorito empatando: cenário natural.
-    - Favorito vencendo por 1: só se a zebra estiver viva e ameaçando.
-    - Favorito vencendo por 2+: bloqueia.
-    """
     if not HABILITAR_DC01_1_SNIPER_NECESSIDADE:
         return True, "DC01_1_SNIPER_NECESSIDADE_OFF"
     if not eh_sniper_ft(m.estrategia):
@@ -4305,7 +3880,6 @@ def dc01_1_sniper_necessidade_real(m: "Metricas") -> Tuple[bool, str]:
     if vencedor != fav:
         return True, "SNIPER_NECESSIDADE_FAVORITO_PERDENDO"
 
-    # Favorito já vence: só passa por 1 e com ameaça real da zebra.
     if diff >= 2:
         return False, f"SNIPER_SEM_NECESSIDADE_FAVORITO_VENCE_{diff}"
 
@@ -4318,11 +3892,6 @@ def dc01_1_sniper_necessidade_real(m: "Metricas") -> Tuple[bool, str]:
 
 
 def dc01_1_ht_adversario_tem_vida(m: "Metricas", adversario: str) -> Tuple[bool, str]:
-    """DC01.1 — avalia se o time que está apanhando no HT ainda ameaça.
-
-    A ideia não é bloquear 3x0 automaticamente. É bloquear 3x0 morto:
-    favorito muito superior, zebra sem remate, sem canto, sem AP recente e sem IP.
-    """
     if adversario not in {"CASA", "FORA"}:
         return False, "ADVERSARIO_INVALIDO"
     d = dados_lado(m, adversario)
@@ -4330,30 +3899,27 @@ def dc01_1_ht_adversario_tem_vida(m: "Metricas", adversario: str) -> Tuple[bool,
     provas = 0
     motivos = []
     if d["rb"] >= 1:
-        provas += 1; motivos.append(f"RB={d['rb']}")
+        provas += 1
+        motivos.append(f"RB={d['rb']}")
     if d["rl"] >= 2:
-        provas += 1; motivos.append(f"RL={d['rl']}")
+        provas += 1
+        motivos.append(f"RL={d['rl']}")
     if d["cantos"] >= 1:
-        provas += 1; motivos.append(f"CANTOS={d['cantos']}")
+        provas += 1
+        motivos.append(f"CANTOS={d['cantos']}")
     if d["u5"] >= 2 or d["u10"] >= 4:
-        provas += 1; motivos.append(f"U5={d['u5']}_U10={d['u10']}")
+        provas += 1
+        motivos.append(f"U5={d['u5']}_U10={d['u10']}")
     if d["chance"] >= 4 or d["xg"] >= 0.15:
-        provas += 1; motivos.append(f"CHANCE={d['chance']}_XG={d['xg']:.2f}")
+        provas += 1
+        motivos.append(f"CHANCE={d['chance']}_XG={d['xg']:.2f}")
     if ip["pico"] >= 14 or ip["c10"] >= 2:
-        provas += 1; motivos.append(f"IP={ip['pico']}_C10={ip['c10']}")
+        provas += 1
+        motivos.append(f"IP={ip['pico']}_C10={ip['c10']}")
     return provas >= 2, f"ADVERSARIO_VIDA_PROVAS={provas}/6|" + "|".join(motivos)
 
 
 def dc01_1_ht_placar_largo_sem_necessidade(m: "Metricas", lado: str) -> Tuple[bool, str]:
-    """DC01.1 — ARCE/HT: 3x0 no 1T só passa se ainda houver necessidade.
-
-    Não mata placar largo por si só. Bloqueia apenas quando:
-    - HT;
-    - diferença >= 3;
-    - o lado pressionante é o vencedor;
-    - odds muito desequilibradas OU adversário totalmente morto;
-    - adversário não mostra ameaça mínima.
-    """
     if not HABILITAR_DC01_1_HT_PLACAR_LARGO_NECESSIDADE:
         return False, "DC01_1_HT_PLACAR_LARGO_OFF"
     if not eh_ht(m.estrategia):
@@ -4380,11 +3946,9 @@ def dc01_1_ht_placar_largo_sem_necessidade(m: "Metricas", lado: str) -> Tuple[bo
         and (ip_v["pico"] >= 28 or ip_v["c18"] >= 3 or ip_v["c22"] >= 2)
     )
 
-    # Se o adversário está vivo, o jogo ainda tem ameaça e pode seguir.
     if adv_vivo:
         return False, "HT_PLACAR_LARGO_MAS_ADVERSARIO_VIVO | " + adv_motivo
 
-    # Se o adversário não está vivo, só preserva massacre realmente fora da curva.
     if massacre_fora_da_curva and not odds_muito_desequilibradas:
         return False, "HT_PLACAR_LARGO_MAS_MASSACRE_FORA_DA_CURVA | " + adv_motivo
 
@@ -4396,19 +3960,6 @@ def dc01_1_ht_placar_largo_sem_necessidade(m: "Metricas", lado: str) -> Tuple[bo
 
 
 def v26_detectar_caos_bidirecional(m: "Metricas") -> Tuple[str, str]:
-    """DC01.2 — detecta trocação legítima para reduzir penalidade V26 FAV_NAO_PRESSIONANTE.
-
-    Objetivo: impedir que a V26 mate jogos de guerra aberta onde a zebra
-    realmente ameaça, mas o favorito ainda domina em termos de pressão global.
-
-    Retorna:
-        "NORMAL"  -> manter penalidade original (-8)
-        "MEDIO"   -> reduzir penalidade para -2  (V26_CAOS_BIDIRECIONAL_MEDIO)
-        "FORTE"   -> zerar penalidade            (V26_CAOS_BIDIRECIONAL_FORTE)
-
-    Prioriza sinais recentes: U5, U10, cantos recentes, AP recentes,
-    ultimo gol, exposicao dos dois lados. NAO usa apenas totais acumulados.
-    """
     if not HABILITAR_DC01_2_V26_CAOS_BIDIRECIONAL:
         return "NORMAL", "DC01_2_V26_CAOS_OFF"
 
@@ -4425,7 +3976,6 @@ def v26_detectar_caos_bidirecional(m: "Metricas") -> Tuple[str, str]:
     sinais_zebra_viva = 0
     motivos_z: list = []
 
-    # Sinais recentes da zebra (prioridade maxima)
     if d_z["u5"] >= 2:
         sinais_zebra_viva += 2
         motivos_z.append(f"ZEBRA_U5={d_z['u5']}")
@@ -4445,7 +3995,6 @@ def v26_detectar_caos_bidirecional(m: "Metricas") -> Tuple[str, str]:
         sinais_zebra_viva += 1
         motivos_z.append(f"ZEBRA_IP={ip_z['pico']}_C10={ip_z['c10']}")
 
-    # Favorito tambem ainda pressionando (guerra aberta, nao jogo morto)
     sinais_fav_ativo = 0
     if d_f["u5"] >= 2:
         sinais_fav_ativo += 1
@@ -4454,7 +4003,6 @@ def v26_detectar_caos_bidirecional(m: "Metricas") -> Tuple[str, str]:
     if ip_f["pico"] >= 18:
         sinais_fav_ativo += 1
 
-    # Ultimo gol recente indica jogo vivo
     delta_gol = minutos_desde_ultimo_gol(m)
     gol_recente_sinal = -1 <= delta_gol <= 10
 
@@ -4463,11 +4011,9 @@ def v26_detectar_caos_bidirecional(m: "Metricas") -> Tuple[str, str]:
         f"|gol_recente={gol_recente_sinal}|{','.join(motivos_z)}"
     )
 
-    # FORTE: zebra muito viva + favorito ainda ativo + jogo claramente aberto
     if sinais_zebra_viva >= 5 and sinais_fav_ativo >= 2 and (gol_recente_sinal or d_z["u5"] >= 3):
         return "FORTE", f"V26_CAOS_BIDIRECIONAL_FORTE | {motivo_base}"
 
-    # MEDIO: zebra com alguma ameaca real + favorito ainda pressionando
     if sinais_zebra_viva >= 3 and sinais_fav_ativo >= 1:
         return "MEDIO", f"V26_CAOS_BIDIRECIONAL_MEDIO | {motivo_base}"
 
@@ -4475,12 +4021,6 @@ def v26_detectar_caos_bidirecional(m: "Metricas") -> Tuple[str, str]:
 
 
 def filtro_sniper_ft_v2(m: "Metricas") -> Tuple[bool, str]:
-    """Porta própria do SNIPER FT.
-
-    Nao cria score novo e nao substitui o V28. Apenas impede que o Sniper
-    entre quando o contexto ja perdeu valor. Se passar, segue pelo fluxo
-    normal Python + IA V28.
-    """
     if not eh_sniper_ft(m.estrategia):
         return True, "NAO_SNIPER"
 
@@ -4522,10 +4062,14 @@ def filtro_sniper_ft_v2(m: "Metricas") -> Tuple[bool, str]:
         if not cont_ok:
             return False, motivo_premiada + " | " + cont_motivo
         provas = 0
-        if d["u5"] >= 4: provas += 1
-        if d["u10"] >= 8: provas += 1
-        if d["rb"] >= 2 or d["chance"] >= 10 or d["xg"] >= 0.40: provas += 1
-        if ip["pico"] >= 22 or ip["c18"] >= 2: provas += 1
+        if d["u5"] >= 4:
+            provas += 1
+        if d["u10"] >= 8:
+            provas += 1
+        if d["rb"] >= 2 or d["chance"] >= 10 or d["xg"] >= 0.40:
+            provas += 1
+        if ip["pico"] >= 22 or ip["c18"] >= 2:
+            provas += 1
         if provas < 3:
             return False, f"SNIPER_PRESSAO_PREMIADA_SEM_NOVO_CICLO | provas={provas}/4 | {motivo_premiada} | {cont_motivo}"
 
@@ -4543,25 +4087,9 @@ def filtro_sniper_ft_v2(m: "Metricas") -> Tuple[bool, str]:
 
 # =========================================================
 # V014 — FILTRO EXCLUSIVO VOLUME_FT
-# Porta isolada antes do score normal.
-# Reprovados morrem silenciosamente (CSV/log apenas).
-# Aprovados seguem fluxo ALFA normal com mensagem pública ALFA.
-# Não toca: score, IA, CHAMA, ARCE, HT, FT principal, grupo grátis, alavancagem, V13 HTML.
 # =========================================================
 
 def volume_ft_favorito_vencendo_extremo_v21(m: "Metricas") -> Tuple[bool, str]:
-    """V21 — exceção raríssima do VOLUME_FT para favorito já vencendo.
-
-    Regra oficial do bot Volume:
-    - favorito empatando ou perdendo segue para os filtros normais;
-    - favorito vencendo por 1 ou mais gols só passa se o jogo estiver
-      EXTREMAMENTE vivo e o favorito ainda estiver amassando agora;
-    - AP acumulado não basta; precisa pressão recente + finalização real + IP +
-      domínio do lado certo.
-
-    Esta função é usada somente na porta VOLUME_FT. Não altera score geral,
-    ALFA_FT, CHAMA_FT, HT, IA nem grupo grátis.
-    """
     fav = m.lado_favorito
     if fav not in {"CASA", "FORA"}:
         return False, "V21_SEM_FAVORITO"
@@ -4579,7 +4107,6 @@ def volume_ft_favorito_vencendo_extremo_v21(m: "Metricas") -> Tuple[bool, str]:
     if diff <= 0:
         return False, "V21_FAVORITO_NAO_ESTA_VENCENDO"
 
-    # Gol de vantagem recente do favorito tende a ser pressão premiada.
     if m.ultimo_gol and m.ultimo_gol_lado == fav and minutos_desde_ultimo_gol(m) < V11_FREE_GOL_VANTAGEM_MIN:
         return False, f"V21_GOL_VANTAGEM_RECENTE_{minutos_desde_ultimo_gol(m)}MIN"
 
@@ -4589,7 +4116,6 @@ def volume_ft_favorito_vencendo_extremo_v21(m: "Metricas") -> Tuple[bool, str]:
     ip = ip_lado(m, fav)
     ap_diff = ap_diff_lado(m, fav)
 
-    # O favorito precisa estar melhor AGORA, não só no acumulado.
     recente_dominante = d["u5"] > od["u5"] and d["u10"] > od["u10"]
 
     if diff == 1:
@@ -4607,8 +4133,6 @@ def volume_ft_favorito_vencendo_extremo_v21(m: "Metricas") -> Tuple[bool, str]:
             or (d["rl"] >= 9 and d["cantos"] >= 4)
         )
     else:
-        # Vencendo por 2+ precisa ser ainda mais raro. Só libera quando parece
-        # massacre vivo/colapso do adversário, não placar confortável.
         pressao_absurda = (
             d["u5"] >= 7
             and d["u10"] >= 14
@@ -4642,13 +4166,6 @@ def volume_ft_favorito_vencendo_extremo_v21(m: "Metricas") -> Tuple[bool, str]:
 
 
 def _volume_ft_contexto_placar_prioritario(m: "Metricas") -> Tuple[bool, str]:
-    """V21 — regra de placar do VOLUME_FT.
-
-    Prioridade do bot volume:
-    - favorito empatando ou perdendo = pode seguir para os próximos filtros;
-    - favorito vencendo por 1+ = bloqueia, exceto em cenário EXTREMO real;
-    - válido somente para VOLUME_FT, sem alterar score geral.
-    """
     fav = m.lado_favorito
     if fav not in {"CASA", "FORA"}:
         return False, "VOLUME_FT_SEM_FAVORITO_IDENTIFICADO"
@@ -4667,22 +4184,18 @@ def _volume_ft_contexto_placar_prioritario(m: "Metricas") -> Tuple[bool, str]:
         return True, "VOLUME_FT_FAVORITO_VENCENDO_EXTREMO|" + motivo_extremo
     return False, "VOLUME_FT_FAVORITO_VENCENDO_BLOQUEADO|" + motivo_extremo
 
+
 def _volume_ft_gol_recente_ok(m: "Metricas") -> Tuple[bool, str]:
-    """Só bloqueia gol recente se colocou o favorito vencendo.
-    Não bloqueia: favorito empatou, zebra marcou, favorito continua perdendo.
-    """
     if not gol_recente(m, janela=5):
         return True, "VOLUME_FT_SEM_GOL_RECENTE"
     fav = m.lado_favorito
     lado_gol = m.ultimo_gol_lado
-    # Gol do favorito que deixou ele vencendo — mata o contexto.
     if lado_gol == fav and ultimo_gol_deixou_lado_vencendo(m):
         return False, f"VOLUME_FT_GOL_RECENTE_FAV_VENCENDO | {m.ultimo_gol}' {lado_gol} | {m.placar}"
     return True, f"VOLUME_FT_GOL_RECENTE_OK | {m.ultimo_gol}' {lado_gol} | {m.placar}"
 
 
 def _volume_ft_pressao_viva(m: "Metricas") -> Tuple[bool, str]:
-    """U10 e U5 com vantagem clara para o lado pressionante."""
     lado = m.lado_pressionante
     if lado not in {"CASA", "FORA"}:
         return False, "VOLUME_FT_SEM_LADO_PRESSIONANTE"
@@ -4691,7 +4204,6 @@ def _volume_ft_pressao_viva(m: "Metricas") -> Tuple[bool, str]:
     u10_adv = m.ultimos10[1 - idx]
     u5_fav = m.ultimos5[idx]
     u5_adv = m.ultimos5[1 - idx]
-    # U10: diferença mínima de 4. U5: diferença mínima de 2.
     if (u10_fav - u10_adv) < 4:
         return False, f"VOLUME_FT_U10_INSUFICIENTE | {u10_fav}x{u10_adv}"
     if (u5_fav - u5_adv) < 2:
@@ -4700,14 +4212,12 @@ def _volume_ft_pressao_viva(m: "Metricas") -> Tuple[bool, str]:
 
 
 def _volume_ft_ataques_perigosos(m: "Metricas") -> Tuple[bool, str]:
-    """Ataques perigosos com vantagem clara para o lado pressionante."""
     lado = m.lado_pressionante
     if lado not in {"CASA", "FORA"}:
         return False, "VOLUME_FT_SEM_LADO_PRESSIONANTE_AP"
     idx = 0 if lado == "CASA" else 1
     ap_fav = m.ataques_perigosos[idx]
     ap_adv = m.ataques_perigosos[1 - idx]
-    # Diferença mínima de 8 e razão mínima de 1.4x.
     if (ap_fav - ap_adv) < 8:
         return False, f"VOLUME_FT_AP_DIFERENCA_INSUFICIENTE | {ap_fav}x{ap_adv}"
     if ap_adv > 0 and (ap_fav / ap_adv) < 1.4:
@@ -4716,7 +4226,6 @@ def _volume_ft_ataques_perigosos(m: "Metricas") -> Tuple[bool, str]:
 
 
 def _volume_ft_remates(m: "Metricas") -> Tuple[bool, str]:
-    """Remates confirmando ofensiva real."""
     lado = m.lado_pressionante
     if lado not in {"CASA", "FORA"}:
         return False, "VOLUME_FT_SEM_LADO_PRESSIONANTE_RB"
@@ -4724,7 +4233,6 @@ def _volume_ft_remates(m: "Metricas") -> Tuple[bool, str]:
     rb_fav = m.remates_baliza[idx]
     rb_adv = m.remates_baliza[1 - idx]
     rl_fav = m.remates_lado[idx]
-    # Exige mínimo de remates à baliza OU remates totais significativos.
     if rb_fav < 2 and rl_fav < 4:
         return False, f"VOLUME_FT_REMATES_INSUFICIENTES | RB={rb_fav} RL={rl_fav}"
     if rb_fav <= rb_adv and rb_fav < 3:
@@ -4733,7 +4241,6 @@ def _volume_ft_remates(m: "Metricas") -> Tuple[bool, str]:
 
 
 def _volume_ft_chance_golo(m: "Metricas") -> Tuple[bool, str]:
-    """Chance de gol mínima para o lado pressionante."""
     lado = m.lado_pressionante
     if lado not in {"CASA", "FORA"}:
         return False, "VOLUME_FT_SEM_LADO_PRESSIONANTE_CHANCE"
@@ -4745,7 +4252,6 @@ def _volume_ft_chance_golo(m: "Metricas") -> Tuple[bool, str]:
 
 
 def _volume_ft_favorito_pressionando(m: "Metricas") -> Tuple[bool, str]:
-    """Favorito deve ser o lado pressionante/dominante."""
     fav = m.lado_favorito
     press = m.lado_pressionante
     if fav not in {"CASA", "FORA"} or press not in {"CASA", "FORA"}:
@@ -4756,7 +4262,6 @@ def _volume_ft_favorito_pressionando(m: "Metricas") -> Tuple[bool, str]:
 
 
 def _volume_ft_minuto(m: "Metricas") -> Tuple[bool, str]:
-    """Janela ideal 65–80. Após 85 bloqueia."""
     t = int(m.tempo or 0)
     if t > 85:
         return False, f"VOLUME_FT_FORA_JANELA_TARDIO | {t}'"
@@ -4766,9 +4271,6 @@ def _volume_ft_minuto(m: "Metricas") -> Tuple[bool, str]:
 
 
 def filtro_volume_ft(m: "Metricas") -> Tuple[bool, str]:
-    """Porta exclusiva do VOLUME_FT. Aplica todos os filtros em sequência.
-    Retorna (True, motivo) se passou. (False, motivo) se bloqueado.
-    """
     checks = [
         _volume_ft_minuto,
         _volume_ft_contexto_placar_prioritario,
@@ -4788,33 +4290,16 @@ def filtro_volume_ft(m: "Metricas") -> Tuple[bool, str]:
 
 # =========================================================
 # V013 — AUDITORIA HTML AUTOMÁTICA
-# Camada completamente isolada. Zero impacto no score/funil.
-# Ponto de inserção: após registrar_csv() e enviar_auditoria().
-# Bots excluídos dos reprovados: BOT_VOLUME_FT, BOT_VOLUME_HT (futuros).
 # =========================================================
 
 import json
 import threading as _threading
 
-# Diretório de dados: Railway Volume /data com fallback para pasta local.
-def _data_dir() -> Path:
-    d = Path(os.getenv("DATA_DIR", "/data"))
-    if not d.exists():
-        try:
-            d.mkdir(parents=True, exist_ok=True)
-        except Exception:
-            d = Path("auditoria_html")
-            d.mkdir(parents=True, exist_ok=True)
-    return d
-
 _v13_lock = _threading.Lock()
-
-# Estratégias excluídas dos reprovados (bots de volume).
 _V13_ESTRATEGIAS_EXCLUIDAS_REPROV = {"BOT_VOLUME_FT", "BOT_VOLUME_HT", "VOLUME_FT"}
 
 
 def _v13_arquivo_json(tipo: str, dt: Optional[datetime] = None) -> Path:
-    """Retorna caminho do JSON diário. tipo = 'aprovados' ou 'reprovados'."""
     dt = dt or datetime.now()
     nome = f"{tipo}_{dt.strftime('%Y_%m_%d')}.json"
     return _data_dir() / nome
@@ -4827,10 +4312,8 @@ def _v13_arquivo_html(tipo: str, dt: Optional[datetime] = None) -> Path:
 
 
 def v13_registrar(m: "Metricas", score_medio: int, aprovado: bool, motivo: str) -> None:
-    """Registra alerta no JSON diário e regera o HTML imediatamente."""
     if not HABILITAR_V13_AUDITORIA_HTML:
         return
-    # Reprovados de bots de volume não entram no HTML de auditoria.
     if not aprovado and m.estrategia in _V13_ESTRATEGIAS_EXCLUIDAS_REPROV:
         return
     tipo = "aprovados" if aprovado else "reprovados"
@@ -4855,19 +4338,25 @@ def v13_registrar(m: "Metricas", score_medio: int, aprovado: bool, motivo: str) 
                 except Exception:
                     registros = []
             registros.append(entrada)
+            # Mudança 20: Limitar a 500 registros
+            if len(registros) > 500:
+                registros = registros[-500:]
             arq.write_text(json.dumps(registros, ensure_ascii=False, indent=2), encoding="utf-8")
             v13_gerar_html(tipo)
     except Exception as e:
         log(f"⚠️ V13 registrar erro | {type(e).__name__}: {e}")
 
 
-def v13_gerar_html(tipo: str, dt: Optional[datetime] = None) -> Path:
-    """Gera HTML TURBO diário — padrão DC01.4.
+# =========================================================
+# ESCAPAMENTO HTML (MUDANÇA 16)
+# =========================================================
 
-    Layout: lista lateral esquerda + iframe CornerPro direita.
-    Teclado: G=Green, R=Red, S=Skip, N=próximo pendente, arrows=navegar.
-    Exportar CSV no topbar. localStorage com fallback em memória.
-    """
+def escape_html(texto: str) -> str:
+    """Escapa caracteres HTML para prevenir XSS (Mudança 16)."""
+    return html.escape(str(texto or ""))
+
+
+def v13_gerar_html(tipo: str, dt: Optional[datetime] = None) -> Path:
     dt = dt or datetime.now()
     arq_json = _v13_arquivo_json(tipo, dt)
     arq_html = _v13_arquivo_html(tipo, dt)
@@ -4885,20 +4374,19 @@ def v13_gerar_html(tipo: str, dt: Optional[datetime] = None) -> Path:
     total = len(registros)
     storage_key = f"coutips_turbo_{tipo}_{data_key}"
 
-    # Gera itens da lista lateral
     itens_js = []
     for i, r in enumerate(registros):
-        link = str(r.get("cornerpro", "") or "")
+        link = escape_html(r.get("cornerpro", "") or "")
         link_safe = link.replace("'", "\\'")
-        bot = str(r.get("bot", "") or "").replace("'", "\\'")
-        jogo = str(r.get("jogo", "") or "").replace("'", "\\'")
-        minuto = str(r.get("minuto", "") or "").replace("'", "\\'")
-        placar = str(r.get("placar", "") or "").replace("'", "\\'")
-        score = str(r.get("score", "") or "").replace("'", "\\'")
-        liga = str(r.get("liga", "") or "").replace("'", "\\'")
-        motivo = str(r.get("motivo", "") or "").replace("'", "\\'")
+        bot = escape_html(r.get("bot", "") or "").replace("'", "\\'")
+        jogo = escape_html(r.get("jogo", "") or "").replace("'", "\\'")
+        minuto = escape_html(str(r.get("minuto", "") or "")).replace("'", "\\'")
+        placar = escape_html(r.get("placar", "") or "").replace("'", "\\'")
+        score = escape_html(str(r.get("score", "") or "")).replace("'", "\\'")
+        liga = escape_html(r.get("liga", "") or "").replace("'", "\\'")
+        motivo = escape_html(r.get("motivo", "") or "").replace("'", "\\'")
         uid_base = f"{r.get('bot','')}|{r.get('jogo','')}|{r.get('minuto','')}|{r.get('placar','')}|{r.get('score','')}|{i}"
-        uid = __import__('hashlib').sha1(uid_base.encode("utf-8", errors="ignore")).hexdigest()[:16]
+        uid = hashlib.sha1(uid_base.encode("utf-8", errors="ignore")).hexdigest()[:16]
         itens_js.append(
             f"{{id:'{uid}',bot:'{bot}',match:'{jogo}',min:'{minuto}',"
             f"placar:'{placar}',score:'{score}',liga:'{liga}',"
@@ -5122,8 +4610,8 @@ if(first)pick(first.id);
         log(f"⚠️ V13 gerar_html erro | {type(e).__name__}: {e}")
     return arq_html
 
+
 async def v13_enviar_htmls_telegram() -> None:
-    """Envia os HTMLs de aprovados e reprovados do dia anterior para @ALFA_CON às 00:05."""
     if not HABILITAR_V13_AUDITORIA_HTML:
         return
     ontem = datetime.now() - timedelta(days=1)
@@ -5131,7 +4619,6 @@ async def v13_enviar_htmls_telegram() -> None:
     for tipo in ("aprovados", "reprovados"):
         arq_html = _v13_arquivo_html(tipo, ontem)
         arq_json = _v13_arquivo_json(tipo, ontem)
-        # Garante que o HTML final está atualizado antes de enviar.
         if arq_json.exists():
             v13_gerar_html(tipo, ontem)
         if not arq_html.exists():
@@ -5150,12 +4637,10 @@ async def v13_enviar_htmls_telegram() -> None:
 
 
 async def v13_agendador() -> None:
-    """Loop que dispara o envio dos HTMLs todo dia às 00:05."""
     log("🕐 V13 agendador iniciado — envio diário às 00:05")
     while True:
         try:
             agora = datetime.now()
-            # Próxima execução às 00:05 do dia seguinte.
             proximo = agora.replace(hour=0, minute=5, second=0, microsecond=0)
             if agora >= proximo:
                 proximo += timedelta(days=1)
@@ -5171,7 +4656,7 @@ async def v13_agendador() -> None:
 
 
 # =========================================================
-# DECISÃO / PROCESSAMENTO
+# DECISÃO / PROCESSAMENTO — COM REFATORAÇÃO (MUDANÇAS 22, 23)
 # =========================================================
 
 def chave_alerta_unica(texto: str) -> str:
@@ -5180,8 +4665,6 @@ def chave_alerta_unica(texto: str) -> str:
     tempo = extrair_tempo(limpo)
     resultado = extrair_resultado(limpo)
     estrategia = detectar_estrategia(limpo)
-    # V25 — HT: chave sem minuto para bloquear mesmo jogo em minutos diferentes.
-    # FT mantém minuto na chave porque tem bot de confirmação (dois alertas válidos).
     if eh_ht(estrategia):
         return f"{normalizar_chave_jogo(jogo)}|{estrategia}|{resultado}"
     return f"{normalizar_chave_jogo(jogo)}|{estrategia}|{tempo}|{resultado}"
@@ -5200,85 +4683,72 @@ def marcar_enviado(chave: str, m: Metricas, score: int) -> None:
 
 
 def destino_principal(m: Metricas, score_medio: int) -> str:
-    """Compatibilidade legada.
-
-    No V11 o canal completo recebe tudo aprovado. O grupo grátis é um envio
-    adicional, controlado por elegivel_grupo_gratuito_v11().
-    """
     return COMPLETE_CHANNEL
 
 
 async def registrar_bloqueio_fluxo(m: Metricas, motivo: str, decisao: str = "REPROVADO", score: int = 0) -> None:
-    """Registra bloqueios/esperas que acontecem antes do score/IA."""
     decisao_py = DecisaoPython(score=score, aprovado_pre_ia=False, status="REPROVADO", motivo=motivo, detalhes={})
     decisao_ia = DecisaoIA(decisao="BLOQUEAR", confianca_original=score, confianca_corrigida=score, motivo="FLUXO_PRE_SCORE", protecao_ativa=False, protecao_motivo="SEM_PROTECAO")
     registrar_csv(m, decisao_py, decisao_ia, score, decisao, motivo)
     await enviar_auditoria(m, score, score, score, False, motivo)
 
 
-async def processar_alerta(alerta: Alerta) -> None:
-    m = alerta.metricas
-    chave = alerta.chave_jogo
+# =========================================================
+# FUNÇÕES AUXILIARES DO PROCESSAR_ALERTA (REFATORAÇÃO MUDANÇA 22)
+# =========================================================
 
-    # V20 — fail-safe definitivo: se o texto bruto diz VOLUME_FT, mas qualquer
-    # etapa anterior classificou como ALFA_HT/ALFA_FT, força VOLUME_FT antes
-    # de passar pelo score. Isso impede que Volume caia no fluxo normal.
+def _forcar_estrategia(m: Metricas) -> Metricas:
     if contem_volume_ft_bruto(m.texto_bruto) and m.estrategia != "VOLUME_FT":
         antigo = m.estrategia
         m.estrategia = "VOLUME_FT"
         m.parser_observacoes.append(f"V20_FORCE_VOLUME_FT:{antigo}->VOLUME_FT")
         preencher_contexto_calculado(m)
         log(f"🧭 V20 FORCE_VOLUME_FT | {antigo}->VOLUME_FT | {m.jogo} | {m.tempo}'")
-
-    # SNIPER V2 — fail-safe: se o texto bruto tiver SNIPER, força a família separada.
     if contem_sniper_bruto(m.texto_bruto) and m.estrategia != "SNIPER_FT":
         antigo = m.estrategia
         m.estrategia = "SNIPER_FT"
         m.parser_observacoes.append(f"SNIPER_FORCE:{antigo}->SNIPER_FT")
         preencher_contexto_calculado(m)
         log(f"🎯 SNIPER FORCE | {antigo}->SNIPER_FT | {m.jogo} | {m.tempo}'")
+    return m
 
-    # =====================================================
-    # V007 — bloqueios e roteamentos antes do score/IA
-    # =====================================================
 
-    # Base sem mercado operacional: não desperdiça análise.
+async def _aplicar_bloqueios_imediatos(m: Metricas) -> bool:
     if HABILITAR_BLOQUEIO_BASE_SEM_MERCADO and competicao_base_bloqueada(m):
         m.fluxo_decisao = "BLOQUEADO_BASE_SEM_MERCADO"
         m.fluxo_motivo = "U18_U19_U20_SUB18_SUB19_SUB20"
         motivo = f"{m.fluxo_decisao} | {m.fluxo_motivo}"
         log(f"⛔ {motivo} | {m.jogo} | {m.competicao}")
         await registrar_bloqueio_fluxo(m, motivo, score=0)
-        return
+        return True
 
-    # Parser crítico: não mata por rótulo corrigível, mas segura dado quebrado.
     if HABILITAR_BLOQUEIO_PARSER_CRITICO and m.parser_confianca <= PARSER_CONFIANCA_CRITICA:
         m.fluxo_decisao = "BLOQUEADO_PARSER_CRITICO"
         m.fluxo_motivo = f"confianca={m.parser_confianca}/8"
         motivo = f"{m.fluxo_decisao} | {m.fluxo_motivo}"
         log(f"⛔ {motivo} | {m.jogo}")
         await registrar_bloqueio_fluxo(m, motivo, score=0)
-        return
+        return True
 
-    # V27 — POS70 OFF: bot redundante após auditoria. Bloqueia antes do score.
     if HABILITAR_V27_POS70_OFF and contem_pos70_bruto(m.texto_bruto):
         m.fluxo_decisao = "V27_POS70_DESATIVADO"
         m.fluxo_motivo = "POS70_OFF_REDUCAO_VOLUME_REDUNDANCIA"
         motivo = f"{m.fluxo_decisao} | {m.fluxo_motivo}"
         log(f"🔇 {motivo} | {m.jogo}")
         await registrar_bloqueio_fluxo(m, motivo, score=0)
-        return
+        return True
 
-    # V29 Item 9 — cooldown universal: jogo já aprovado hoje não reentra
-    chave_jogo_base = normalizar_chave_jogo(m.jogo)
+    return False
+
+
+async def _aplicar_filtros_v29(m: Metricas, chave: str, chave_jogo_base: str) -> bool:
     if v29_cooldown_universal_aprovado(chave_jogo_base) and not eh_confirmacao(m.estrategia):
         m.fluxo_decisao = "V29_COOLDOWN_UNIVERSAL"
         m.fluxo_motivo = f"JOGO_JA_APROVADO_HOJE | {m.jogo}"
         log(f"⏳ V29 COOLDOWN_UNIVERSAL | {m.jogo} | já foi aprovado hoje")
         await registrar_bloqueio_fluxo(m, f"V29_COOLDOWN_UNIVERSAL | {m.fluxo_motivo}", score=0)
-        return
+        return True
 
-    # V29 Item 5 — trava RB=0 do perdedor em liga NEUTRA/PERIGOSA
     if eh_ft(m.estrategia) and not eh_confirmacao(m.estrategia):
         bloqueio_rb, motivo_rb = v29_trava_rb_zero_liga_fraca(m)
         if bloqueio_rb:
@@ -5286,9 +4756,8 @@ async def processar_alerta(alerta: Alerta) -> None:
             m.fluxo_motivo = motivo_rb
             log(f"⛔ V29 RB_ZERO_LIGA_FRACA | {m.jogo} | {motivo_rb}")
             await registrar_bloqueio_fluxo(m, f"V29_TRAVA_RB_ZERO_LIGA_FRACA | {motivo_rb}", score=0)
-            return
+            return True
 
-    # V29 Item 10 — trava decaimento de pressão no 2ºP (CHAMA_FT)
     if m.estrategia == "CHAMA_FT":
         bloqueio_dec, motivo_dec = v29_trava_decaimento_pressao_2p(m)
         if bloqueio_dec:
@@ -5296,80 +4765,93 @@ async def processar_alerta(alerta: Alerta) -> None:
             m.fluxo_motivo = motivo_dec
             log(f"⛔ V29 DECAIMENTO_PRESSAO_2P | {m.jogo} | {motivo_dec}")
             await registrar_bloqueio_fluxo(m, f"V29_TRAVA_DECAIMENTO_PRESSAO_2P | {motivo_dec}", score=0)
-            return
+            return True
 
-    # V29 Item 11 — exceção massacre absoluto: quebra trava de liga PERIGOSA
-    # Quando o vencedor tem números extremos, permite seguir mesmo em liga PERIGOSA
-    _v29_massacre_ativo = False
+    return False
+
+
+def _aplicar_massacre_excecao_perigosa(m: Metricas) -> bool:
     if HABILITAR_V29_MELHORIAS and m.liga == "PERIGOSA":
         massacre_ok_pre, massacre_motivo_pre = v29_massacre_absoluto_vencedor(m)
         if massacre_ok_pre:
-            _v29_massacre_ativo = True
             m.fluxo_motivo = (m.fluxo_motivo or "") + f" | V29_MASSACRE_EXCECAO_PERIGOSA"
             log(f"✅ V29 MASSACRE_ABSOLUTO_EXCECAO_PERIGOSA | {m.jogo} | {massacre_motivo_pre}")
+            return True
+    return False
 
-    # V27/V28 — HT_MODERADO: taxa 53% — bloqueio total no V28.
-    # V27 modo observacao preservado via flag; V28 bloqueia completamente.
-    if contem_ht_moderado_bruto(m.texto_bruto):
-        if HABILITAR_V28 and HABILITAR_V28_HT_MODERADO_BLOQUEIO:
-            # V28 — bloqueio total: HT_MODERADO descontinuado
-            m.fluxo_decisao = "V28_HT_MODERADO_BLOQUEADO"
-            m.fluxo_motivo = "HT_MODERADO_DESCONTINUADO_V28_TAXA_53PCT"
-            motivo = f"{m.fluxo_decisao} | {m.fluxo_motivo}"
+
+async def _processar_ht_moderado(m: Metricas) -> bool:
+    if not contem_ht_moderado_bruto(m.texto_bruto):
+        return False
+
+    if HABILITAR_V28 and HABILITAR_V28_HT_MODERADO_BLOQUEIO:
+        m.fluxo_decisao = "V28_HT_MODERADO_BLOQUEADO"
+        m.fluxo_motivo = "HT_MODERADO_DESCONTINUADO_V28_TAXA_53PCT"
+        motivo = f"{m.fluxo_decisao} | {m.fluxo_motivo}"
+        log(f"⛔ {motivo} | {m.jogo}")
+        await registrar_bloqueio_fluxo(m, motivo, score=0)
+        return True
+
+    if HABILITAR_V27_HT_MODERADO_ALAV_OBS:
+        m.fluxo_decisao = "V27_HT_MODERADO_ALAVANCAGEM_OBSERVACAO"
+        lado_ht = m.lado_pressionante
+        pos_gol_ht = gol_recente_do_pressionante(m, janela=3)
+        ht_ok, ht_motivo = massacre_contextual_ht(m, lado_ht, pos_gol_recente=pos_gol_ht)
+        m.fluxo_motivo = ht_motivo
+        if not ht_ok:
+            motivo = f"V27_HT_MODERADO_BLOQUEADO_SEM_MASSACRE | {ht_motivo}"
             log(f"⛔ {motivo} | {m.jogo}")
             await registrar_bloqueio_fluxo(m, motivo, score=0)
-            return
-        elif HABILITAR_V27_HT_MODERADO_ALAV_OBS:
-            # V27 modo observacao: passa pelo score mas nao vai ao canal principal
-            m.fluxo_decisao = "V27_HT_MODERADO_ALAVANCAGEM_OBSERVACAO"
-            lado_ht = m.lado_pressionante
-            pos_gol_ht = gol_recente_do_pressionante(m, janela=3)
-            ht_ok, ht_motivo = massacre_contextual_ht(m, lado_ht, pos_gol_recente=pos_gol_ht)
-            m.fluxo_motivo = ht_motivo
-            if not ht_ok:
-                motivo = f"V27_HT_MODERADO_BLOQUEADO_SEM_MASSACRE | {ht_motivo}"
-                log(f"⛔ {motivo} | {m.jogo}")
-                await registrar_bloqueio_fluxo(m, motivo, score=0)
-                return
-            log(f"🧪 V27 HT_MODERADO PASSOU COMO HT_ALAVANCAGEM_OBS | {m.jogo} | {ht_motivo}")
+            return True
+        log(f"🧪 V27 HT_MODERADO PASSOU COMO HT_ALAVANCAGEM_OBS | {m.jogo} | {ht_motivo}")
 
-    # SNIPER V2 — porta própria antes do score normal.
-    # Reprovados morrem silenciosamente no CSV/log, igual filosofia do Volume.
-    # Aprovados seguem o fluxo normal Python + IA V28, sem mexer no CHAMA/VOLUME/ARCE.
-    if eh_sniper_ft(m.estrategia):
-        ok_sniper, motivo_sniper = filtro_sniper_ft_v2(m)
-        if not ok_sniper:
-            m.fluxo_decisao = "SNIPER_V2_BLOQUEADO"
-            m.fluxo_motivo = motivo_sniper
-            decisao_py_sniper = DecisaoPython(score=0, aprovado_pre_ia=False, status="REPROVADO", motivo=motivo_sniper, detalhes={})
-            decisao_ia_sniper = DecisaoIA(decisao="BLOQUEAR", confianca_original=0, confianca_corrigida=0, motivo="SNIPER_V2_FILTRO", protecao_ativa=False, protecao_motivo="SEM_PROTECAO")
-            registrar_csv(m, decisao_py_sniper, decisao_ia_sniper, 0, "REPROVADO", motivo_sniper)
-            log(f"🔇 SNIPER V2 BLOQUEADO SILENCIOSO | {motivo_sniper} | {m.jogo}")
-            return
-        m.fluxo_decisao = "SNIPER_V2_APROVADO_PARA_SCORE"
+    return False
+
+
+async def _processar_sniper_v2(m: Metricas) -> bool:
+    if not eh_sniper_ft(m.estrategia):
+        return False
+
+    ok_sniper, motivo_sniper = filtro_sniper_ft_v2(m)
+    if not ok_sniper:
+        m.fluxo_decisao = "SNIPER_V2_BLOQUEADO"
         m.fluxo_motivo = motivo_sniper
-        log(f"🎯 SNIPER V2 FILTRO PASSOU | {motivo_sniper} | {m.jogo}")
+        decisao_py_sniper = DecisaoPython(score=0, aprovado_pre_ia=False, status="REPROVADO", motivo=motivo_sniper, detalhes={})
+        decisao_ia_sniper = DecisaoIA(decisao="BLOQUEAR", confianca_original=0, confianca_corrigida=0, motivo="SNIPER_V2_FILTRO", protecao_ativa=False, protecao_motivo="SEM_PROTECAO")
+        registrar_csv(m, decisao_py_sniper, decisao_ia_sniper, 0, "REPROVADO", motivo_sniper)
+        # Mudança 4: Sniper bloqueios vão para auditoria
+        await enviar_auditoria(m, 0, 0, 0, False, motivo_sniper)
+        v13_registrar(m, 0, False, motivo_sniper)
+        log(f"🔇 SNIPER V2 BLOQUEADO | {motivo_sniper} | {m.jogo}")
+        return True
 
-    # V014 — VOLUME_FT: porta exclusiva antes do score normal.
-    # Reprovados morrem silenciosamente — só CSV/log interno, sem canal de reprovados.
-    if HABILITAR_VOLUME_FT and eh_volume_ft(m.estrategia):
-        ok_vol, motivo_vol = filtro_volume_ft(m)
-        if not ok_vol:
-            m.fluxo_decisao = "VOLUME_FT_BLOQUEADO"
-            m.fluxo_motivo = motivo_vol
-            # Registra no CSV para rastreio interno. Sem envio para canais de reprovados.
-            decisao_py_vol = DecisaoPython(score=0, aprovado_pre_ia=False, status="REPROVADO", motivo=motivo_vol, detalhes={})
-            decisao_ia_vol = DecisaoIA(decisao="BLOQUEAR", confianca_original=0, confianca_corrigida=0, motivo="VOLUME_FT_FILTRO", protecao_ativa=False, protecao_motivo="SEM_PROTECAO")
-            registrar_csv(m, decisao_py_vol, decisao_ia_vol, 0, "REPROVADO", motivo_vol)
-            log(f"🔇 VOLUME_FT BLOQUEADO SILENCIOSO | {motivo_vol} | {m.jogo}")
-            return
-        # Passou o filtro: continua no fluxo normal do V13 como ALFA_FT.
-        log(f"🟢 VOLUME_FT FILTRO PASSOU | {motivo_vol} | {m.jogo}")
-        m.fluxo_decisao = "VOLUME_FT_APROVADO"  # V14 — preserva rastreio para auditoria futura
-        m.estrategia = "ALFA_FT"  # Mensagem pública sai como ALFA, não como VOLUME_FT.
+    m.fluxo_decisao = "SNIPER_V2_APROVADO_PARA_SCORE"
+    m.fluxo_motivo = motivo_sniper
+    log(f"🎯 SNIPER V2 FILTRO PASSOU | {motivo_sniper} | {m.jogo}")
+    return False
 
-    # DC01 — CHAMA_FT com placar elástico: regra isolada antes do score/IA.
-    # Estados: BLOQUEAR -> morre; CONFIRMAR -> espera BOT_FT CONFIRMAÇÃO; APROVAR -> segue fluxo normal.
+
+async def _processar_volume_ft(m: Metricas) -> bool:
+    if not (HABILITAR_VOLUME_FT and eh_volume_ft(m.estrategia)):
+        return False
+
+    ok_vol, motivo_vol = filtro_volume_ft(m)
+    if not ok_vol:
+        m.fluxo_decisao = "VOLUME_FT_BLOQUEADO"
+        m.fluxo_motivo = motivo_vol
+        decisao_py_vol = DecisaoPython(score=0, aprovado_pre_ia=False, status="REPROVADO", motivo=motivo_vol, detalhes={})
+        decisao_ia_vol = DecisaoIA(decisao="BLOQUEAR", confianca_original=0, confianca_corrigida=0, motivo="VOLUME_FT_FILTRO", protecao_ativa=False, protecao_motivo="SEM_PROTECAO")
+        registrar_csv(m, decisao_py_vol, decisao_ia_vol, 0, "REPROVADO", motivo_vol)
+        log(f"🔇 VOLUME_FT BLOQUEADO SILENCIOSO | {motivo_vol} | {m.jogo}")
+        return True
+
+    log(f"🟢 VOLUME_FT FILTRO PASSOU | {motivo_vol} | {m.jogo}")
+    m.fluxo_decisao = "VOLUME_FT_APROVADO"
+    m.estrategia = "ALFA_FT"
+    return False
+
+
+async def _processar_dc01_chama_ft(m: Metricas, chave: str) -> bool:
     acao_dc01, motivo_dc01 = dc01_chama_placar_elastico(m)
     if acao_dc01 == "BLOQUEAR":
         m.fluxo_decisao = "DC01_CHAMA_PLACAR_ELASTICO_BLOQUEADO"
@@ -5377,7 +4859,8 @@ async def processar_alerta(alerta: Alerta) -> None:
         log(f"⛔ DC01 CHAMA PLACAR ELÁSTICO BLOQUEADO | {m.jogo} | {motivo_dc01}")
         await registrar_bloqueio_fluxo(m, f"{m.fluxo_decisao} | {motivo_dc01}", score=0)
         ultimas_leituras_por_jogo[chave] = {"metricas": m, "score": 0, "recebido_em": time.time()}
-        return
+        return True
+
     if acao_dc01 == "CONFIRMAR":
         m.fluxo_decisao = "DC01_CHAMA_PLACAR_ELASTICO_AGUARDANDO_CONFIRMACAO"
         m.fluxo_motivo = motivo_dc01
@@ -5390,81 +4873,93 @@ async def processar_alerta(alerta: Alerta) -> None:
         log(f"⏳ DC01 CHAMA PLACAR ELÁSTICO → CONFIRMAÇÃO | timeout={timeout_s}s | {m.jogo} | {motivo_dc01}")
         await registrar_bloqueio_fluxo(m, f"AGUARDANDO_CONFIRMACAO_DC01 | {motivo_dc01}", decisao="AGUARDANDO", score=0)
         ultimas_leituras_por_jogo[chave] = {"metricas": m, "score": 0, "recebido_em": time.time()}
-        return
+        return True
+
     if acao_dc01 == "APROVAR":
         m.fluxo_decisao = "DC01_CHAMA_PLACAR_ELASTICO_APROVADO_PARA_SCORE"
         m.fluxo_motivo = (m.fluxo_motivo or "") + f" | {motivo_dc01}"
         log(f"✅ DC01 CHAMA PLACAR ELÁSTICO PASSOU | {m.jogo} | {motivo_dc01}")
 
-    # V026 — FAV_NAO_PRESSIONANTE: penaliza score FT onde favorito não é o lado pressionante.
-    # DC01.2 — V26_CAOS_BIDIRECIONAL: reduz penalidade em jogos de trocação legítima.
-    # Modo auditoria: não bloqueia — penaliza no score e registra motivo no CSV/HTML.
-    if HABILITAR_V26_FAV_NAO_PRESSIONANTE and eh_ft(m.estrategia) and not eh_confirmacao(m.estrategia):
-        fav_v26 = m.lado_favorito
-        press_v26 = m.lado_pressionante
-        if fav_v26 in {"CASA", "FORA"} and press_v26 in {"CASA", "FORA"} and fav_v26 != press_v26:
-            # DC01.2 — detecta caos bidirecional antes de aplicar penalidade
-            caos_nivel, caos_motivo = v26_detectar_caos_bidirecional(m)
-            if caos_nivel == "FORTE":
-                penalidade_efetiva = 0
-                log(f"🔥 V26_CAOS_BIDIRECIONAL_FORTE | penalidade=0 (zerada) | {m.jogo} | {caos_motivo}")
-                m.fluxo_motivo = (m.fluxo_motivo or "") + f" | {caos_motivo}"
-            elif caos_nivel == "MEDIO":
-                penalidade_efetiva = 2
-                log(f"⚡ V26_CAOS_BIDIRECIONAL_MEDIO | penalidade=-2 (reduzida de -{V26_FAV_NAO_PRESSIONANTE_PENALIDADE}) | {m.jogo} | {caos_motivo}")
-                m.fluxo_motivo = (m.fluxo_motivo or "") + f" | {caos_motivo}"
-            else:
-                penalidade_efetiva = V26_FAV_NAO_PRESSIONANTE_PENALIDADE
-                motivo_nao_press = f"V26_FAV_NAO_PRESSIONANTE_PENALIDADE={penalidade_efetiva} | fav={fav_v26} press={press_v26}"
-                log(f"⚠️ V26 FAV_NAO_PRESSIONANTE | penalidade=-{penalidade_efetiva} | {m.jogo} | {motivo_nao_press}")
-                m.fluxo_motivo = (m.fluxo_motivo or "") + f" | {motivo_nao_press}"
-            m.penalidade_v26_fav_nao_press = penalidade_efetiva
+    return False
 
-    # BOT_FT CONFIRMAÇÃO: se existe gatilho anterior pendente, comparar obrigatoriamente.
-    if HABILITAR_CONFIRMACAO_V2 and eh_confirmacao(m.estrategia) and eh_ft(m.estrategia):
-        pendente = pendentes_confirmacao_ft.pop(chave, None)
-        tarefa = tarefas_timeout_confirmacao_ft.pop(chave, None)
-        if tarefa and not tarefa.done():
-            tarefa.cancel()
 
-        if pendente:
-            old: Metricas = pendente.get("metricas")
-            ok_conf, motivo_conf, detalhes_conf = comparar_alertas_confirmacao(old, m)
-            m.fluxo_decisao = "CONFIRMACAO_CRUZADA_APROVADA" if ok_conf else "CONFIRMACAO_CRUZADA_BLOQUEADA"
-            m.fluxo_motivo = motivo_conf
-            log(f"🧪 FT_CONF_CRUZADA | ok={ok_conf} | {m.jogo} | {motivo_conf}")
-            if not ok_conf:
-                await registrar_bloqueio_fluxo(m, f"{m.fluxo_decisao} | {motivo_conf}", score=0)
-                ultimas_leituras_por_jogo[chave] = {"metricas": m, "score": 0, "recebido_em": time.time()}
-                return
-        else:
-            # Confirmação isolada só entra com urgência nova. E ainda assim morre se o gol recente
-            # do pressionante deixou o lado vencendo/resolvido em cima do alerta.
-            if gol_recente_pressionante_resolveu_confirmacao(m, janela=5):
-                motivo = (
-                    f"CONF_ISOLADA_BLOQUEADA_GOL_RECENTE_PRESSIONANTE_RESOLVEU | "
-                    f"ultimo={m.ultimo_gol}' {m.ultimo_gol_lado} | placar={m.placar}"
-                )
-                m.fluxo_decisao = "CONFIRMACAO_ISOLADA_BLOQUEADA"
-                m.fluxo_motivo = motivo
-                log(f"⛔ {motivo} | {m.jogo}")
-                await registrar_bloqueio_fluxo(m, motivo, score=0)
-                ultimas_leituras_por_jogo[chave] = {"metricas": m, "score": 0, "recebido_em": time.time()}
-                return
+def _aplicar_v26_penalidade(m: Metricas) -> None:
+    if not (HABILITAR_V26_FAV_NAO_PRESSIONANTE and eh_ft(m.estrategia) and not eh_confirmacao(m.estrategia)):
+        return
 
-            ok_iso, motivo_iso = confirmacao_isolada_valida(m)
-            m.fluxo_decisao = "CONFIRMACAO_ISOLADA_APROVADA_PARA_SCORE" if ok_iso else "CONFIRMACAO_ISOLADA_BLOQUEADA"
-            m.fluxo_motivo = motivo_iso
-            log(f"🧪 FT_CONF_ISOLADA | ok={ok_iso} | {m.jogo} | {motivo_iso}")
-            if not ok_iso:
-                await registrar_bloqueio_fluxo(m, f"{m.fluxo_decisao} | {motivo_iso}", score=0)
-                ultimas_leituras_por_jogo[chave] = {"metricas": m, "score": 0, "recebido_em": time.time()}
-                return
+    fav_v26 = m.lado_favorito
+    press_v26 = m.lado_pressionante
+    if fav_v26 not in {"CASA", "FORA"} or press_v26 not in {"CASA", "FORA"} or fav_v26 == press_v26:
+        return
 
-    # Primeiro alerta FT com gol recente do pressionante aumentando vantagem: aguarda confirmação.
+    caos_nivel, caos_motivo = v26_detectar_caos_bidirecional(m)
+    if caos_nivel == "FORTE":
+        penalidade_efetiva = 0
+        log(f"🔥 V26_CAOS_BIDIRECIONAL_FORTE | penalidade=0 (zerada) | {m.jogo} | {caos_motivo}")
+        m.fluxo_motivo = (m.fluxo_motivo or "") + f" | {caos_motivo}"
+    elif caos_nivel == "MEDIO":
+        penalidade_efetiva = 2
+        log(f"⚡ V26_CAOS_BIDIRECIONAL_MEDIO | penalidade=-2 (reduzida de -{V26_FAV_NAO_PRESSIONANTE_PENALIDADE}) | {m.jogo} | {caos_motivo}")
+        m.fluxo_motivo = (m.fluxo_motivo or "") + f" | {caos_motivo}"
+    else:
+        penalidade_efetiva = V26_FAV_NAO_PRESSIONANTE_PENALIDADE
+        motivo_nao_press = f"V26_FAV_NAO_PRESSIONANTE_PENALIDADE={penalidade_efetiva} | fav={fav_v26} press={press_v26}"
+        log(f"⚠️ V26 FAV_NAO_PRESSIONANTE | penalidade=-{penalidade_efetiva} | {m.jogo} | {motivo_nao_press}")
+        m.fluxo_motivo = (m.fluxo_motivo or "") + f" | {motivo_nao_press}"
+
+    m.penalidade_v26_fav_nao_press = penalidade_efetiva
+
+
+async def _processar_confirmacao_ft(m: Metricas, chave: str) -> bool:
+    if not (HABILITAR_CONFIRMACAO_V2 and eh_confirmacao(m.estrategia) and eh_ft(m.estrategia)):
+        return False
+
+    pendente = pendentes_confirmacao_ft.pop(chave, None)
+    tarefa = tarefas_timeout_confirmacao_ft.pop(chave, None)
+    if tarefa and not tarefa.done():
+        tarefa.cancel()
+
+    if pendente:
+        old: Metricas = pendente.get("metricas")
+        ok_conf, motivo_conf, detalhes_conf = comparar_alertas_confirmacao(old, m)
+        m.fluxo_decisao = "CONFIRMACAO_CRUZADA_APROVADA" if ok_conf else "CONFIRMACAO_CRUZADA_BLOQUEADA"
+        m.fluxo_motivo = motivo_conf
+        log(f"🧪 FT_CONF_CRUZADA | ok={ok_conf} | {m.jogo} | {motivo_conf}")
+        if not ok_conf:
+            await registrar_bloqueio_fluxo(m, f"{m.fluxo_decisao} | {motivo_conf}", score=0)
+            ultimas_leituras_por_jogo[chave] = {"metricas": m, "score": 0, "recebido_em": time.time()}
+            return True
+        return False
+
+    if gol_recente_pressionante_resolveu_confirmacao(m, janela=5):
+        motivo = (
+            f"CONF_ISOLADA_BLOQUEADA_GOL_RECENTE_PRESSIONANTE_RESOLVEU | "
+            f"ultimo={m.ultimo_gol}' {m.ultimo_gol_lado} | placar={m.placar}"
+        )
+        m.fluxo_decisao = "CONFIRMACAO_ISOLADA_BLOQUEADA"
+        m.fluxo_motivo = motivo
+        log(f"⛔ {motivo} | {m.jogo}")
+        await registrar_bloqueio_fluxo(m, motivo, score=0)
+        ultimas_leituras_por_jogo[chave] = {"metricas": m, "score": 0, "recebido_em": time.time()}
+        return True
+
+    ok_iso, motivo_iso = confirmacao_isolada_valida(m)
+    m.fluxo_decisao = "CONFIRMACAO_ISOLADA_APROVADA_PARA_SCORE" if ok_iso else "CONFIRMACAO_ISOLADA_BLOQUEADA"
+    m.fluxo_motivo = motivo_iso
+    log(f"🧪 FT_CONF_ISOLADA | ok={ok_iso} | {m.jogo} | {motivo_iso}")
+    if not ok_iso:
+        await registrar_bloqueio_fluxo(m, f"{m.fluxo_decisao} | {motivo_iso}", score=0)
+        ultimas_leituras_por_jogo[chave] = {"metricas": m, "score": 0, "recebido_em": time.time()}
+        return True
+
+    return False
+
+
+async def _processar_primeiro_alerta_ft(m: Metricas, chave: str) -> bool:
     aguardar, motivo_aguardar = (False, "CONFIRMACAO_V2_DESATIVADA")
     if HABILITAR_CONFIRMACAO_V2:
         aguardar, motivo_aguardar = deve_aguardar_confirmacao_ft(m)
+
     if aguardar:
         m.fluxo_decisao = "AGUARDANDO_FT_CONFIRMACAO"
         m.fluxo_motivo = motivo_aguardar
@@ -5475,14 +4970,14 @@ async def processar_alerta(alerta: Alerta) -> None:
             tarefa_antiga.cancel()
         tarefas_timeout_confirmacao_ft[chave] = asyncio.create_task(cancelar_pendente_confirmacao_ft_depois(chave, timeout_s))
         log(f"⏳ AGUARDANDO_FT_CONFIRMACAO | timeout={timeout_s}s | {m.jogo} | {motivo_aguardar}")
-        # Registra como observação operacional, sem enviar ao canal principal.
         await registrar_bloqueio_fluxo(m, f"AGUARDANDO_CONFIRMACAO | {motivo_aguardar}", decisao="AGUARDANDO", score=0)
         ultimas_leituras_por_jogo[chave] = {"metricas": m, "score": 0, "recebido_em": time.time()}
-        return
+        return True
 
-    # =====================================================
-    # Fluxo normal já existente: Python + IA + envio
-    # =====================================================
+    return False
+
+
+async def _processar_score_e_ia(m: Metricas, chave: str) -> None:
     decisao_py = score_python_contextual(m, chave)
     log(
         f"📊 PY_PROCESSADO | {m.estrategia} | Gol={decisao_py.score}% | {m.jogo} | "
@@ -5492,27 +4987,18 @@ async def processar_alerta(alerta: Alerta) -> None:
     decisao_ia_txt, confianca_ia, motivo_ia = await consultar_openai(m, decisao_py)
     decisao_ia = calcular_protecao_ia(m, decisao_py, decisao_ia_txt, confianca_ia)
 
-    # Bloqueio crítico só depois da proteção contextual.
     if decisao_ia.confianca_corrigida <= 45 and not decisao_ia.protecao_ativa:
         score_medio = round((decisao_py.score + decisao_ia.confianca_corrigida) / 2)
         motivo = f"IA_BLOQUEIO_CRITICO | {motivo_ia}"
         log(f"⛔ BLOQUEADO IA CRITICA | IA={decisao_ia.confianca_corrigida}% | {m.jogo}")
         registrar_csv(m, decisao_py, decisao_ia, score_medio, "REPROVADO", motivo)
         await enviar_auditoria(m, decisao_py.score, decisao_ia.confianca_corrigida, score_medio, False, motivo)
-        v13_registrar(m, score_medio, False, motivo)  # V13
+        v13_registrar(m, score_medio, False, motivo)
         ultimas_leituras_por_jogo[chave] = {"metricas": m, "score": decisao_py.score, "recebido_em": time.time()}
         return
 
     score_medio = clamp((decisao_py.score + decisao_ia.confianca_corrigida) / 2)
 
-    # V026 — aplicar penalidade FAV_NAO_PRESSIONANTE no score_medio.
-    penalidade_v26 = getattr(m, 'penalidade_v26_fav_nao_press', 0)
-    if penalidade_v26:
-        score_medio_original = score_medio
-        score_medio = max(0, score_medio - penalidade_v26)
-        log(f"📉 V26 penalidade aplicada | score {score_medio_original}% → {score_medio}% | -{penalidade_v26} | {m.jogo}")
-
-    # V27 — teto forte para liga UNDER em qualquer fluxo aprovado.
     if HABILITAR_V27_UNDER_TETO_82 and m.liga == "UNDER" and score_medio > V27_UNDER_TETO_SCORE:
         score_under_original = score_medio
         score_medio = V27_UNDER_TETO_SCORE
@@ -5522,11 +5008,9 @@ async def processar_alerta(alerta: Alerta) -> None:
     corte = corte_por_estrategia(m.estrategia)
     aprovado = score_medio >= corte and decisao_py.status != "REPROVADO"
 
-    # Confirmação forte só pode furar canal técnico quando não foi bloqueada pelo fluxo V007.
     if eh_confirmacao(m.estrategia) and score_medio >= 92:
         aprovado = True
 
-    # Pré-calcula campos V11 para CSV antes do registro.
     if aprovado:
         alavanca_pre, alavanca_motivo_pre = selo_alavancagem_v11(m, score_medio)
         m.alavancagem = "SIM" if alavanca_pre else "NAO"
@@ -5549,10 +5033,8 @@ async def processar_alerta(alerta: Alerta) -> None:
     motivo_final = "APROVADO" if aprovado else f"MÉDIA={score_medio}% < {corte}% OU trava_py={decisao_py.motivo}"
     registrar_csv(m, decisao_py, decisao_ia, score_medio, "APROVADO" if aprovado else "REPROVADO", motivo_final)
     await enviar_auditoria(m, decisao_py.score, decisao_ia.confianca_corrigida, score_medio, aprovado, motivo_final)
-    v13_registrar(m, score_medio, aprovado, motivo_final)  # V13
+    v13_registrar(m, score_medio, aprovado, motivo_final)
 
-    # V27 — HT_MODERADO em observação: mesmo aprovado, não vai para canal principal.
-    # No V28 este bloco nunca e alcancado porque o HT_MODERADO e bloqueado antes.
     if aprovado and HABILITAR_V27_HT_MODERADO_ALAV_OBS and not (HABILITAR_V28 and HABILITAR_V28_HT_MODERADO_BLOQUEIO) and contem_ht_moderado_bruto(m.texto_bruto):
         m.destino_final = "SOMENTE_AUDITORIA_V27_HT_ALAVANCAGEM_OBS"
         ultimas_leituras_por_jogo[chave] = {"metricas": m, "score": decisao_py.score, "recebido_em": time.time()}
@@ -5569,19 +5051,15 @@ async def processar_alerta(alerta: Alerta) -> None:
         log(f"⏳ COOLDOWN | {m.jogo}")
         return
 
-    # V011 — canal completo recebe tudo que foi aprovado.
     alavanca_ok, alavanca_motivo = selo_alavancagem_v11(m, score_medio)
     m.alavancagem = "SIM" if alavanca_ok else "NAO"
     m.motivo_alavancagem = alavanca_motivo
 
-    # Canal completo/interno recebe visual técnico por família de bot.
-    # Grupo grátis/principal continua usando formatar_alerta_cliente() normal.
     mensagem_completa = formatar_alerta_canal_completo(m, score_medio, alavancagem=alavanca_ok)
     canal_completo = destino_principal(m, score_medio)
     await enfileirar_envio(canal_completo, mensagem_completa)
     destinos = [canal_completo]
 
-    # V011 — grupo grátis é vitrine: limitado, sem selo, sem confirmações.
     if MODO_TESTE:
         m.grupo_gratuito = "NAO"
         m.motivo_grupo_gratuito = "MODO_TESTE_ATIVO"
@@ -5599,7 +5077,6 @@ async def processar_alerta(alerta: Alerta) -> None:
 
     m.destino_final = ",".join(destinos)
     marcar_enviado(chave, m, score_medio)
-    # V29 Item 9 — registra aprovação para cooldown universal
     if HABILITAR_V29_MELHORIAS:
         v29_marcar_aprovado_universal(normalizar_chave_jogo(m.jogo))
     log(
@@ -5608,6 +5085,61 @@ async def processar_alerta(alerta: Alerta) -> None:
         f"alfa={m.alavancagem}:{m.motivo_alavancagem} | {m.jogo}"
     )
 
+
+# =========================================================
+# PROCESSAR ALERTA REFATORADO (MUDANÇA 22)
+# =========================================================
+
+async def processar_alerta(alerta: Alerta) -> None:
+    m = alerta.metricas
+    chave = alerta.chave_jogo
+
+    # 1. Forçar estratégia
+    m = _forcar_estrategia(m)
+
+    # 2. Bloqueios imediatos
+    if await _aplicar_bloqueios_imediatos(m):
+        return
+
+    # 3. V29 — cooldown universal
+    chave_jogo_base = normalizar_chave_jogo(m.jogo)
+    if await _aplicar_filtros_v29(m, chave, chave_jogo_base):
+        return
+
+    # 4. V29 — exceção massacre absoluto (liga PERIGOSA)
+    _aplicar_massacre_excecao_perigosa(m)
+
+    # 5. HT_MODERADO
+    if await _processar_ht_moderado(m):
+        return
+
+    # 6. SNIPER V2 (Mudança 10: antes do V29)
+    if await _processar_sniper_v2(m):
+        return
+
+    # 7. VOLUME FT
+    if await _processar_volume_ft(m):
+        return
+
+    # 8. DC01 CHAMA FT
+    if await _processar_dc01_chama_ft(m, chave):
+        return
+
+    # 9. V26 — FAV_NAO_PRESSIONANTE
+    _aplicar_v26_penalidade(m)
+
+    # 10. Confirmação FT
+    if await _processar_confirmacao_ft(m, chave):
+        return
+
+    # 11. Primeiro alerta FT aguardando confirmação
+    if await _processar_primeiro_alerta_ft(m, chave):
+        return
+
+    # 12. Score + IA
+    await _processar_score_e_ia(m, chave)
+
+
 async def janela_decisao(chave: str) -> None:
     await asyncio.sleep(JANELA_DECISAO_SEGUNDOS)
     async with lock_jogo(chave):
@@ -5615,27 +5147,16 @@ async def janela_decisao(chave: str) -> None:
         tarefas_decisao.pop(chave, None)
     if not alertas:
         return
-    # Usa o alerta mais recente da janela.
     alerta = sorted(alertas, key=lambda a: a["recebido_em"])[-1]
     await processar_alerta(alerta["alerta"])
 
 
 def auditoria_autorizada(event: events.NewMessage.Event) -> bool:
-    """V24 — restringe o comando /auditoria.
-
-    Aceita:
-    - mensagens OUTGOING do próprio usuário;
-    - sender_id ou chat_id em AUDITORIA_CHAT_IDS;
-    - posts de canal sem sender_id (sender_id=None): aceita se AUDITORIA_CHAT_IDS
-      está configurado — assumindo que só o dono posta no canal monitorado.
-    """
     try:
         if bool(getattr(event, "out", False)) or bool(getattr(event, "outgoing", False)):
             return True
         chat_id = int(getattr(event, "chat_id", 0) or 0)
         sender_id = getattr(event, "sender_id", None)
-        # Post de canal: sender_id é None. Se AUDITORIA_CHAT_IDS está configurado,
-        # aceita — o canal é privado e só o dono envia mensagens.
         if sender_id is None and AUDITORIA_CHAT_IDS:
             return True
         sender_id_int = int(sender_id or 0)
@@ -5650,9 +5171,6 @@ async def receber_mensagem(event: events.NewMessage.Event) -> None:
     try:
         texto = event.raw_text or ""
 
-        # V19 — comando /auditoria restrito.
-        # Por padrão, só comando OUTGOING do próprio usuário recebe HTML.
-        # Incoming externo só recebe se chat_id/sender_id estiver em AUDITORIA_CHAT_IDS.
         texto_lower = texto.strip().lower()
         if texto_lower in ("/auditoria", "auditoria"):
             chat_id = str(getattr(event, "chat_id", ""))
@@ -5709,7 +5227,7 @@ async def receber_mensagem(event: events.NewMessage.Event) -> None:
 
 
 # =========================================================
-# WATCHDOG / MAIN
+# WATCHDOG
 # =========================================================
 
 async def watchdog() -> None:
@@ -5732,12 +5250,9 @@ async def watchdog() -> None:
 
 
 # =========================================================
-# SISTEMA PRÉ-LIVE ALFA PRE-LIVE V1
-# =========================================================
-# ADICIONADO EM 26/06/2026 - NÃO ALTERA NADA DO SISTEMA AO VIVO
+# SISTEMA PRÉ-LIVE
 # =========================================================
 
-# Variáveis para o Pré-Live
 TEOLOGIN_EMAIL = os.getenv("TEOLOGIN_EMAIL", "")
 TEOLOGIN_SENHA = os.getenv("TEOLOGIN_SENHA", "")
 SCORE_MINIMO_APROVACAO = 85
@@ -5746,7 +5261,6 @@ QTD_MINIMA_JOGOS = 5
 QTD_MAXIMA_COMPLEMENTARES = 3
 
 
-# Dataclasses do Pré-Live
 @dataclass
 class EstatisticasTimePreLive:
     nome: str = ""
@@ -5810,7 +5324,7 @@ class MultiplePreLive:
 
 
 # =========================================================
-# SCRAPER COM LOGIN AUTOMÁTICO - PRÉ-LIVE
+# SCRAPER PRÉ-LIVE
 # =========================================================
 
 class TeoBorgesScraperPreLive:
@@ -5837,7 +5351,7 @@ class TeoBorgesScraperPreLive:
             log("❌ TEOLOGIN_EMAIL ou TEOLOGIN_SENHA não configurados!")
             return False
 
-        log(f"🔑 Tentando login no clube.theoborges.com como {TEOLOGIN_EMAIL}")
+        log(f"🔑 Tentando login no clube.theoborges.com")
 
         try:
             self.client = httpx.AsyncClient(
@@ -5932,7 +5446,7 @@ class TeoBorgesScraperPreLive:
 
     async def extrair_dados_jogo(self, url: str) -> Optional[Dict]:
         try:
-            await asyncio.sleep(random.uniform(1.0, 2.5))
+            await asyncio.sleep(random.uniform(0.5, 1.5))
 
             resp = await self.client.get(url)
             if resp.status_code != 200:
@@ -6049,10 +5563,6 @@ class TeoBorgesScraperPreLive:
             await self.client.aclose()
 
 
-# =========================================================
-# MATCHUP ENGINE - PRÉ-LIVE
-# =========================================================
-
 class MatchupEnginePreLive:
     def calcular_matchup(self, jogo: JogoPreLive, mercado: str) -> float:
         casa = jogo.estatisticas_casa
@@ -6113,10 +5623,6 @@ class MatchupEnginePreLive:
         else:
             return min(100, fora.escanteios_favor * 12 + casa.escanteios_contra * 8)
 
-
-# =========================================================
-# MARKET ENGINE - PRÉ-LIVE
-# =========================================================
 
 class MarketEnginePreLive:
     def __init__(self):
@@ -6234,10 +5740,6 @@ class MarketEnginePreLive:
         return (casa + fora) / 2
 
 
-# =========================================================
-# CANDIDATE SELECTOR - PRÉ-LIVE
-# =========================================================
-
 class CandidateSelectorPreLive:
     def __init__(self):
         self.market_engine = MarketEnginePreLive()
@@ -6263,7 +5765,7 @@ class CandidateSelectorPreLive:
         if aprovados:
             media = sum(m.score for m in aprovados) / len(aprovados)
             if media < MEDIA_MINIMA_DIA:
-                log(f"⚠️ Média do dia {media:.1f} < {MEDIA_MINIMA_DIA} — nenhuma múltipla gerada")
+                log(f"⚠️ Média do dia {media:.1f} < {MEDIA_MINIMA_DIA}")
                 return {"aprovados": [], "media": media, "total": len(candidatos)}
 
         return {
@@ -6273,10 +5775,6 @@ class CandidateSelectorPreLive:
             "todos_mercados": todos_mercados,
         }
 
-
-# =========================================================
-# ANCHOR SELECTOR - PRÉ-LIVE
-# =========================================================
 
 class AnchorSelectorPreLive:
     def selecionar(self, aprovados: List[MercadoPreLive]) -> Tuple[List[MercadoPreLive], List[List[MercadoPreLive]]]:
@@ -6299,10 +5797,6 @@ class AnchorSelectorPreLive:
 
         return ancoras, complementares_com_mercados
 
-
-# =========================================================
-# MULTIPLE BUILDER - PRÉ-LIVE
-# =========================================================
 
 class MultipleBuilderPreLive:
     def construir(self, ancoras: List[MercadoPreLive], complementares: List[List[MercadoPreLive]]) -> List[MultiplePreLive]:
@@ -6377,10 +5871,6 @@ class MultipleBuilderPreLive:
         return multiplas
 
 
-# =========================================================
-# FORMATADOR DE MENSAGEM - PRÉ-LIVE
-# =========================================================
-
 def formatar_multipla_prelive(multiple: MultiplePreLive) -> str:
     linhas = [
         f"📊 **{multiple.nome}**",
@@ -6412,12 +5902,7 @@ def formatar_multipla_prelive(multiple: MultiplePreLive) -> str:
     return "\n".join(linhas)
 
 
-# =========================================================
-# COMANDO /PRElive - VARREDURA PRÉ-LIVE
-# =========================================================
-
 async def varrer_site_theoborges_prelive() -> None:
-    """Versão Pré-Live do varrer_site_theoborges - com login automático e Market Engine"""
     log("🚀 INICIANDO VARREdura PRÉ-LIVE DO SITE THEOBORGES (COMANDO /prelive)")
 
     scraper = TeoBorgesScraperPreLive()
@@ -6549,11 +6034,47 @@ async def varrer_site_theoborges_prelive() -> None:
 # MAIN
 # =========================================================
 
+def logar_versao_inicial() -> None:
+    log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    log(f"🚀 VERSAO_COUTIPS_ATIVA = {VERSAO_COUTIPS}")
+    log("✅ MUDANÇAS IMPLEMENTADAS:")
+    log("  1. V29 cooldown com persistência")
+    log("  2. V17 salvamento atômico")
+    log("  3. V26 backup no Telegram")
+    log("  4. Sniper bloqueios na auditoria")
+    log("  5. Decaimento pressão 2ºP corrigido (U5/U10)")
+    log("  6. Zebra exige 3 provas")
+    log("  7. extrair_jogo mais robusto")
+    log("  8. extrair_odds múltiplos formatos")
+    log("  9. extrair_pressao_alfa múltiplos nomes")
+    log(" 10. Sniper antes do V29")
+    log(" 11. V26 aplicado antes do score")
+    log(" 12. Confirmação IP usa >")
+    log(" 13. PRESSAO_PREMIADA_MORREU -10")
+    log(" 14. Placar largo com exceção")
+    log(" 15. Validação de variáveis")
+    log(" 16. HTML escapado")
+    log(" 17. CSV sanitizado")
+    log(" 18. Prompt sanitizado")
+    log(" 19. FloodWait backoff")
+    log(" 20. JSON limitado 500")
+    log(" 21. Cache robusto")
+    log(" 22-25. Refatorações")
+    log(f"📊 Corte HT={CORTE_GOL_HT}% | Corte FT={CORTE_GOL_FT}%")
+    log(f"📡 Canais: grátis={FREE_CHANNEL} | completo={COMPLETE_CHANNEL}")
+    log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+
+
 async def main() -> None:
     global tarefa_envio
+
+    # Mudança 15: Validar variáveis de ambiente
+    validar_env()
+
     logar_versao_inicial()
     garantir_csv()
     v17_carregar_estado()
+    v29_carregar_cooldowns()
 
     tarefa_envio = asyncio.create_task(trabalhador_fila_envio())
     asyncio.create_task(watchdog())
@@ -6577,7 +6098,6 @@ async def main() -> None:
         except Exception as e:
             log(f"⚠️ V24 handler_outgoing erro | {type(e).__name__}: {e}")
 
-    # COMANDO /teste (ao vivo - inalterado)
     @client.on(events.NewMessage(incoming=True))
     async def handler_teste(event):
         texto = event.raw_text or ""
@@ -6592,7 +6112,6 @@ async def main() -> None:
             log("📩 /teste RECEBIDO (CHAT PRIVADO)")
             await varrer_site_theoborges()
 
-    # COMANDO /prelive (novo - sistema Pré-Live)
     @client.on(events.NewMessage(incoming=True))
     async def handler_prelive(event):
         texto = event.raw_text or ""
@@ -6610,20 +6129,20 @@ async def main() -> None:
     # Versão original do varrer_site_theoborges (mantida inalterada)
     async def varrer_site_theoborges():
         log("🚀 INICIANDO VARREdura DO SITE THEOBORGES (COMANDO MANUAL)")
-        
+
         import httpx
         from bs4 import BeautifulSoup
-        
+
         dias_para_tentar = ["hoje", "amanha"]
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
         }
         encontrou_jogos = False
-        
+
         for dia in dias_para_tentar:
             url_lista = f"https://clube.theoborges.com/matches?dia={dia}"
             log(f"🔄 Tentando buscar jogos para: {dia}")
-            
+
             async with httpx.AsyncClient(follow_redirects=True, timeout=30) as client_http:
                 try:
                     response = await client_http.get(url_lista, headers=headers)
@@ -6635,9 +6154,9 @@ async def main() -> None:
                     continue
 
             soup = BeautifulSoup(response.text, "html.parser")
-            
+
             links_jogos = []
-            
+
             for link in soup.select(".match-row"):
                 href = link.get("href")
                 if href and "/game/" in href:
@@ -6678,7 +6197,7 @@ async def main() -> None:
                     if response_jogo.status_code != 200:
                         continue
                     soup_jogo = BeautifulSoup(response_jogo.text, "html.parser")
-                    
+
                     titulo = soup_jogo.select_one(".match-name")
                     nome_jogo = titulo.text.strip() if titulo else "Jogo não identificado"
 
@@ -6704,7 +6223,7 @@ async def main() -> None:
                             "media_gols": media_gols,
                             "over25": over25
                         })
-                    
+
                     await asyncio.sleep(1)
                 except Exception as e:
                     log(f"⚠️ Erro processando: {e}")
