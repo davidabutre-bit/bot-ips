@@ -72,10 +72,11 @@ from dotenv import load_dotenv
 from telethon import TelegramClient, events
 from telethon.errors import FloodWaitError
 from telethon.sessions import StringSession
+from bs4 import BeautifulSoup
 
 try:
     from telethon.errors.common import TypeNotFoundError
-except Exception:
+except Exception:  # pragma: no cover
     class TypeNotFoundError(Exception):
         pass
 
