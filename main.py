@@ -5279,7 +5279,8 @@ PESO_CONTEXTO = float(os.getenv("PESO_CONTEXTO", "0.15"))
 class EstatisticasTimePreLive:
     nome: str = ""
     gols_marcados: float = 0.0
-    gols_sofridos: float = 0.0    xg: float = 0.0
+    gols_sofridos: float = 0.0
+    xg: float = 0.0
     xga: float = 0.0
     finalizacoes: float = 0.0
     finalizacoes_sofridas: float = 0.0
@@ -5962,7 +5963,8 @@ class MultipleBuilderPreLiveV1:
         elif total == 6:
             num_ancoras = 3
             num_complementares = 3
-        else:  # 5 jogos            num_ancoras = 2
+        else:  # 5 jogos
+            num_ancoras = 2
             num_complementares = 3
 
         ancoras = jogos_aprovados[:num_ancoras]
