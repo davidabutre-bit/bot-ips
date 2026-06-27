@@ -86,7 +86,7 @@ except Exception:  # pragma: no cover
 # VERSÃO / CONFIGURAÇÃO BASE
 # =========================================================
 
-VERSAO_COUTIPS = "ALFA_COUTIPS_2026_06_18_V29_MELHORIAS_ATUALIZADO"
+VERSAO_COUTIPS = "ALFA_COUTIPS_2026_06_27_PRELIVE_FIX"
 
 load_dotenv()
 
@@ -139,7 +139,7 @@ AUDITORIA_CHAT_IDS = {
 MODO_TESTE = os.getenv("MODO_TESTE", "false").lower() == "true"
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.5")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
 OPENAI_HABILITADO = os.getenv("OPENAI_HABILITADO", "true").lower() == "true"
 OPENAI_TIMEOUT = float(os.getenv("OPENAI_TIMEOUT", "30"))
 
@@ -4842,9 +4842,6 @@ async def _processar_volume_ft(m: Metricas) -> bool:
     if not ok_vol:
         m.fluxo_decisao = "VOLUME_FT_BLOQUEADO"
         m.fluxo_motivo = motivo_vol
-        decisao_py_vol = DecisaoPython(score=0, aprovado_pre_ia=False, status="REPROVADO", motivo=motivo_vol, detalhes={})
-        decisao_ia_vol = DecisaoIA(decisao="BLOQUEAR", confianca_original=0, confianca_corrigida=0, motivo="VOLUME_FT_FILTRO", protecao_ativa=False, protecao_motivo="SEM_PROTECAO")
-        registrar_csv(m, decisao_py_vol, decisao_ia_vol, 0, "REPROVADO", motivo_vol)
         log(f"🔇 VOLUME_FT BLOQUEADO SILENCIOSO | {motivo_vol} | {m.jogo}")
         return True
 
