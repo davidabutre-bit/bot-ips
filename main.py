@@ -60,7 +60,7 @@ except Exception:  # pragma: no cover
 # VERSÃO / CONFIGURAÇÃO BASE
 # =========================================================
 
-VERSAO_COUTIPS = "ALFA_COUTIPS_2026_06_28_RODADA_14_ITENS_V003"
+VERSAO_COUTIPS = "ALFA_COUTIPS_2026_06_28_FIX_PROTECAO_IA_NONE_V004"
 
 load_dotenv()
 
@@ -5620,6 +5620,14 @@ def calcular_protecao_ia(m: Metricas, decisao_py: DecisaoPython, decisao_ia: str
 
     log(f"🧪 PROTECAO_IA_NAO_ATIVADA | motivo={motivo} | ia={original} | score_python={decisao_py.score}")
     m.protecao_ia_ativa = False
+    # BUG CORRIGIDO (28/06): esse caminho (proteção NÃO ativada) nunca
+    # tinha um `return` — a função caía no fim e devolvia None. Qualquer
+    # alerta que passasse por aqui (score_python baixo, liga perigosa,
+    # sem lado pressionante, etc) quebrava com
+    # "AttributeError: 'NoneType' object has no attribute 'confianca_corrigida'"
+    # em _processar_score_e_ia, e o jogo era perdido silenciosamente
+    # (a exceção só aparecia como "Task exception was never retrieved").
+    return DecisaoIA(decisao_ia, original, original, "SEM_PROTECAO", False, motivo)
 
 def emoji_liga(liga: str) -> str:
     return {"PREMIUM": "🏆", "MODERADA": "📊", "NEUTRA": "⚪", "UNDER": "🟡", "PERIGOSA": "🔴"}.get(liga, "⚪")
