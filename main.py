@@ -32,6 +32,7 @@ import logging
 import os
 import random
 import re
+import sys
 import threading as _threading
 import time
 import traceback
@@ -59,7 +60,7 @@ except Exception:  # pragma: no cover
 # VERSÃO / CONFIGURAÇÃO BASE
 # =========================================================
 
-VERSAO_COUTIPS = "ALFA_COUTIPS_2026_06_28_PRELIVE_CRUZAMENTO_CONFIABILIDADE_V002"
+VERSAO_COUTIPS = "ALFA_COUTIPS_2026_06_28_RODADA_14_ITENS_V003"
 
 load_dotenv()
 
@@ -68,6 +69,10 @@ logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
     format="%(asctime)s %(levelname)s %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
+    stream=sys.stdout,  # CORRIGIDO (28/06): sem isso, vai pro stderr e o
+    # Railway marca toda linha de stderr como "severity":"error", mesmo
+    # sendo um WATCHDOG OK ou um INFO normal — log duplicado e marcado
+    # como erro sem ser erro nenhum.
 )
 
 API_ID_RAW = os.getenv("API_ID", "").strip()
@@ -144,6 +149,7 @@ ODD_MAXIMA_FAVORITO_PRELIVE = float(os.getenv("ODD_MAXIMA_FAVORITO_PRELIVE", "2.
 PRELIVE_SCORE_MINIMO = int(os.getenv("PRELIVE_SCORE_MINIMO", "85"))
 PRELIVE_MEDIA_MINIMA = int(os.getenv("PRELIVE_MEDIA_MINIMA", "85"))
 PRELIVE_QTD_MINIMA_JOGOS = int(os.getenv("PRELIVE_QTD_MINIMA_JOGOS", "5"))
+PRELIVE_QTD_MINIMA_ABSOLUTA = int(os.getenv("PRELIVE_QTD_MINIMA_ABSOLUTA", "3"))
 PRELIVE_MAXIMO_JOGOS = int(os.getenv("PRELIVE_MAXIMO_JOGOS", "8"))
 PRELIVE_DOMINANCIA_MINIMA = int(os.getenv("PRELIVE_DOMINANCIA_MINIMA", "3"))
 
@@ -224,6 +230,7 @@ HABILITAR_UNDER_PROVA_EXTRA = os.getenv("HABILITAR_UNDER_PROVA_EXTRA", "true").l
 HABILITAR_V13_AUDITORIA_HTML = os.getenv("HABILITAR_V13_AUDITORIA_HTML", "true").lower() == "true"
 
 HABILITAR_VOLUME_FT = os.getenv("HABILITAR_VOLUME_FT", "true").lower() == "true"
+HABILITAR_SNIPER_PERFIL_140 = os.getenv("HABILITAR_SNIPER_PERFIL_140", "true").lower() == "true"
 
 HABILITAR_V26_FAV_NAO_PRESSIONANTE = os.getenv("HABILITAR_V26_FAV_NAO_PRESSIONANTE", "true").lower() == "true"
 V26_FAV_NAO_PRESSIONANTE_PENALIDADE = int(os.getenv("V26_FAV_NAO_PRESSIONANTE_PENALIDADE", "8"))
@@ -362,14 +369,13 @@ def log(msg: str) -> None:
     nunca log bruto. O envio de log bruto causava spam e erros
     "Cannot send requests while disconnected" quando log() era chamado
     antes do client.start() (ex.: durante validar_env()).
+
+    CORRIGIDO (28/06): só usa print() agora. As chamadas extras de
+    `logging.info/warning/error` duplicavam cada linha no Railway (uma
+    via stdout, outra via o logger) sem adicionar nenhuma informação —
+    o print() já cobre tudo que esse log precisa.
     """
     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
-    if msg.startswith("❌"):
-        logging.error(msg)
-    elif msg.startswith(("⚠️", "⛔", "🟡")):
-        logging.warning(msg)
-    else:
-        logging.info(msg)
 
 
 def remover_acentos(texto: Any) -> str:
@@ -446,9 +452,11 @@ _TORNEIOS_CAMPO_NEUTRO = (
     "qualifiers", "euro ", "eurocopa", "european championship",
     "copa america", "copa américa", "nations league", "liga das nacoes",
     "liga das nações", "gold cup", "copa africa", "copa áfrica", "afcon",
-    "africa cup of nations", "amistoso internacional", "international friendl",
-    "uefa nations", "concacaf", "asian cup", "copa asiatica",
+    "africa cup of nations", "uefa nations", "concacaf", "asian cup",
+    "copa asiatica",
 )
+
+_TERMOS_AMISTOSO = ("amistoso", "friendly", "friendlies", "preseason", "pre-season")
 
 
 def eh_campo_neutro(liga: str) -> bool:
@@ -458,6 +466,18 @@ def eh_campo_neutro(liga: str) -> bool:
         return False
     l = remover_acentos(liga).lower()
     return any(remover_acentos(termo) in l for termo in _TORNEIOS_CAMPO_NEUTRO)
+
+
+def eh_amistoso(liga: str) -> bool:
+    """Item 13 (28/06): amistoso é categoria de atenção PRÓPRIA, separada
+    de campo neutro. Time reserva, sem pressão real de resultado — mas
+    amistoso de clube ainda tem casa/fora de verdade (não bloqueia
+    Vitória Casa/Fora como campo neutro faz), só reduz a confiança geral.
+    """
+    if not liga:
+        return False
+    l = remover_acentos(liga).lower()
+    return any(remover_acentos(termo) in l for termo in _TERMOS_AMISTOSO)
 
 
 def now_iso() -> str:
@@ -560,10 +580,13 @@ _v26_msg_estado_id: Optional[int] = None
 
 
 async def v26_salvar_estado_telegram() -> None:
-    """Salva estado no canal de confirmação (técnico).
+    """Salva estado no canal de auditoria (Cout_aud).
 
-    @Cout_aud (CANAL_LOGS_PRELIVE) não é mais usado para storage de estado —
-    esse canal agora é dedicado só às auditorias HTML (v13_enviar_htmls_telegram).
+    CORRIGIDO (28/06): na rodada anterior eu tinha movido esse estado pro
+    canal de confirmação, supondo que Cout_aud devia ser só HTML — decisão
+    minha, não pedida. Comparando com o canal real, o lugar certo do
+    #COUTIPS_ESTADO_V26 é de volta no Cout_aud, junto com WATCHDOG e o
+    resto da auditoria técnica.
     """
     if not HABILITAR_V26_PERSISTENCIA_TELEGRAM:
         return
@@ -576,7 +599,7 @@ async def v26_salvar_estado_telegram() -> None:
         }
         texto = f"{V26_ESTADO_TAG}\n{json.dumps(dados, ensure_ascii=False)}"
 
-        canal_destino = CONFIRMATION_CHANNEL
+        canal_destino = CANAL_LOGS_PRELIVE if CANAL_LOGS_PRELIVE else CONFIRMATION_CHANNEL
 
         if _v26_msg_estado_id:
             try:
@@ -597,12 +620,16 @@ async def v26_salvar_estado_telegram() -> None:
 
 
 async def v26_carregar_estado_telegram() -> None:
-    """Lê estado do canal de confirmação (técnico)."""
+    """Lê estado do canal de auditoria (Cout_aud), com fallback no canal de confirmação."""
     if not HABILITAR_V26_PERSISTENCIA_TELEGRAM:
         return
     global v11_gratis_contadores, v11_gratis_enviados_por_jogo, _v26_msg_estado_id
     try:
-        canais = [CONFIRMATION_CHANNEL] if CONFIRMATION_CHANNEL else []
+        canais = []
+        if CANAL_LOGS_PRELIVE:
+            canais.append(CANAL_LOGS_PRELIVE)
+        if CONFIRMATION_CHANNEL and CONFIRMATION_CHANNEL != CANAL_LOGS_PRELIVE:
+            canais.append(CONFIRMATION_CHANNEL)
 
         for canal in canais:
             try:
@@ -867,11 +894,17 @@ def destino_principal(m: Metricas, score_medio: int) -> str:
     return COMPLETE_CHANNEL
 
 
-async def registrar_bloqueio_fluxo(m: Metricas, motivo: str, decisao: str = "REPROVADO", score: int = 0) -> None:
+async def registrar_bloqueio_fluxo(
+    m: Metricas,
+    motivo: str,
+    decisao: str = "REPROVADO",
+    score: int = 0,
+    ia_consultada: bool = True,
+) -> None:
     decisao_py = DecisaoPython(score=score, aprovado_pre_ia=False, status="REPROVADO", motivo=motivo, detalhes={})
     decisao_ia = DecisaoIA(decisao="BLOQUEAR", confianca_original=score, confianca_corrigida=score, motivo="FLUXO_PRE_SCORE", protecao_ativa=False, protecao_motivo="SEM_PROTECAO")
     registrar_csv(m, decisao_py, decisao_ia, score, decisao, motivo)
-    await enviar_auditoria(m, score, score, score, False, motivo)
+    await enviar_auditoria(m, score, score, score, False, motivo, ia_consultada=ia_consultada)
 
 
 # =========================================================
@@ -894,13 +927,25 @@ def _forcar_estrategia(m: Metricas) -> Metricas:
     return m
 
 
-async def _aplicar_bloqueios_imediatos(m: Metricas) -> bool:
+async def _aplicar_bloqueios_imediatos(m: Metricas, chave: str = "") -> bool:
     if HABILITAR_BLOQUEIO_BASE_SEM_MERCADO and competicao_base_bloqueada(m):
         m.fluxo_decisao = "BLOQUEADO_BASE_SEM_MERCADO"
         m.fluxo_motivo = "U18_U19_U20_SUB18_SUB19_SUB20"
         motivo = f"{m.fluxo_decisao} | {m.fluxo_motivo}"
         log(f"⛔ {motivo} | {m.jogo} | {m.competicao}")
-        await registrar_bloqueio_fluxo(m, motivo, score=0)
+        # Mostra o PY real na auditoria em vez de 0% — sem isso não dá pra
+        # avaliar se esse filtro de categoria está cortando jogo bom.
+        # VOLUME_FT reprovado já nem chega no canal (ver canal_auditoria),
+        # então pular o cálculo pra ele economiza processamento de graça.
+        if eh_volume_ft(m.estrategia):
+            await registrar_bloqueio_fluxo(m, motivo, score=0)
+        else:
+            try:
+                decisao_py_real = score_python_contextual(m, chave)
+                await registrar_bloqueio_fluxo(m, motivo, score=decisao_py_real.score, ia_consultada=False)
+            except Exception as e:
+                log(f"⚠️ Erro ao calcular PY real pra auditoria de bloqueio | {type(e).__name__}: {e}")
+                await registrar_bloqueio_fluxo(m, motivo, score=0, ia_consultada=False)
         return True
 
     if HABILITAR_BLOQUEIO_PARSER_CRITICO and m.parser_confianca <= PARSER_CONFIANCA_CRITICA:
@@ -1256,7 +1301,8 @@ async def _processar_score_e_ia(m: Metricas, chave: str) -> None:
     m.destino_final = ",".join(destinos)
     marcar_enviado(chave, m, score_medio)
     if HABILITAR_V29_MELHORIAS:
-        v29_marcar_aprovado_universal(normalizar_chave_jogo(m.jogo))
+        periodo_marca = "HT" if eh_ht(m.estrategia) else "FT"
+        v29_marcar_aprovado_universal(f"{normalizar_chave_jogo(m.jogo)}__{periodo_marca}")
     log(
         f"✅ ENVIADO/ENFILEIRADO V11 | {m.estrategia} | score={score_medio}% | "
         f"destinos={m.destino_final} | gratis={m.grupo_gratuito}:{m.motivo_grupo_gratuito} | "
@@ -1276,11 +1322,16 @@ async def processar_alerta(alerta: Alerta) -> None:
     m = _forcar_estrategia(m)
 
     # 2. Bloqueios imediatos
-    if await _aplicar_bloqueios_imediatos(m):
+    if await _aplicar_bloqueios_imediatos(m, chave):
         return
 
-    # 3. V29 — cooldown universal
-    chave_jogo_base = normalizar_chave_jogo(m.jogo)
+    # 3. V29 — cooldown universal (separado por período HT/FT — ver item 7
+    # da revisão de 28/06: antes a chave era só o nome do jogo, então um
+    # bot de HT aprovado bloqueava 24h qualquer bot de FT no mesmo jogo,
+    # mesmo sendo mercados diferentes que não deviam competir pelo mesmo
+    # "slot" de cooldown).
+    periodo_cooldown = "HT" if eh_ht(m.estrategia) else "FT"
+    chave_jogo_base = f"{normalizar_chave_jogo(m.jogo)}__{periodo_cooldown}"
     if await _aplicar_filtros_v29(m, chave, chave_jogo_base):
         return
 
@@ -1538,6 +1589,7 @@ class MultiplePreLive:
     descricao: str = ""
     num_ancoras: int = 0
     num_complementares: int = 0
+    confianca_baixa: bool = False
 
 
 # =========================================================
@@ -2282,7 +2334,11 @@ class TeoBorgesScraperPreLiveV2:
         m = re.search(r"(\d+)[.,]5", l)
         if m:
             numero = m.group(1)
-            if "cartao" in l or "cartões" in l:
+            # BUG CORRIGIDO (28/06): "cartao" (sem acento, singular) nunca
+            # batia com "cartoes" (plural sem acento) — substring diferente
+            # ("cartao" != prefixo de "cartoes"). Resultado: toda linha de
+            # cartão ("Mais de 0.5 cartões"...) saía sem slug nenhum.
+            if "cartao" in l or "cartoes" in l:
                 return f"cartoes_{numero}5"
             if "escanteio" in l or "canto" in l:
                 if "sofreu" in l or "contra" in l:
@@ -2343,6 +2399,31 @@ class TeoBorgesScraperPreLiveV2:
 
         return None
 
+    def _slug_especial(self, titulo_card_norm: str, sub_id: str, label_norm: str) -> Optional[str]:
+        """BUG CORRIGIDO (28/06, achado comparando com HTML real do site):
+        over_25_ft / over_15_ft / over_05_ht nunca chegavam no score.
+
+        Dois motivos juntos:
+        1. Essas linhas vivem dentro de cards com sub-abas (Over/Under Gols,
+           1º/2º Tempo) — e o código só salvava slug "plano" pra cards SEM
+           sub-aba (agregado=True). Como a sub-aba "Over Gols" e "1º Tempo"
+           SÃO a fonte certa desses três números, elas ficavam de fora.
+        2. Mesmo se passassem, o tradutor genérico devolvia "over_25"/
+           "over_05" — sem o sufixo "_ft"/"_ht" que o resto do pipeline
+           (FeatureBuilderPreLiveV2, _construir_historico) realmente procura.
+
+        Esta função resolve os 3 casos específicos direto pelo card+sub-aba,
+        sem depender do tradutor genérico nem do flag "agregado".
+        """
+        if "total de gols" in titulo_card_norm and "over" in sub_id and "1t" not in sub_id and "2t" not in sub_id:
+            if "over 1.5 gols" in label_norm:
+                return "over_15_ft"
+            if "over 2.5 gols" in label_norm:
+                return "over_25_ft"
+        if "gols no 1" in titulo_card_norm and "1t" in sub_id:
+            if "over 0.5 gols" in label_norm:
+                return "over_05_ht"
+        return None
 
     def _parse_pagina_completa(self, soup: BeautifulSoup) -> Dict:
         """Extrai TODAS as estatísticas da página numa única passada,
@@ -2410,6 +2491,7 @@ class TeoBorgesScraperPreLiveV2:
         dados: Dict,
         agregado: bool,
     ) -> None:
+        titulo_norm = remover_acentos(titulo_card or "").lower()
         for row in container.select(".pg-tstable-row"):
             label_elem = row.select_one(".pg-tstable-label")
             if not label_elem:
@@ -2422,14 +2504,22 @@ class TeoBorgesScraperPreLiveV2:
             val_fora = self._parse_valor(valores[1].text.strip())
 
             # Chave composta — nunca colide entre cards/sub-abas diferentes.
-            partes = [p for p in (aba_id, remover_acentos(titulo_card).lower(), sub_id, label) if p]
+            partes = [p for p in (aba_id, titulo_norm, sub_id, label) if p]
             chave_composta = "__".join(partes)
             dados["estatisticas"]["casa"][chave_composta] = val_casa
             dados["estatisticas"]["fora"][chave_composta] = val_fora
 
+            # Resolução especial (over_25_ft/over_15_ft/over_05_ht) — vale
+            # mesmo em card com sub-aba, porque é exatamente a sub-aba certa
+            # que tem esse dado (ver _slug_especial).
+            slug_especial = self._slug_especial(titulo_norm, sub_id, label)
+            if slug_especial:
+                dados["estatisticas"]["casa"][slug_especial] = val_casa
+                dados["estatisticas"]["fora"][slug_especial] = val_fora
+
             # Só os cards agregados (sem sub-aba 1ºT/2ºT/over-under) alimentam
-            # o slug "plano" que o resto do pipeline lê (gols_marcados, etc.).
-            # Isso evita que o valor do 1º Tempo sobrescreva o valor geral.
+            # o slug "plano" genérico — isso evita que o valor do 1º Tempo
+            # sobrescreva o valor geral.
             if agregado:
                 slug = self._label_para_slug(label, titulo_card)
                 if slug and slug not in dados["estatisticas"]["casa"]:
@@ -2950,6 +3040,19 @@ class MarketEnginePreLiveV2:
                 m.nome_sugerido = "Vitória Fora"
                 mercados.append(m)
 
+        # Item 12: ajuste de qualidade de liga (PREMIUM/MODERADA/NEUTRA/
+        # UNDER/PERIGOSA), reaproveitado do ao vivo.
+        ajuste_liga = liga_ajuste(classificar_liga(jogo.liga))
+        # Item 13: amistoso é atenção própria — reduz confiança geral
+        # (time reserva, sem pressão real), mas não bloqueia Vitória
+        # Casa/Fora como campo neutro faz, porque amistoso de clube
+        # ainda tem casa/fora de verdade.
+        penalidade_amistoso = -8 if eh_amistoso(jogo.liga) else 0
+        ajuste_total = ajuste_liga + penalidade_amistoso
+        if ajuste_total:
+            for m in mercados:
+                m.score = clamp(m.score + ajuste_total, 0, 100)
+
         return mercados
 
     def _calc_vitoria_casa(self, f: Dict, jogo: JogoPreLive) -> float:
@@ -3079,11 +3182,30 @@ class CandidateSelectorPreLiveV2:
 class MultipleBuilderPreLiveV2:
     def construir_multiplas(self, jogos_aprovados: List[Dict]) -> List[MultiplePreLive]:
         total = len(jogos_aprovados)
-        
-        if total < PRELIVE_QTD_MINIMA_JOGOS:
-            log(f"⚠️ Apenas {total} jogos aprovados. Mínimo: {PRELIVE_QTD_MINIMA_JOGOS}")
+
+        if total < PRELIVE_QTD_MINIMA_ABSOLUTA:
+            log(f"⚠️ Apenas {total} jogos aprovados. Piso absoluto: {PRELIVE_QTD_MINIMA_ABSOLUTA} — nenhuma múltipla")
             return []
-        
+
+        # Item 14 (28/06): entre o piso absoluto e o mínimo ideal, não
+        # trava tudo-ou-nada mais — manda só a múltipla SAFE (a mais
+        # conservadora), com todos os jogos como âncora e marcada como
+        # confiança reduzida, em vez de ficar mudo no dia.
+        if total < PRELIVE_QTD_MINIMA_JOGOS:
+            log(f"🟡 Apenas {total} jogos aprovados (abaixo do ideal {PRELIVE_QTD_MINIMA_JOGOS}) — mandando SAFE com confiança reduzida")
+            mercados_reduzidos = [j["melhor_mercado"] for j in jogos_aprovados]
+            score_medio = sum(m.score for m in mercados_reduzidos) / len(mercados_reduzidos)
+            safe_reduzida = MultiplePreLive(
+                nome="SAFE",
+                mercados=mercados_reduzidos,
+                score_medio=score_medio,
+                descricao="Mercados mais confiáveis de cada jogo — CONFIANÇA REDUZIDA (poucos jogos hoje)",
+                num_ancoras=len(jogos_aprovados),
+                num_complementares=0,
+                confianca_baixa=True,
+            )
+            return [safe_reduzida]
+
         if total >= 8:
             num_ancoras, num_complementares = 4, 4
         elif total == 7:
@@ -3183,7 +3305,7 @@ class MultipleBuilderPreLiveV2:
 def formatar_multipla_prelive_v2(multiple: MultiplePreLive) -> str:
     """Formata a mensagem da múltipla para envio (V2 com mercados sugeridos)."""
     linhas = [
-        f"📊 **{multiple.nome}**",
+        f"📊 **{multiple.nome}**" + (" ⚠️ CONFIANÇA REDUZIDA" if multiple.confianca_baixa else ""),
         f"📈 Média: **{multiple.score_medio:.1f}%**",
         f"📝 {multiple.descricao}",
         f"🔹 {multiple.num_ancoras} Âncoras | {multiple.num_complementares} Complementares",
@@ -3386,11 +3508,11 @@ async def varrer_site_theoborges_prelive_v2() -> None:
     
     log(f"📊 {resultado['total_aprovados']} jogos aprovados (Score ≥ {PRELIVE_SCORE_MINIMO})")
     
-    if resultado['total_aprovados'] < PRELIVE_QTD_MINIMA_JOGOS:
-        log(f"❌ Menos de {PRELIVE_QTD_MINIMA_JOGOS} jogos aprovados")
+    if resultado['total_aprovados'] < PRELIVE_QTD_MINIMA_ABSOLUTA:
+        log(f"❌ Menos de {PRELIVE_QTD_MINIMA_ABSOLUTA} jogos aprovados (piso absoluto)")
         await client.send_message(
             "me",
-            f"❌ Apenas {resultado['total_aprovados']} jogos aprovados. Mínimo: {PRELIVE_QTD_MINIMA_JOGOS}."
+            f"❌ Apenas {resultado['total_aprovados']} jogos aprovados. Piso mínimo absoluto: {PRELIVE_QTD_MINIMA_ABSOLUTA}."
         )
         return
     
@@ -5815,6 +5937,11 @@ def elegivel_grupo_gratuito_v11(m: Metricas, chave_jogo: str, score: int = 0) ->
 
 
 def canal_auditoria(m: Metricas, aprovado: bool) -> str:
+    # VOLUME_FT reprovado morre silencioso (CSV/log only) — regra já
+    # documentada no projeto, mas nunca implementada aqui. Aprovado do
+    # VOLUME_FT continua indo normal pro canal de aprovados.
+    if not aprovado and eh_volume_ft(m.estrategia):
+        return ""
     if eh_ht(m.estrategia):
         return AUDIT_HT_OK if aprovado else AUDIT_HT_NO
     return AUDIT_FT_OK if aprovado else AUDIT_FT_NO
@@ -5838,20 +5965,31 @@ def nome_visual_auditoria(m: Metricas) -> str:
     return m.estrategia
 
 
-async def enviar_auditoria(m: Metricas, score_py: int, score_ia: int, score_medio: int, aprovado: bool, motivo: str) -> None:
+async def enviar_auditoria(
+    m: Metricas,
+    score_py: int,
+    score_ia: int,
+    score_medio: int,
+    aprovado: bool,
+    motivo: str,
+    ia_consultada: bool = True,
+) -> None:
     canal = canal_auditoria(m, aprovado)
     if not canal:
         return
     status = "APROVADO" if aprovado else "REPROVADO"
     emoji = "✅" if aprovado else "❌"
+    ia_txt = f"{score_ia}%" if ia_consultada else "N/A (bloqueado antes da IA)"
+    medio_txt = f"{score_medio}%" if ia_consultada else f"{score_py}% (só PY, sem IA)"
     texto = (
         f"{emoji} {status} | {nome_visual_auditoria(m)}\n"
         f"🏟 {m.jogo}\n"
         f"⏱ {m.tempo}' | {m.placar}\n"
-        f"📊 PY={score_py}% | IA={score_ia}% | MÉDIA={score_medio}%\n"
+        f"📊 PY={score_py}% | IA={ia_txt} | MÉDIA={medio_txt}\n"
         f"🏆 Liga: {m.liga}\n"
-        f"🧠 Valor: {m.valor_pos_evento_classe}\n"
-        f"📝 {motivo}"
+        f"🧠 Valor: {m.valor_pos_evento_classe}"
+        + (f" ({m.valor_pos_evento_motivo})" if m.valor_pos_evento_motivo else "")
+        + f"\n📝 {motivo}"
     )
     await send_resiliente(canal, texto)
 
@@ -5879,6 +6017,8 @@ CSV_FIELDS = [
     "previsao_over05_ht",
     "resultado_manual", "cornerpro", "bet365",
     "penalidade_v26",
+    "detalhes_completos",
+    "texto_bruto_raw",
 ]
 
 
@@ -5938,10 +6078,70 @@ def registrar_csv(m: Metricas, decisao_py: DecisaoPython, decisao_ia: DecisaoIA,
         "cornerpro": m.cornerpro,
         "bet365": m.bet365,
         "penalidade_v26": getattr(m, 'penalidade_v26_fav_nao_press', 0),
+        "detalhes_completos": sanitizar_csv(
+            json.dumps(decisao_py.detalhes, ensure_ascii=False, default=str)
+            if decisao_py.detalhes else ""
+        ),
+        "texto_bruto_raw": sanitizar_csv((m.texto_bruto or "")[:1500]),
     }
     with CSV_PATH.open("a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
         writer.writerow(row)
+
+
+def gerar_resumo_resultados() -> str:
+    """Item 10 (28/06): resumo de acerto por estratégia, usando o que já
+    foi auditado manualmente (coluna resultado_manual) no CSV existente.
+
+    IMPORTANTE — limite honesto: isso é um resumo do que já aconteceu,
+    não um backtest de fórmula nova. Backtest de verdade (rodar a fórmula
+    nova contra jogos antigos e comparar) precisa do texto bruto de cada
+    alerta — por isso a coluna texto_bruto_raw foi adicionada agora no
+    CSV. A partir de hoje, dá pra fazer esse backtest real; pra alertas
+    anteriores a essa mudança, esse dado não existe.
+    """
+    if not CSV_PATH.exists():
+        return "📊 Ainda não há CSV de auditoria pra resumir."
+
+    contagem: Dict[str, Dict[str, int]] = {}
+    total_linhas = 0
+    total_com_resultado = 0
+
+    try:
+        with CSV_PATH.open("r", newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                total_linhas += 1
+                estrategia = row.get("estrategia") or "DESCONHECIDA"
+                resultado = (row.get("resultado_manual") or "").strip().lower()
+                if not resultado:
+                    continue
+                total_com_resultado += 1
+                contagem.setdefault(estrategia, {"green": 0, "red": 0})
+                if "green" in resultado or "verde" in resultado:
+                    contagem[estrategia]["green"] += 1
+                elif "red" in resultado or "vermelho" in resultado:
+                    contagem[estrategia]["red"] += 1
+    except Exception as e:
+        return f"⚠️ Erro lendo CSV pra resumo: {type(e).__name__}: {e}"
+
+    if not contagem:
+        return (
+            f"📊 RESUMO DE RESULTADOS\n"
+            f"Total de linhas no CSV: {total_linhas}\n"
+            f"Nenhuma linha tem resultado_manual preenchido ainda — "
+            f"audite no HTML turbo antes de pedir resumo."
+        )
+
+    linhas = [f"📊 RESUMO DE RESULTADOS (auditado manualmente)", f"Total no CSV: {total_linhas} | Com resultado: {total_com_resultado}", ""]
+    for estrategia, c in sorted(contagem.items(), key=lambda kv: -(kv[1]["green"] + kv[1]["red"])):
+        total_est = c["green"] + c["red"]
+        if total_est == 0:
+            continue
+        pct = round(100 * c["green"] / total_est, 1)
+        linhas.append(f"• {estrategia}: {c['green']}G / {c['red']}R ({total_est} jogos) — {pct}% acerto")
+
+    return "\n".join(linhas)
 
 
 # =========================================================
@@ -6703,8 +6903,13 @@ def filtro_sniper_ft_v2(m: "Metricas") -> Tuple[bool, str]:
     press = m.lado_pressionante
     if fav not in {"CASA", "FORA"}:
         return False, "SNIPER_SEM_FAVORITO"
-    if m.odd_favorito and m.odd_favorito > 1.60:
-        return False, f"SNIPER_ODD_FAVORITO_ACIMA_1_60 | odd={m.odd_favorito}"
+    # Item 9 (28/06): perfil documentado nos cadernos físicos é odd máx
+    # 1.40 + super favorito (91.7% acerto / 46.7% ROI histórico) — o código
+    # ainda usava 1.60, mais solto que o que foi validado manualmente.
+    # Flag pra rollback instantâneo se o aperto cortar volume demais.
+    odd_maxima_sniper = 1.40 if HABILITAR_SNIPER_PERFIL_140 else 1.60
+    if m.odd_favorito and m.odd_favorito > odd_maxima_sniper:
+        return False, f"SNIPER_ODD_FAVORITO_ACIMA_{odd_maxima_sniper} | odd={m.odd_favorito}"
     if press != fav:
         return False, f"SNIPER_FAVORITO_NAO_PRESSIONANTE | fav={fav} press={press}"
 
@@ -7424,6 +7629,19 @@ def logar_versao_inicial() -> None:
     log("  9. Pré-live: score de Gols/Escanteios/BTTS/HT agora cruza ataque de um time x defesa do outro")
     log(" 10. Pré-live: confiabilidade real (não finge mais ALTA/10 jogos sempre) + fallback 10→5→histórico completo")
     log(" 11. Pré-live: 'Vitória Casa/Fora' não entra mais em jogo de seleção/torneio em campo neutro")
+    log(" 12. #COUTIPS_ESTADO_V26 de volta pro canal Cout_aud (não fica mais no canal de confirmação)")
+    log(" 13. Pré-live: bugs over_25_ft/over_15_ft/over_05_ht e cartões corrigidos (comparado com HTML real)")
+    log(" 14. VOLUME_FT reprovado não vai mais pro canal FT-REPROVADO")
+    log(" 15. Score real (PY) mostrado em vez de 0% quando bloqueado por categoria sub-20/19/18")
+    log(" 16. Log duplicado/marcado como erro no Railway corrigido (stdout em vez de stderr)")
+    log(" 17. Cooldown universal separado por período HT/FT (não bloqueia mais um pelo outro)")
+    log(" 18. CSV de auditoria com detalhes_completos + texto_bruto_raw (base pra backtest real)")
+    log(" 19. SNIPER apertado pro perfil documentado (odd máx 1.40, era 1.60) — flag HABILITAR_SNIPER_PERFIL_140")
+    log(" 20. Comando /resumo — resumo de acerto por estratégia a partir do CSV auditado")
+    log(" 21. Auditoria mostra o motivo do valor pós-evento, não só a classe")
+    log(" 22. Pré-live usa classificação de liga (PREMIUM/MODERADA/NEUTRA/UNDER/PERIGOSA) do ao vivo")
+    log(" 23. Pré-live: amistoso é atenção própria (penalidade), separado de campo neutro (bloqueio)")
+    log(" 24. Pré-live: abaixo do mínimo ideal mas acima do piso absoluto, manda SAFE com confiança reduzida")
     log(f"📊 Corte HT={CORTE_GOL_HT}% | Corte FT={CORTE_GOL_FT}%")
     log(f"📡 Canal gols={TARGET_CHANNEL} | confirmação={CONFIRMATION_CHANNEL}")
     log(f"📡 Múltiplas Pré-Live={CANAL_MULTIPLAS_PRELIVE or 'NÃO CONFIGURADO'}")
@@ -7536,6 +7754,22 @@ async def main() -> None:
         if texto.strip().lower() == "/prelive":
             log("📩 /prelive RECEBIDO (CHAT PRIVADO)")
             await varrer_site_theoborges_prelive_v2()
+
+    @client.on(events.NewMessage(incoming=True))
+    async def handler_resumo(event):
+        texto = event.raw_text or ""
+        if texto.strip().lower() == "/resumo":
+            log("📩 /resumo RECEBIDO (INCOMING)")
+            resumo = gerar_resumo_resultados()
+            await client.send_message(event.chat_id, resumo)
+
+    @client.on(events.NewMessage(from_users='me'))
+    async def handler_resumo_me(event):
+        texto = event.raw_text or ""
+        if texto.strip().lower() == "/resumo":
+            log("📩 /resumo RECEBIDO (CHAT PRIVADO)")
+            resumo = gerar_resumo_resultados()
+            await client.send_message("me", resumo)
 
     log("🚀 INICIANDO BOT")
 
