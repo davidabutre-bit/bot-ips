@@ -59,7 +59,7 @@ except Exception:  # pragma: no cover
 # VERSÃO / CONFIGURAÇÃO BASE
 # =========================================================
 
-VERSAO_COUTIPS = "ALFA_COUTIPS_2026_06_28_MERGE_PRELIVE_CRASH_FIX_V001"
+VERSAO_COUTIPS = "ALFA_COUTIPS_2026_06_28_PRELIVE_CRUZAMENTO_CONFIABILIDADE_V002"
 
 load_dotenv()
 
@@ -437,8 +437,32 @@ def clamp(valor: float, minimo: int = 0, maximo: int = 100) -> int:
     return max(minimo, min(maximo, int(round(valor))))
 
 
+# Competições de seleção/torneio internacional — jogadas em campo neutro
+# (ou onde "casa" não significa o que significa no futebol de clube).
+# Usado pelo pré-live pra não aplicar o mercado "Vitória Casa/Fora" nesses
+# jogos, já que a vantagem de jogar em casa simplesmente não existe ali.
+_TORNEIOS_CAMPO_NEUTRO = (
+    "copa do mundo", "world cup", "mundial", "eliminatorias", "eliminatoria",
+    "qualifiers", "euro ", "eurocopa", "european championship",
+    "copa america", "copa américa", "nations league", "liga das nacoes",
+    "liga das nações", "gold cup", "copa africa", "copa áfrica", "afcon",
+    "africa cup of nations", "amistoso internacional", "international friendl",
+    "uefa nations", "concacaf", "asian cup", "copa asiatica",
+)
+
+
+def eh_campo_neutro(liga: str) -> bool:
+    """True se a competição é de seleção/torneio internacional — onde o
+    conceito de "jogar em casa" não vale do jeito que vale em clube."""
+    if not liga:
+        return False
+    l = remover_acentos(liga).lower()
+    return any(remover_acentos(termo) in l for termo in _TORNEIOS_CAMPO_NEUTRO)
+
+
 def now_iso() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
 
 
 def lock_jogo(chave: str) -> asyncio.Lock:
@@ -802,8 +826,9 @@ class HistoricoTimePreLive:
     over_25_ft_percent: float = 0.0
     cartoes_media: float = 0.0
     cartoes_sofridos_media: float = 0.0
-    confiabilidade: str = "BAIXA"  # ALTA (10), MEDIA (5), BAIXA (<5)
+    confiabilidade: str = "BAIXA"  # ALTA (>=8 jogos), MEDIA (4-7), BAIXA (<4)
     dados_completos: bool = False
+    escopo_dados: str = "last10"  # last10 | last5 | competicao_completa
 
 
 # =========================================================
@@ -2224,6 +2249,23 @@ class TeoBorgesScraperPreLiveV2:
             log(f"❌ Erro ao buscar jogos: {type(e).__name__}: {e}")
             return []
 
+    async def _refazer_com_scope(self, url: str, scope: str, timeout: int = 60) -> Optional[BeautifulSoup]:
+        """Refaz a requisição do jogo pedindo um recorte de jogos diferente
+        (last5/competition) — só é chamada quando Últimos 10 não tem dados
+        suficientes pra um dos times. Continua sendo o mínimo de requisições
+        necessárias, não um retorno ao padrão antigo de 3 requisições fixas.
+        """
+        try:
+            separador = "&" if "?" in url else "?"
+            url_scope = f"{url}{separador}stats_scope={scope}"
+            resp = await self.client.get(url_scope, timeout=timeout)
+            if resp.status_code != 200:
+                return None
+            return BeautifulSoup(resp.text, "html.parser")
+        except Exception as e:
+            log(f"⚠️ Erro ao refazer requisição com scope={scope}: {type(e).__name__}: {e}")
+            return None
+
     def _label_para_slug(self, label_norm: str, card_titulo: str = "") -> Optional[str]:
         """Traduz o label em português (já sem acento, minúsculo) da linha do
         site para o slug que o resto do pipeline (_mapear_estatisticas_prelive,
@@ -2465,6 +2507,19 @@ class TeoBorgesScraperPreLiveV2:
         except:
             return 0.0
 
+    def _classificar_confiabilidade(self, total_jogos: float) -> Tuple[str, bool]:
+        """Confiabilidade real, baseada no que o site de fato devolveu —
+        nunca mais fixa em "ALTA"/10 jogos independente do dado existir.
+        """
+        total = int(total_jogos or 0)
+        if total >= 8:
+            return "ALTA", True
+        if total >= 4:
+            return "MEDIA", True
+        if total >= 1:
+            return "BAIXA", True
+        return "BAIXA", False
+
     def _construir_historico(self, dados_completos: Dict) -> Tuple[HistoricoTimePreLive, HistoricoTimePreLive]:
         """Constrói histórico dos times (Mudança 8 e 10)."""
         hist_casa = HistoricoTimePreLive()
@@ -2472,6 +2527,7 @@ class TeoBorgesScraperPreLiveV2:
         
         estat_casa = dados_completos.get("estatisticas", {}).get("casa", {})
         estat_fora = dados_completos.get("estatisticas", {}).get("fora", {})
+        escopo_usado = dados_completos.get("escopo_usado", "last10")
         
         hist_casa.nome = dados_completos.get("time_casa", "")
         hist_casa.gols_media = estat_casa.get("media_gols", 0)
@@ -2482,9 +2538,9 @@ class TeoBorgesScraperPreLiveV2:
         hist_casa.over_25_ft_percent = estat_casa.get("over_25_ft", 0)
         hist_casa.over_05_ht_percent = estat_casa.get("over_05_ht", 0)
         hist_casa.over_15_ft_percent = estat_casa.get("over_15_ft", 0)
-        hist_casa.total_jogos = 10
-        hist_casa.confiabilidade = "ALTA"
-        hist_casa.dados_completos = True
+        hist_casa.total_jogos = int(estat_casa.get("total_jogos", 0) or 0)
+        hist_casa.confiabilidade, hist_casa.dados_completos = self._classificar_confiabilidade(hist_casa.total_jogos)
+        hist_casa.escopo_dados = escopo_usado
         
         hist_fora.nome = dados_completos.get("time_fora", "")
         hist_fora.gols_media = estat_fora.get("media_gols", 0)
@@ -2495,9 +2551,9 @@ class TeoBorgesScraperPreLiveV2:
         hist_fora.over_25_ft_percent = estat_fora.get("over_25_ft", 0)
         hist_fora.over_05_ht_percent = estat_fora.get("over_05_ht", 0)
         hist_fora.over_15_ft_percent = estat_fora.get("over_15_ft", 0)
-        hist_fora.total_jogos = 10
-        hist_fora.confiabilidade = "ALTA"
-        hist_fora.dados_completos = True
+        hist_fora.total_jogos = int(estat_fora.get("total_jogos", 0) or 0)
+        hist_fora.confiabilidade, hist_fora.dados_completos = self._classificar_confiabilidade(hist_fora.total_jogos)
+        hist_fora.escopo_dados = escopo_usado
         
         return hist_casa, hist_fora
 
@@ -2579,10 +2635,38 @@ class TeoBorgesScraperPreLiveV2:
             if odds_base:
                 dados_completos["odds"] = odds_base
 
-            # Estatísticas: UMA única extração, escopada por card/sub-aba
-            # (substitui o loop antigo de 3 requisições por #fragmento, que
-            # eram redundantes — ver _parse_pagina_completa).
+            # Estatísticas: extração escopada por card/sub-aba (corrige colisão
+            # de labels) + fallback de confiabilidade: tenta Últimos 10 (padrão
+            # do site); se algum dos dois times não tiver jogo suficiente,
+            # tenta de novo com Últimos 5; se ainda faltar, tenta com o
+            # histórico completo da competição (o que tiver, fica valendo —
+            # mas a confiabilidade reportada reflete isso de verdade, não
+            # finge que sempre tem 10 jogos).
             dados_pagina = self._parse_pagina_completa(soup_base)
+            escopo_usado = "last10"
+
+            def _min_jogos(dp: Dict) -> int:
+                tc = dp.get("estatisticas", {}).get("casa", {}).get("total_jogos", 0)
+                tf = dp.get("estatisticas", {}).get("fora", {}).get("total_jogos", 0)
+                return min(int(tc or 0), int(tf or 0))
+
+            if dados_pagina and _min_jogos(dados_pagina) < 8:
+                soup_5 = await self._refazer_com_scope(url, "last5")
+                if soup_5:
+                    dados_5 = self._parse_pagina_completa(soup_5)
+                    if dados_5 and _min_jogos(dados_5) > _min_jogos(dados_pagina):
+                        dados_pagina = dados_5
+                        escopo_usado = "last5"
+
+            if dados_pagina and _min_jogos(dados_pagina) < 3:
+                soup_comp = await self._refazer_com_scope(url, "competition")
+                if soup_comp:
+                    dados_comp = self._parse_pagina_completa(soup_comp)
+                    if dados_comp and _min_jogos(dados_comp) > _min_jogos(dados_pagina):
+                        dados_pagina = dados_comp
+                        escopo_usado = "competicao_completa"
+
+            dados_completos["escopo_usado"] = escopo_usado
             if dados_pagina:
                 dados_completos["estatisticas"] = dados_pagina["estatisticas"]
                 if dados_pagina.get("odds"):
@@ -2840,30 +2924,32 @@ class MarketEnginePreLiveV2:
             m.estatistica_media = media_ht
             mercados.append(m)
         
-        # 5. Vitória Casa
-        score_casa = self._calc_vitoria_casa(features, jogo)
-        if score_casa > 0:
-            m = MercadoPreLive(
-                nome="Vitória Casa",
-                jogo=jogo,
-                score=score_casa,
-                detalhes={}
-            )
-            m.nome_sugerido = "Vitória Casa"
-            mercados.append(m)
-        
-        # 6. Vitória Fora
-        score_fora = self._calc_vitoria_fora(features, jogo)
-        if score_fora > 0:
-            m = MercadoPreLive(
-                nome="Vitória Fora",
-                jogo=jogo,
-                score=score_fora,
-                detalhes={}
-            )
-            m.nome_sugerido = "Vitória Fora"
-            mercados.append(m)
-        
+        # 5 e 6. Vitória Casa / Vitória Fora — não fazem sentido em jogo de
+        # seleção/torneio internacional disputado em campo neutro (não
+        # existe "vantagem de jogar em casa" ali).
+        if not eh_campo_neutro(jogo.liga):
+            score_casa = self._calc_vitoria_casa(features, jogo)
+            if score_casa > 0:
+                m = MercadoPreLive(
+                    nome="Vitória Casa",
+                    jogo=jogo,
+                    score=score_casa,
+                    detalhes={}
+                )
+                m.nome_sugerido = "Vitória Casa"
+                mercados.append(m)
+
+            score_fora = self._calc_vitoria_fora(features, jogo)
+            if score_fora > 0:
+                m = MercadoPreLive(
+                    nome="Vitória Fora",
+                    jogo=jogo,
+                    score=score_fora,
+                    detalhes={}
+                )
+                m.nome_sugerido = "Vitória Fora"
+                mercados.append(m)
+
         return mercados
 
     def _calc_vitoria_casa(self, f: Dict, jogo: JogoPreLive) -> float:
@@ -2889,43 +2975,48 @@ class MarketEnginePreLiveV2:
         return clamp(score, 0, 100)
 
     def _calc_over_05_ht(self, f: Dict) -> float:
-        score = (
-            f.get("over_05_ht_casa", 0) * 0.35 +
-            f.get("over_05_ht_fora", 0) * 0.25 +
-            f.get("xg_casa", 0) * 0.20 +
-            f.get("xg_fora", 0) * 0.10 +
-            f.get("btts_casa", 0) * 0.10
-        )
-        return clamp(score * 100, 0, 100)
+        """Cruza o ataque de cada time (xG) com a fragilidade defensiva do
+        adversário (xGA), nas duas direções, e usa a tendência de over no
+        1ºT de cada time como contexto secundário."""
+        casa_ataca_fora_sofre = (f.get("xg_casa", 0) + f.get("xga_fora", 0)) / 2
+        fora_ataca_casa_sofre = (f.get("xg_fora", 0) + f.get("xga_casa", 0)) / 2
+        cruzamento = (casa_ataca_fora_sofre + fora_ataca_casa_sofre) / 2
+        contexto = (f.get("over_05_ht_casa", 0) + f.get("over_05_ht_fora", 0)) / 2
+        score = cruzamento * 20 + contexto * 40
+        return clamp(score, 0, 100)
 
     def _calc_over_25_ft(self, f: Dict) -> float:
-        score = (
-            f.get("over_25_ft_casa", 0) * 0.35 +
-            f.get("over_25_ft_fora", 0) * 0.25 +
-            f.get("xg_casa", 0) * 0.20 +
-            f.get("xg_fora", 0) * 0.10 +
-            f.get("btts_casa", 0) * 0.10
-        )
-        return clamp(score * 100, 0, 100)
+        """Mesma lógica de cruzamento, pro jogo completo."""
+        casa_ataca_fora_sofre = (f.get("xg_casa", 0) + f.get("xga_fora", 0)) / 2
+        fora_ataca_casa_sofre = (f.get("xg_fora", 0) + f.get("xga_casa", 0)) / 2
+        cruzamento = (casa_ataca_fora_sofre + fora_ataca_casa_sofre) / 2
+        contexto = (
+            f.get("over_25_ft_casa", 0) + f.get("over_25_ft_fora", 0)
+            + f.get("btts_casa", 0) + f.get("btts_fora", 0)
+        ) / 4
+        score = cruzamento * 22 + contexto * 35
+        return clamp(score, 0, 100)
 
     def _calc_btts(self, f: Dict) -> float:
-        score = (
-            f.get("btts_casa", 0) * 0.35 +
-            f.get("btts_fora", 0) * 0.25 +
-            f.get("xg_casa", 0) * 0.20 +
-            f.get("xg_fora", 0) * 0.10 +
-            f.get("over_25_ft_casa", 0) * 0.10
-        )
-        return clamp(score * 100, 0, 100)
+        """BTTS exige que OS DOIS marquem — por isso usa o lado mais fraco
+        da conta (mínimo), não a média. Se um dos dois não tem ataque
+        real contra a defesa do outro, BTTS não acontece, mesmo que o
+        outro lado esteja ótimo."""
+        casa_marca = (f.get("xg_casa", 0) + f.get("xga_fora", 0)) / 2
+        fora_marca = (f.get("xg_fora", 0) + f.get("xga_casa", 0)) / 2
+        cruzamento = min(casa_marca, fora_marca)
+        contexto = (f.get("btts_casa", 0) + f.get("btts_fora", 0)) / 2
+        score = cruzamento * 28 + contexto * 45
+        return clamp(score, 0, 100)
 
     def _calc_escanteios(self, f: Dict) -> float:
-        score = (
-            f.get("escanteios_favor_casa", 0) * 0.35 +
-            f.get("escanteios_favor_fora", 0) * 0.25 +
-            f.get("escanteios_contra_casa", 0) * 0.20 +
-            f.get("escanteios_contra_fora", 0) * 0.20
-        )
-        return clamp(score * 10, 0, 100)
+        """Cruza quem ataca de escanteio (escanteios_favor) com quem
+        concede escanteio (escanteios_contra) do adversário, nas duas
+        direções — em vez de só somar os 4 números dos dois lados."""
+        casa_ataca_fora_sofre = (f.get("escanteios_favor_casa", 0) + f.get("escanteios_contra_fora", 0)) / 2
+        fora_ataca_casa_sofre = (f.get("escanteios_favor_fora", 0) + f.get("escanteios_contra_casa", 0)) / 2
+        cruzamento = (casa_ataca_fora_sofre + fora_ataca_casa_sofre) / 2
+        return clamp(cruzamento * 10, 0, 100)
 
 
 # =========================================================
@@ -7330,6 +7421,9 @@ def logar_versao_inicial() -> None:
     log("  6. Scraper pré-live: extração escopada por card/sub-aba (corrige colisão de labels)")
     log("  7. Scraper pré-live: tradução label PT->slug (pipeline de feature parava de zerar)")
     log("  8. Merge dos 5 fragmentos DeepSeek em um único arquivo, sem duplicar MarketEngine/MAIN")
+    log("  9. Pré-live: score de Gols/Escanteios/BTTS/HT agora cruza ataque de um time x defesa do outro")
+    log(" 10. Pré-live: confiabilidade real (não finge mais ALTA/10 jogos sempre) + fallback 10→5→histórico completo")
+    log(" 11. Pré-live: 'Vitória Casa/Fora' não entra mais em jogo de seleção/torneio em campo neutro")
     log(f"📊 Corte HT={CORTE_GOL_HT}% | Corte FT={CORTE_GOL_FT}%")
     log(f"📡 Canal gols={TARGET_CHANNEL} | confirmação={CONFIRMATION_CHANNEL}")
     log(f"📡 Múltiplas Pré-Live={CANAL_MULTIPLAS_PRELIVE or 'NÃO CONFIGURADO'}")
