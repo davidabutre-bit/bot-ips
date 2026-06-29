@@ -2,3 +2,4 @@ telethon>=1.36.0
 python-dotenv
 openai
 beautifulsoup4
+requests
