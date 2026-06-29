@@ -43,6 +43,17 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
+
+# Bot Auditor V2 (item 19/29-06) — módulo separado, opcional. Se o arquivo
+# não existir ou der erro de import, o resto do sistema continua
+# funcionando normal — o auditor é só uma camada de inteligência por
+# cima, nunca pode derrubar o ao vivo/pré-live.
+try:
+    import coutips_auditor_v2 as auditor_v2
+    AUDITOR_V2_DISPONIVEL = True
+except Exception as _e_auditor_import:
+    auditor_v2 = None
+    AUDITOR_V2_DISPONIVEL = False
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
 from telethon.errors import FloodWaitError
@@ -60,7 +71,7 @@ except Exception:  # pragma: no cover
 # VERSÃO / CONFIGURAÇÃO BASE
 # =========================================================
 
-VERSAO_COUTIPS = "ALFA_COUTIPS_2026_06_28_FIX_PROTECAO_IA_NONE_V004"
+VERSAO_COUTIPS = "ALFA_COUTIPS_2026_06_29_AUDITOR_V2_INTEGRADO_V005"
 
 load_dotenv()
 
@@ -577,6 +588,12 @@ def v29_salvar_cooldowns() -> None:
 # =========================================================
 
 _v26_msg_estado_id: Optional[int] = None
+
+# Bot Auditor V2 — instância única, inicializada em main() depois que o
+# client conecta. Fica None se a inicialização falhar (sistema continua
+# funcionando sem o auditor, só sem essa camada extra).
+_auditor_v2_manager = None
+_auditor_v2_scheduler = None
 
 
 async def v26_salvar_estado_telegram() -> None:
@@ -6044,6 +6061,70 @@ def sanitizar_csv(texto: str) -> str:
     return texto
 
 
+def _extrair_times_do_jogo(jogo: str) -> Tuple[str, str]:
+    partes = re.split(r"\s+x\s+|\s+vs\s+", jogo or "", maxsplit=1)
+    if len(partes) < 2:
+        return (jogo or "", "")
+    return (partes[0].strip(), partes[1].strip())
+
+
+def montar_snapshot_auditor_v2(m: Metricas, decisao_py: DecisaoPython, decisao_ia: DecisaoIA,
+                                score_medio: int, decisao_final: str, motivo: str) -> Dict[str, Any]:
+    """Item 19 (29/06) — traduz o que o sistema já calcula pro formato que
+    o Bot Auditor V2 espera. HONESTO: nem todo subcomponente de score que
+    o Auditor V2 tenta guardar (pressure/ip/chance_gol/shots/rb/contexto/
+    favoritismo) existe separado no nosso pipeline hoje — a maior parte
+    do detalhe vive dentro de decisao_py.detalhes como dicionário solto,
+    não como esses campos específicos. Preenche o que existe de verdade
+    (total, base) e deixa o resto vazio em vez de inventar número.
+    """
+    home_team, away_team = _extrair_times_do_jogo(m.jogo)
+    detalhes = decisao_py.detalhes or {}
+    return {
+        "fixture_id": None,
+        "match_id": None,
+        "league": m.liga,
+        "country": None,
+        "season": None,
+        "home_team": home_team,
+        "away_team": away_team,
+        "match_date": datetime.now().date().isoformat(),
+        "match_time": None,
+        "market": m.mercado,
+        "period": "HT" if eh_ht(m.estrategia) else "FT",
+        "decision_type": m.estrategia,
+        "approved": decisao_final == "APROVADO",
+        "decision_minute": m.tempo,
+        "decision_reasons": [motivo] if motivo else [],
+        "scores": {
+            "total": score_medio,
+            "base": decisao_py.score,
+            # demais subcomponentes não existem separados no pipeline atual —
+            # deixados de fora de propósito, ver docstring.
+            "components": detalhes,
+        },
+        "context": {
+            "favorite_team": "home" if m.lado_favorito == "CASA" else ("away" if m.lado_favorito == "FORA" else None),
+            "favorite_odd": m.odd_favorito,
+            "pressure_team": "home" if m.lado_pressionante == "CASA" else ("away" if m.lado_pressionante == "FORA" else None),
+            "game_context": m.valor_pos_evento_classe or None,
+        },
+    }
+
+
+def _registrar_no_auditor_v2(m: Metricas, decisao_py: DecisaoPython, decisao_ia: DecisaoIA,
+                              score_medio: int, decisao_final: str, motivo: str) -> None:
+    """Nunca deixa o Auditor V2 quebrar o resto do sistema — qualquer erro
+    aqui só vira log, o ao vivo/pré-live segue intocado."""
+    if _auditor_v2_manager is None:
+        return
+    try:
+        snapshot = montar_snapshot_auditor_v2(m, decisao_py, decisao_ia, score_medio, decisao_final, motivo)
+        _auditor_v2_manager.registrar_decisao_v2(snapshot)
+    except Exception as e:
+        log(f"⚠️ Auditor V2 falhou ao registrar decisão (não afeta o resto) | {type(e).__name__}: {e}")
+
+
 def registrar_csv(m: Metricas, decisao_py: DecisaoPython, decisao_ia: DecisaoIA, score_medio: int, decisao_final: str, motivo: str) -> None:
     garantir_csv()
     row = {
@@ -6095,6 +6176,8 @@ def registrar_csv(m: Metricas, decisao_py: DecisaoPython, decisao_ia: DecisaoIA,
     with CSV_PATH.open("a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
         writer.writerow(row)
+
+    _registrar_no_auditor_v2(m, decisao_py, decisao_ia, score_medio, decisao_final, motivo)
 
 
 def gerar_resumo_resultados() -> str:
@@ -7650,6 +7733,7 @@ def logar_versao_inicial() -> None:
     log(" 22. Pré-live usa classificação de liga (PREMIUM/MODERADA/NEUTRA/UNDER/PERIGOSA) do ao vivo")
     log(" 23. Pré-live: amistoso é atenção própria (penalidade), separado de campo neutro (bloqueio)")
     log(" 24. Pré-live: abaixo do mínimo ideal mas acima do piso absoluto, manda SAFE com confiança reduzida")
+    log(" 25. Auditor V2 integrado — CornerPro removido da cascata, bug de INSERT corrigido, matching por nome+data")
     log(f"📊 Corte HT={CORTE_GOL_HT}% | Corte FT={CORTE_GOL_FT}%")
     log(f"📡 Canal gols={TARGET_CHANNEL} | confirmação={CONFIRMATION_CHANNEL}")
     log(f"📡 Múltiplas Pré-Live={CANAL_MULTIPLAS_PRELIVE or 'NÃO CONFIGURADO'}")
@@ -7778,6 +7862,20 @@ async def main() -> None:
             log("📩 /resumo RECEBIDO (CHAT PRIVADO)")
             resumo = gerar_resumo_resultados()
             await client.send_message("me", resumo)
+
+    global _auditor_v2_manager, _auditor_v2_scheduler
+    if AUDITOR_V2_DISPONIVEL:
+        try:
+            _auditor_v2_manager = auditor_v2.AuditManagerV2()
+            _auditor_v2_scheduler = auditor_v2.AuditSchedulerV2()
+            _auditor_v2_scheduler.start()  # thread própria — não bloqueia o loop assíncrono do bot
+            log(f"🧠 Auditor V2 ativo | providers: {[p.provider_name for p in _auditor_v2_manager.providers]}")
+        except Exception as e:
+            _auditor_v2_manager = None
+            _auditor_v2_scheduler = None
+            log(f"⚠️ Auditor V2 não iniciou (bot segue normal sem ele) | {type(e).__name__}: {e}")
+    else:
+        log("ℹ️ Auditor V2 não encontrado (coutips_auditor_v2.py ausente) — bot segue normal sem ele")
 
     log("🚀 INICIANDO BOT")
 
