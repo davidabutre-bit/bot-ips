@@ -7,6 +7,18 @@ COUTIPS AUDITOR V2 - Sistema de Inteligência do ALFA
 ================================================================================
 Versão: 2.0.0
 Autor: COUTIPS Development Team
+
+EVOLUÇÃO DO V1 PARA V2:
+- Snapshot completo com todos os scores e componentes
+- Contexto do jogo (favorito, pressão, domínio, intensidade)
+- Classificações expandidas (PRESSAO_CONVERTIDA, PRESSAO_CONTINUOU, etc.)
+- Resultado operacional detalhado (GREEN_EXCELENTE, RED_EVITAVEL, etc.)
+- Learning Engine (identificação de padrões estatísticos)
+- Relatórios inteligentes com conclusões automáticas
+- Consultas avançadas para responder perguntas complexas
+
+FILOSOFIA: O Auditor V2 é um SISTEMA DE INTELIGÊNCIA.
+Nunca altera decisões do ALFA. Apenas observa, registra, analisa e gera conhecimento.
 ================================================================================
 """
 
@@ -28,41 +40,92 @@ from contextlib import contextmanager
 from collections import defaultdict
 from enum import Enum
 
-# =========================
-# 🔴 ADICIONADO (SÓ ISSO)
-# =========================
+# ============================================================================
+# CONFIGURAÇÃO
+# ============================================================================
+
+# Interruptor de emergência — adicionado em 30/06 (mudança de urgência).
+# Reforça, dentro do próprio módulo do auditor, o mesmo interruptor que o
+# main.py já lê antes de iniciar o AuditManagerV2/AuditSchedulerV2. Default
+# TRUE (auditor ligado).
 AUDITOR_ENABLED = os.getenv("AUDITOR_ENABLED", "true").lower() == "true"
 
 @dataclass
 class Config:
     """Configuração central do sistema V2"""
-    
+
+    # Interruptor de emergência (mudança de urgência, 30/06) — liga/desliga
+    # sem precisar de redeploy de código.
+    auditor_enabled: bool = AUDITOR_ENABLED
+
+    # Database
     db_path: str = "audit_database_v2.db"
     
+    # Telegram
     telegram_bot_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
     telegram_chat_id: str = os.getenv("TELEGRAM_CHAT_ID", "")
     
-    # 🔴 ADICIONADO (SÓ ISSO)
-    auditor_enabled: bool = AUDITOR_ENABLED
-    
+    # Chaves de API
     api_keys: Dict[str, str] = field(default_factory=lambda: {
         "api1": os.getenv("API1_KEY", "your_api_key_1"),
         "api2": os.getenv("API2_KEY", "your_api_key_2"),
         "api3": os.getenv("API3_KEY", "your_api_key_3"),
     })
     
+    # URLs das APIs
     api_urls: Dict[str, str] = field(default_factory=lambda: {
         "api1": "https://api.football-data.org/v4",
         "api2": "https://api2.example.com/v1",
         "api3": "https://api3.example.com/v1",
     })
     
+    # Ordem de prioridade dos providers
+    # ATUALIZADO (30/06): CornerPro foi reintroduzido na cascata, agora com
+    # arquitetura própria de segurança — sessão via cookies (não scraping de
+    # login), espera obrigatória após o fim do jogo, intervalo mínimo entre
+    # requisições, e circuit-breaker que desliga o provider sozinho se a
+    # sessão expirar (ver CornerProProvider). É a fonte com cobertura mais
+    # próxima de 100% dos jogos que o ALFA realmente analisa, porque é a
+    # MESMA fonte que já alimenta o ao vivo. Fica em primeiro na prioridade;
+    # se falhar (ou estiver fora da janela de espera), a cascata cai pros
+    # providers seguintes normalmente, sem travar a auditoria do jogo.
     provider_priority: List[str] = field(default_factory=lambda: [
         "cornerpro", "api1", "api2", "api3", "sofascore", "flashscore"
     ])
 
+    # --- CornerPro: cookies de sessão (não é login automático) ---
+    # A sessão da CornerPro não expira por inatividade nem ao fechar a aba —
+    # só com logout manual. Por isso o auditor usa os cookies de uma sessão
+    # já autenticada pelo operador, em vez de tentar automatizar login.
     cornerpro_phpsessid: str = os.getenv("CORNERPRO_PHPSESSID", "")
     cornerpro_token: str = os.getenv("CORNERPRO_TOKEN", "")
+
+    # Nunca duas requisições à CornerPro ao mesmo tempo, e nunca em rajada —
+    # regra de segurança definida junto com o operador pra não arriscar a
+    # sessão que o AO VIVO também depende (mesma conta, fontes diferentes).
+    cornerpro_intervalo_minimo_segundos: int = int(os.getenv("CORNERPRO_INTERVALO_MINIMO_SEGUNDOS", "45"))
+
+    # Espera depois do fim do jogo antes de tentar buscar o resultado:
+    # (90 - minuto_do_alerta) + margem, em minutos.
+    cornerpro_margem_minutos: int = int(os.getenv("CORNERPRO_MARGEM_MINUTOS", "25"))
+
+    # Circuit-breaker: depois de N falhas de autenticação (401/403)
+    # CONSECUTIVAS, o provider para de tentar e avisa o canal — em vez de
+    # martelar uma sessão que claramente expirou.
+    cornerpro_max_falhas_auth_consecutivas: int = int(os.getenv("CORNERPRO_MAX_FALHAS_AUTH", "3"))
+
+    # Canal/chat pra avisos operacionais do CornerProProvider (níveis 2-4 de
+    # erro). Se vazio, cai no telegram_chat_id geral do auditor.
+    cornerpro_alert_chat_id: str = os.getenv("CORNERPRO_ALERT_CHAT_ID", "")
+    
+    # Limites
+    queue_batch_size: int = 50
+    max_retry_attempts: int = 3
+    request_timeout: int = 30
+    
+    # Learning Engine
+    learning_min_samples: int = 50
+    learning_analysis_period_days: int = 90
     
     # Limiares para classificações
     threshold_pressure_convert: float = 0.6
@@ -1393,6 +1456,18 @@ class CornerProProvider(BaseProvider):
         objeto 'game' dentro do texto já desescapado. Devolve status + scores
         se conseguir; nunca inventa valor — se não achar com segurança,
         devolve erro de parse e a cascata segue pro próximo provider.
+
+        CORRIGIDO (30/06, achado pela auditoria do próprio dia 30/06):
+        a versão anterior usava .encode("utf-8").decode("unicode_escape"),
+        que trata bytes UTF-8 multibyte como se fossem Latin-1 — qualquer
+        acento (nome de time/liga com é, ã, ç, etc.) corrompia o texto e
+        o parser nunca mais achava o bloco 'game' a partir daquele ponto.
+        Por isso TODOS os jogos davam parse_fail, não só os com acento —
+        o fragmento inteiro concatenado ficava ilegível depois do primeiro
+        caractere acentuado. Corrigido usando json.loads na própria string
+        entre aspas, que desescapa \\", \\\\, \\n, \\uXXXX corretamente sem
+        tocar em caracteres literais (a forma certa de desescapar uma
+        string de literal JS/JSON que o Python já decodificou como texto).
         """
         fragmentos = re.findall(r'self\.__next_f\.push\(\[1,\s*"((?:[^"\\]|\\.)*)"\]\)', html)
         if not fragmentos:
@@ -1401,7 +1476,7 @@ class CornerProProvider(BaseProvider):
         texto_completo = ""
         for frag in fragmentos:
             try:
-                texto_completo += frag.encode("utf-8").decode("unicode_escape")
+                texto_completo += json.loads(f'"{frag}"')
             except Exception:
                 texto_completo += frag
 
