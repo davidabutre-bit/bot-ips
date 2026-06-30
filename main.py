@@ -61,7 +61,7 @@ except Exception:  # pragma: no cover
 # VERSÃO / CONFIGURAÇÃO BASE
 # =========================================================
 
-VERSAO_COUTIPS = "ALFA_COUTIPS_2026_06_30_PRELIVE_ISOLADO_V007"
+VERSAO_COUTIPS = "ALFA_COUTIPS_2026_06_30_PRELIVE_ISOLADO_V008"
 
 load_dotenv()
 
@@ -5715,37 +5715,8 @@ async def main() -> None:
     log("🚀 INICIANDO BOT")
 
     # Retry com backoff para AuthKeyDuplicatedError — cobre o caso legítimo
-    # de overlap de deploy (deploy antigo do Railway ainda não morreu).
-    # Se persistir além disso, a sessão está morta de verdade (ver
-    # _notificar_sessao_morta_telegram) e quem chama main() decide parar
-    # o processo em vez de ficar em crash loop infinito.
-    TENTATIVAS_AUTHKEY = 5
-    for tentativa in range(1, TENTATIVAS_AUTHKEY + 1):
-        try:
-            await client.start()
-            await client.catch_up()
-            break
-        except Exception as e:
-            if "AuthKeyDuplicated" in str(e) or "two different IP" in str(e):
-                log(f"⚠️ Possível deploy antigo ainda ativo (tentativa {tentativa}/{TENTATIVAS_AUTHKEY}). Aguardando 30s...")
-                # Desconecta o client atual antes de tentar de novo —
-                # sem isso, a sessão fica ocupada do lado do Telegram
-                # até o container antigo morrer sozinho (pode levar
-                # minutos). Com o disconnect explícito, liberamos a
-                # sessão imediatamente e o próximo client.start()
-                # consegue conectar limpo.
-                try:
-                    await client.disconnect()
-                except Exception:
-                    pass
-                await asyncio.sleep(10)
-                # Recria o client para a próxima tentativa — a instância
-                # anterior foi desconectada e não pode ser reutilizada.
-                client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
-                if tentativa == TENTATIVAS_AUTHKEY:
-                    raise
-            else:
-                raise
+    await client.start()
+    await client.catch_up()
 
     log("✅ TELEGRAM CONECTADO COM SUCESSO")
     await v26_carregar_estado_telegram()
@@ -5787,22 +5758,8 @@ if __name__ == "__main__":
         except Exception as e:
             erro_str = str(e)
             if "AuthKeyDuplicated" in erro_str or "two different IP" in erro_str:
-                falhas_authkey_consecutivas += 1
-                if falhas_authkey_consecutivas >= AUTHKEY_FALHAS_MAX:
-                    # Acima do limite: já não é overlap de deploy, é sessão
-                    # revogada de fato. Parar — ficar reiniciando pra sempre
-                    # contra uma authkey morta só spamma o Railway.
-                    try:
-                        asyncio.run(_notificar_sessao_morta_telegram(falhas_authkey_consecutivas))
-                    except Exception:
-                        pass
-                    log("🛑 PARANDO O PROCESSO — gere uma SESSION_STRING nova e confirme replicas=1 no Railway.")
-                    raise SystemExit(1)
-                log(
-                    f"⚠️ Sessão duplicada detectada (falha {falhas_authkey_consecutivas}/{AUTHKEY_FALHAS_MAX}). "
-                    f"Aguardando 30s para deploy antigo encerrar..."
-                )
-                time.sleep(30)
+                log(f"⚠️ Sessão duplicada — aguardando 10s e tentando novamente...")
+                time.sleep(10)
             elif "event loop" in erro_str:
                 log(f"⚠️ Erro de event loop: {e}. Reiniciando em 5s...")
                 time.sleep(5)
