@@ -618,6 +618,67 @@ class AuditDatabaseV2:
                 LIMIT ?
             """, (limit,))
             return [dict(row) for row in cursor.fetchall()]
+
+    def get_resumo_hoje(self) -> Dict[str, Any]:
+        """Resumo do dia (30/06) — pensado pra responder rápido, a qualquer
+        hora, à pergunta 'como está indo a auditoria hoje?'. Diferente do
+        get_stats_summary_v2 (que é histórico acumulado desde sempre), este
+        filtra só pelo dia de hoje."""
+        hoje = datetime.now().strftime("%Y-%m-%d")
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+
+            cursor.execute(
+                "SELECT COUNT(*) FROM audit_matches WHERE date(created_at) = ?", (hoje,)
+            )
+            registrados_hoje = cursor.fetchone()[0] or 0
+
+            cursor.execute(
+                "SELECT COUNT(*) FROM audit_matches WHERE date(created_at) = ? AND audited_at IS NOT NULL",
+                (hoje,)
+            )
+            auditados_hoje = cursor.fetchone()[0] or 0
+
+            cursor.execute(
+                "SELECT COUNT(*) FROM audit_matches WHERE date(created_at) = ? AND approved = 1",
+                (hoje,)
+            )
+            aprovados_hoje = cursor.fetchone()[0] or 0
+
+            cursor.execute(
+                "SELECT COUNT(*) FROM audit_matches WHERE date(created_at) = ? AND approved = 0",
+                (hoje,)
+            )
+            reprovados_hoje = cursor.fetchone()[0] or 0
+
+            cursor.execute(
+                "SELECT COUNT(*) FROM audit_matches WHERE date(created_at) = ? AND green = 1",
+                (hoje,)
+            )
+            greens_hoje = cursor.fetchone()[0] or 0
+
+            cursor.execute(
+                "SELECT COUNT(*) FROM audit_matches WHERE date(created_at) = ? AND green = 0 AND audited_at IS NOT NULL",
+                (hoje,)
+            )
+            reds_hoje = cursor.fetchone()[0] or 0
+
+            cursor.execute("SELECT COUNT(*) FROM audit_queue WHERE status = 'pending'")
+            pendentes_total = cursor.fetchone()[0] or 0
+
+            cursor.execute("SELECT COUNT(*) FROM audit_queue WHERE status = 'failed'")
+            falhados_total = cursor.fetchone()[0] or 0
+
+        return {
+            "registrados_hoje": registrados_hoje,
+            "auditados_hoje": auditados_hoje,
+            "aprovados_hoje": aprovados_hoje,
+            "reprovados_hoje": reprovados_hoje,
+            "greens_hoje": greens_hoje,
+            "reds_hoje": reds_hoje,
+            "pendentes_na_fila": pendentes_total,
+            "falhados_na_fila": falhados_total,
+        }
     
     # ===== CONSULTAS INTELIGENTES V2 =====
     
@@ -2684,6 +2745,91 @@ class AuditReportsV2:
 """
         
         return report, conclusions
+
+    def generate_biweekly_report_v2(self) -> Tuple[str, List[str]]:
+        """Gera relatório quinzenal (30/06) — mesma estrutura do semanal,
+        janela de 15 dias em vez de 7. Pedido explícito do operador:
+        fechamento diário, semanal, quinzenal e mensal, todos com o mesmo
+        nível de detalhe (aprovados/reprovados, green/red, evolução)."""
+        today = datetime.now()
+        start_date = today - timedelta(days=15)
+
+        report = f"""
+╔══════════════════════════════════════════════════════════════╗
+║            RELATÓRIO QUINZENAL INTELIGENTE V2               ║
+║              {start_date.strftime('%d/%m')} - {today.strftime('%d/%m/%Y')}              ║
+╚══════════════════════════════════════════════════════════════╝
+
+📊 RESUMO DA QUINZENA
+───────────────────────────────────────────────────────────────
+"""
+
+        with self.db.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT 
+                    COUNT(*) as total,
+                    SUM(CASE WHEN green = 1 THEN 1 ELSE 0 END) as greens,
+                    AVG(score_total) as avg_score,
+                    SUM(CASE WHEN classification = 'PRESSAO_CONVERTIDA' THEN 1 ELSE 0 END) as pressure_conv,
+                    SUM(CASE WHEN classification = 'GOL_CONTRA_FLUXO' THEN 1 ELSE 0 END) as counter_goal,
+                    SUM(CASE WHEN operational_result = 'GREEN_EXCELENTE' THEN 1 ELSE 0 END) as green_excelente,
+                    SUM(CASE WHEN approved = 1 THEN 1 ELSE 0 END) as aprovados,
+                    SUM(CASE WHEN approved = 0 THEN 1 ELSE 0 END) as reprovados
+                FROM audit_matches
+                WHERE audited_at >= ? AND audited_at <= ?
+            """, (start_date.isoformat(), today.isoformat()))
+
+            row = cursor.fetchone()
+            total = row[0] or 0
+            greens = row[1] or 0
+            success_rate = (greens / total * 100) if total > 0 else 0
+
+            report += f"""
+  Total Auditado: {total}
+  Aprovados: {row[6] or 0} | Reprovados: {row[7] or 0}
+  Taxa de Acerto (dos auditados): {success_rate:.1f}%
+  Score Médio: {row[2] or 0:.1f}
+
+  📈 Indicadores de Qualidade:
+  ├─ Pressão Convertida: {row[3] or 0}
+  ├─ Gol Contra o Fluxo: {row[4] or 0}
+  └─ GREEN Excelente: {row[5] or 0}
+
+📊 EVOLUÇÃO POR SEMANA (dentro da quinzena)
+───────────────────────────────────────────────────────────────
+"""
+            for semana in range(2):
+                semana_fim = today - timedelta(days=7 * semana)
+                semana_inicio = semana_fim - timedelta(days=7)
+                cursor.execute("""
+                    SELECT 
+                        COUNT(*) as total,
+                        SUM(CASE WHEN green = 1 THEN 1 ELSE 0 END) as greens
+                    FROM audit_matches
+                    WHERE audited_at >= ? AND audited_at < ?
+                """, (semana_inicio.isoformat(), semana_fim.isoformat()))
+                r = cursor.fetchone()
+                s_total = r[0] or 0
+                s_greens = r[1] or 0
+                s_rate = (s_greens / s_total * 100) if s_total > 0 else 0
+                bar2 = '█' * int(s_rate / 5) + '░' * (20 - int(s_rate / 5))
+                rotulo = "Semana mais recente" if semana == 0 else "Semana anterior"
+                report += f"  {rotulo:<20} {bar2} {s_rate:.1f}% ({s_greens}/{s_total})\n"
+
+        conclusions_quinzenal = self._generate_weekly_conclusions(total, success_rate, start_date, today)
+
+        if conclusions_quinzenal:
+            report += "\n💡 CONCLUSÕES AUTOMÁTICAS\n───────────────────────────────────────────────────────────────\n"
+            for i, conclusion in enumerate(conclusions_quinzenal, 1):
+                report += f"  {i}. {conclusion}\n"
+
+        report += f"""
+───────────────────────────────────────────────────────────────
+📅 Relatório gerado em: {datetime.now().strftime('%d/%m/%Y %H:%M')}
+"""
+
+        return report, conclusions_quinzenal
     
     def _generate_weekly_conclusions(self, total: int, success_rate: float, start_date: datetime, end_date: datetime) -> List[str]:
         """Gera conclusões automáticas para o relatório semanal"""
@@ -2992,6 +3138,7 @@ class AuditSchedulerV2:
     def _run(self):
         last_daily = None
         last_weekly = None
+        last_biweekly = None
         last_monthly = None
         last_learning = None
         last_queue = datetime.now()
@@ -3010,8 +3157,9 @@ class AuditSchedulerV2:
                     self._run_learning()
                     last_learning = now
             
-            # Relatório diário às 23:00
-            if now.hour == 23 and now.minute == 0:
+            # Relatório diário às 23:30 — pedido explícito do operador (30/06):
+            # fechamento do dia com aprovados/reprovados e green/red.
+            if now.hour == 23 and now.minute == 30:
                 if last_daily is None or last_daily.date() != now.date():
                     self._send_daily_report()
                     last_daily = now
@@ -3021,6 +3169,13 @@ class AuditSchedulerV2:
                 if last_weekly is None or (now - last_weekly).days >= 7:
                     self._send_weekly_report()
                     last_weekly = now
+
+            # Relatório quinzenal (30/06) — a cada 15 dias corridos, às 06:30,
+            # sem depender de dia da semana específico (diferente do semanal).
+            if now.hour == 6 and now.minute == 30:
+                if last_biweekly is None or (now - last_biweekly).days >= 15:
+                    self._send_biweekly_report()
+                    last_biweekly = now
             
             # Relatório mensal no dia 1 às 08:00
             if now.day == 1 and now.hour == 8 and now.minute == 0:
@@ -3070,6 +3225,15 @@ class AuditSchedulerV2:
             self.db.log_info("Relatório semanal V2 enviado")
         except Exception as e:
             self.db.log_error(f"Erro ao enviar relatório semanal V2: {e}")
+
+    def _send_biweekly_report(self):
+        try:
+            report, conclusions = self.reports.generate_biweekly_report_v2()
+            self.db.save_report('biweekly_v2', report)
+            self.telegram.send_report(report, conclusions, "📊 RELATÓRIO QUINZENAL V2")
+            self.db.log_info("Relatório quinzenal V2 enviado")
+        except Exception as e:
+            self.db.log_error(f"Erro ao enviar relatório quinzenal V2: {e}")
     
     def _send_monthly_report(self):
         try:
@@ -3232,6 +3396,52 @@ class AuditQueriesV2:
 # ============================================================================
 # FUNÇÃO PRINCIPAL
 # ============================================================================
+
+# ============================================================================
+# RESUMO DIÁRIO SOB DEMANDA (30/06) — usado pelo comando /status_auditor
+# ============================================================================
+
+def formatar_resumo_diario_auditor(manager: "AuditManagerV2") -> str:
+    """Monta a mensagem de status do auditor pra responder, a qualquer
+    momento do dia, "como está indo a auditoria hoje?". Pensado pra
+    acompanhamento de perto enquanto o CornerProProvider ainda é novo —
+    nenhuma decisão do ALFA depende deste comando, é só visibilidade."""
+    resumo = manager.db.get_resumo_hoje()
+
+    cornerpro = next((p for p in manager.providers if p.provider_name == "cornerpro"), None)
+    if cornerpro is None:
+        linha_cornerpro = "CornerPro: não está na cascata (provider_priority sem 'cornerpro')"
+    elif not cornerpro._sessao_configurada():
+        linha_cornerpro = "CornerPro: ⚠️ cookies não configurados (CORNERPRO_PHPSESSID/CORNERPRO_TOKEN vazios)"
+    elif cornerpro._circuito_aberto:
+        linha_cornerpro = "CornerPro: 🛑 PAUSADO (sessão provavelmente expirada — renovar cookies)"
+    elif cornerpro._falhas_auth_consecutivas > 0:
+        linha_cornerpro = f"CornerPro: 🟡 ativo, com {cornerpro._falhas_auth_consecutivas} falha(s) de autenticação recente(s)"
+    else:
+        linha_cornerpro = "CornerPro: ✅ ativo, sem falhas registradas"
+
+    pct_green = (
+        round(resumo["greens_hoje"] / (resumo["greens_hoje"] + resumo["reds_hoje"]) * 100, 1)
+        if (resumo["greens_hoje"] + resumo["reds_hoje"]) > 0 else None
+    )
+    linha_green = (
+        f"Green hoje: {resumo['greens_hoje']} | Red hoje: {resumo['reds_hoje']}"
+        + (f" ({pct_green}% green)" if pct_green is not None else "")
+    )
+
+    return (
+        "🧠 <b>STATUS DO AUDITOR — HOJE</b>\n\n"
+        f"Alertas registrados hoje: {resumo['registrados_hoje']}\n"
+        f"Já auditados (resultado confirmado): {resumo['auditados_hoje']}\n"
+        f"Aprovados hoje: {resumo['aprovados_hoje']} | Reprovados hoje: {resumo['reprovados_hoje']}\n"
+        f"{linha_green}\n\n"
+        f"Esperando resultado na fila: {resumo['pendentes_na_fila']}\n"
+        f"Com falha na fila: {resumo['falhados_na_fila']}\n\n"
+        f"{linha_cornerpro}\n\n"
+        "<i>Auditoria roda continuamente o dia todo (fila checada a cada 5 min) — "
+        "não é num horário fixo só. O relatório completo diário sai às 23:00.</i>"
+    )
+
 
 def main():
     """Função principal do sistema V2"""
