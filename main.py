@@ -292,11 +292,8 @@ V11_TZ_OFFSET_HORAS = int(os.getenv("V11_TZ_OFFSET_HORAS", "-4"))
 
 PARSER_CONFIANCA_CRITICA = int(os.getenv("PARSER_CONFIANCA_CRITICA", "2"))
 
-client = TelegramClient(
-    StringSession(SESSION_STRING),
-    API_ID,
-    API_HASH
-)
+# client é criado dentro de main() a cada reinício — ver comentário lá.
+client = None
 
 
 # =========================================================
@@ -5611,7 +5608,7 @@ def logar_versao_inicial() -> None:
 
 
 async def main() -> None:
-    global tarefa_envio, fila_envio
+    global tarefa_envio, fila_envio, client
 
     validar_env()
     logar_versao_inicial()
@@ -5619,19 +5616,15 @@ async def main() -> None:
     v17_carregar_estado()
     v29_carregar_cooldowns()
 
-    # CORRIGIDO (30/06) — bug crítico de crash loop:
-    # fila_envio era criada só uma vez, no import do módulo (linha ~306),
-    # presa ao primeiro event loop que existisse no processo. Mas o loop
-    # de retry (ver final do arquivo) chama asyncio.run(main()) de novo a
-    # cada reinício — e asyncio.run() SEMPRE cria um event loop novo. A
-    # fila antiga ficava "presa" ao loop morto da tentativa anterior, e
-    # na primeira vez que trabalhador_fila_envio tentava usá-la
-    # (await fila_envio.get()), o processo crashava de novo com
-    # "Queue is bound to a different event loop" — em menos de 1 segundo.
-    # Resultado real observado em produção: loop de reinício a cada ~5s,
-    # sem parar, depois do primeiro crash de qualquer natureza. Recriando
-    # a fila aqui, ela nasce sempre ligada ao loop atual e correto.
+    # CORRIGIDO (30/06) — causa raiz do crash loop:
+    # Tanto fila_envio quanto o TelegramClient são criados uma única vez
+    # fora de main(), presos ao primeiro event loop. Quando asyncio.run()
+    # reinicia após um crash, cria um event loop NOVO — e os dois objetos
+    # explodem imediatamente com "event loop must not change after
+    # connection" / "Queue bound to different event loop". Solução: recriar
+    # os dois aqui, dentro de main(), a cada chamada.
     fila_envio = asyncio.Queue(maxsize=200)
+    client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 
     tarefa_envio = asyncio.create_task(trabalhador_fila_envio())
     asyncio.create_task(watchdog())
