@@ -70,15 +70,43 @@ class Config:
     })
     
     # Ordem de prioridade dos providers
-    # CORRIGIDO (29/06): "cornerpro" removido de propósito. Regra do projeto
-    # ALFA: CornerPro nunca pode ser acessado por scraping automático além
-    # da integração via Telegram já existente — o ao vivo depende 100%
-    # dessa fonte, risco demais pra um ganho secundário de confirmação de
-    # resultado. Se um dia precisar reconsiderar, é decisão humana, não
-    # default de código.
+    # ATUALIZADO (30/06): CornerPro foi reintroduzido na cascata, agora com
+    # arquitetura própria de segurança — sessão via cookies (não scraping de
+    # login), espera obrigatória após o fim do jogo, intervalo mínimo entre
+    # requisições, e circuit-breaker que desliga o provider sozinho se a
+    # sessão expirar (ver CornerProProvider). É a fonte com cobertura mais
+    # próxima de 100% dos jogos que o ALFA realmente analisa, porque é a
+    # MESMA fonte que já alimenta o ao vivo. Fica em primeiro na prioridade;
+    # se falhar (ou estiver fora da janela de espera), a cascata cai pros
+    # providers seguintes normalmente, sem travar a auditoria do jogo.
     provider_priority: List[str] = field(default_factory=lambda: [
-        "api1", "api2", "api3", "sofascore", "flashscore"
+        "cornerpro", "api1", "api2", "api3", "sofascore", "flashscore"
     ])
+
+    # --- CornerPro: cookies de sessão (não é login automático) ---
+    # A sessão da CornerPro não expira por inatividade nem ao fechar a aba —
+    # só com logout manual. Por isso o auditor usa os cookies de uma sessão
+    # já autenticada pelo operador, em vez de tentar automatizar login.
+    cornerpro_phpsessid: str = os.getenv("CORNERPRO_PHPSESSID", "")
+    cornerpro_token: str = os.getenv("CORNERPRO_TOKEN", "")
+
+    # Nunca duas requisições à CornerPro ao mesmo tempo, e nunca em rajada —
+    # regra de segurança definida junto com o operador pra não arriscar a
+    # sessão que o AO VIVO também depende (mesma conta, fontes diferentes).
+    cornerpro_intervalo_minimo_segundos: int = int(os.getenv("CORNERPRO_INTERVALO_MINIMO_SEGUNDOS", "45"))
+
+    # Espera depois do fim do jogo antes de tentar buscar o resultado:
+    # (90 - minuto_do_alerta) + margem, em minutos.
+    cornerpro_margem_minutos: int = int(os.getenv("CORNERPRO_MARGEM_MINUTOS", "25"))
+
+    # Circuit-breaker: depois de N falhas de autenticação (401/403)
+    # CONSECUTIVAS, o provider para de tentar e avisa o canal — em vez de
+    # martelar uma sessão que claramente expirou.
+    cornerpro_max_falhas_auth_consecutivas: int = int(os.getenv("CORNERPRO_MAX_FALHAS_AUTH", "3"))
+
+    # Canal/chat pra avisos operacionais do CornerProProvider (níveis 2-4 de
+    # erro). Se vazio, cai no telegram_chat_id geral do auditor.
+    cornerpro_alert_chat_id: str = os.getenv("CORNERPRO_ALERT_CHAT_ID", "")
     
     # Limites
     queue_batch_size: int = 50
@@ -1203,8 +1231,317 @@ class FlashScoreProvider(BaseProvider):
         }
 
 
-# NOTA (29/06): CornerProProvider foi removido de propósito desta cascata.
-# Ver comentário em Config.provider_priority — risco demais pra esse projeto.
+# ============================================================================
+# CORNERPRO PROVIDER — adicionado em 30/06/2026
+#
+# Mesma fonte que já alimenta o AO VIVO via Telegram. A página de jogo da
+# CornerPro guarda, depois que a partida termina, um JSON completo dentro
+# de um bloco <script> Next.js (self.__next_f.push). Esta classe não faz
+# login automatizado — usa os cookies de uma sessão já autenticada pelo
+# operador (PHPSESSID + token), porque a sessão da CornerPro não expira
+# por inatividade, só com logout manual confirmado pelo operador.
+#
+# Quatro camadas de segurança, todas combinadas com o operador antes de
+# escrever este código:
+#   1. Espera obrigatória: (90 - minuto_do_alerta) + margem antes de tentar.
+#   2. Intervalo mínimo entre requisições (nunca em rajada, nunca paralelo).
+#   3. Sistema de 4 níveis de erro (ver _registrar_falha / _registrar_sucesso).
+#   4. Circuit-breaker: some auth falha demais, o provider se desliga sozinho
+#      até o operador renovar os cookies — nunca martela uma sessão morta.
+# ============================================================================
+
+class CornerProProvider(BaseProvider):
+    """Provider para a CornerPro (cornerprobet.com), via cookies de sessão."""
+
+    _ultima_requisicao_ts: float = 0.0  # compartilhado por todas as instâncias
+    _lock = threading.Lock()
+
+    def __init__(self):
+        self._provider_name = "cornerpro"
+        self._priority = (
+            config.provider_priority.index("cornerpro") + 1
+            if "cornerpro" in config.provider_priority else 99
+        )
+        self._telegram = None  # criado sob demanda, só quando precisa avisar
+        # Estado do circuit-breaker e dos níveis de erro por jogo. Em
+        # memória, mas o nível 2 (falha por jogo) também se apoia no
+        # contador 'attempts' que o AuditDatabaseV2 já mantém na fila —
+        # não depende só de memória pra não se perder num restart.
+        self._falhas_auth_consecutivas = 0
+        self._circuito_aberto = False
+        self._falhas_por_decisao: Dict[str, int] = {}
+
+    @property
+    def provider_name(self) -> str:
+        return self._provider_name
+
+    @property
+    def priority(self) -> int:
+        return self._priority
+
+    def _get_telegram(self) -> "AuditTelegramV2":
+        if self._telegram is None:
+            self._telegram = AuditTelegramV2()
+        return self._telegram
+
+    def _avisar_canal(self, mensagem: str) -> None:
+        try:
+            chat_id_original = config.telegram_chat_id
+            if config.cornerpro_alert_chat_id:
+                config.telegram_chat_id = config.cornerpro_alert_chat_id
+            self._get_telegram().send_message(mensagem, parse_mode="HTML")
+            config.telegram_chat_id = chat_id_original
+        except Exception:
+            pass  # aviso falhar nunca pode derrubar a auditoria em si
+
+    def _cookies(self) -> Dict[str, str]:
+        return {
+            "PHPSESSID": config.cornerpro_phpsessid,
+            "token": config.cornerpro_token,
+        }
+
+    def _sessao_configurada(self) -> bool:
+        return bool(config.cornerpro_phpsessid and config.cornerpro_token)
+
+    def _respeitar_intervalo_minimo(self) -> None:
+        """Nunca duas requisições à CornerPro em rajada — espera o tempo
+        que faltar desde a última requisição de QUALQUER instância."""
+        with CornerProProvider._lock:
+            agora = time.time()
+            decorrido = agora - CornerProProvider._ultima_requisicao_ts
+            faltante = config.cornerpro_intervalo_minimo_segundos - decorrido
+            if faltante > 0:
+                time.sleep(faltante)
+            CornerProProvider._ultima_requisicao_ts = time.time()
+
+    def _pronto_para_buscar(self, match: Dict[str, Any]) -> bool:
+        """(90 - minuto_do_alerta) + margem, contado a partir do momento em
+        que a decisão foi registrada na fila (proxy confiável do horário
+        real do alerta, já que o registro acontece poucos segundos depois)."""
+        try:
+            minuto = int(match.get("decision_minute") or 0)
+            criado_em_str = match.get("created_at") or match.get("queue_created_at")
+            if not criado_em_str:
+                return True  # sem como calcular, não bloqueia — deixa a
+                              # cascata seguir e o próprio jogo decidir
+            criado_em = datetime.fromisoformat(criado_em_str)
+            minutos_espera = max(0, 90 - minuto) + config.cornerpro_margem_minutos
+            pronto_em = criado_em + timedelta(minutes=minutos_espera)
+            return datetime.now() >= pronto_em
+        except Exception:
+            return True
+
+    @staticmethod
+    def _extrair_json_apos_chave(texto: str, chave: str) -> Optional[Any]:
+        """Acha '"chave":' no texto e extrai o bloco JSON balanceado que
+        vem depois (objeto {} ou array []), faz json.loads só desse trecho.
+        Resiliente ao formato React Server Components da Next.js, que não
+        é um JSON único — é vários fragmentos de texto escapado.
+        """
+        idx = texto.find(f'"{chave}":')
+        if idx == -1:
+            return None
+        pos = idx + len(f'"{chave}":')
+        while pos < len(texto) and texto[pos] in " \t\n":
+            pos += 1
+        if pos >= len(texto) or texto[pos] not in "{[":
+            return None
+        abre = texto[pos]
+        fecha = "}" if abre == "{" else "]"
+        profundidade = 0
+        fim = None
+        dentro_string = False
+        escapando = False
+        for i in range(pos, len(texto)):
+            c = texto[i]
+            if escapando:
+                escapando = False
+                continue
+            if c == "\\":
+                escapando = True
+                continue
+            if c == '"':
+                dentro_string = not dentro_string
+                continue
+            if dentro_string:
+                continue
+            if c == abre:
+                profundidade += 1
+            elif c == fecha:
+                profundidade -= 1
+                if profundidade == 0:
+                    fim = i + 1
+                    break
+        if fim is None:
+            return None
+        bloco = texto[pos:fim]
+        try:
+            return json.loads(bloco)
+        except Exception:
+            return None
+
+    def _extrair_resultado_da_pagina(self, html: str) -> Dict[str, Any]:
+        """Concatena os fragmentos self.__next_f.push([1,"...]) e procura o
+        objeto 'game' dentro do texto já desescapado. Devolve status + scores
+        se conseguir; nunca inventa valor — se não achar com segurança,
+        devolve erro de parse e a cascata segue pro próximo provider.
+        """
+        fragmentos = re.findall(r'self\.__next_f\.push\(\[1,\s*"((?:[^"\\]|\\.)*)"\]\)', html)
+        if not fragmentos:
+            return {"error": "parse_fail", "detalhe": "nenhum fragmento __next_f encontrado"}
+
+        texto_completo = ""
+        for frag in fragmentos:
+            try:
+                texto_completo += frag.encode("utf-8").decode("unicode_escape")
+            except Exception:
+                texto_completo += frag
+
+        game = self._extrair_json_apos_chave(texto_completo, "game")
+        if not isinstance(game, dict):
+            return {"error": "parse_fail", "detalhe": "bloco 'game' não encontrado/inválido"}
+
+        status = game.get("status")
+        scores = game.get("scores") or {}
+
+        def _par(valor) -> Tuple[Optional[int], Optional[int]]:
+            if isinstance(valor, (list, tuple)) and len(valor) >= 2:
+                try:
+                    return int(valor[0]), int(valor[1])
+                except Exception:
+                    return None, None
+            if isinstance(valor, dict):
+                try:
+                    return int(valor.get("home")), int(valor.get("away"))
+                except Exception:
+                    return None, None
+            return None, None
+
+        ft_home, ft_away = _par(scores.get("FT") or scores.get("ft"))
+        ht_home, ht_away = _par(scores.get("HT") or scores.get("ht"))
+
+        if status != 3 or ft_home is None:
+            # Jogo ainda não terminou (ou terminou e ainda não conseguimos
+            # ler o placar com segurança) — não é erro, é "ainda não dá".
+            return {"error": "not_finished", "status_bruto": status}
+
+        return {
+            "source": self.provider_name,
+            "ft_score_home": ft_home,
+            "ft_score_away": ft_away,
+            "ht_score_home": ht_home,
+            "ht_score_away": ht_away,
+            "status": "finished",
+        }
+
+    def get_match_result(self, match_id: str, fixture_id: str = None,
+                          match_context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        match_context = match_context or {}
+
+        if not self._sessao_configurada():
+            return {"error": "sem_sessao", "source": self.provider_name}
+
+        if self._circuito_aberto:
+            return {"error": "circuito_aberto", "source": self.provider_name}
+
+        if not self._pronto_para_buscar(match_context):
+            return {"error": "aguardando_fim_jogo", "source": self.provider_name}
+
+        url = match_id or match_context.get("cornerpro_url")
+        if not url:
+            return {"error": "sem_url", "source": self.provider_name}
+
+        self._respeitar_intervalo_minimo()
+
+        try:
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                              "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml",
+            }
+            response = requests.get(
+                url, headers=headers, cookies=self._cookies(),
+                timeout=config.request_timeout,
+            )
+
+            if response.status_code in (401, 403):
+                self._registrar_falha_auth(match_context.get("decision_id", ""))
+                return {"error": "auth", "source": self.provider_name, "status_code": response.status_code}
+
+            response.raise_for_status()
+            resultado = self._extrair_resultado_da_pagina(response.text)
+
+            if resultado.get("error"):
+                self._registrar_falha_nivel1(match_context.get("decision_id", ""), resultado.get("error"))
+                return resultado
+
+            self._registrar_sucesso()
+            return resultado
+
+        except requests.exceptions.RequestException as e:
+            self._registrar_falha_nivel1(match_context.get("decision_id", ""), str(e))
+            return {"error": "network", "source": self.provider_name, "detalhe": str(e)}
+
+    def find_match_by_teams(self, home_team: str, away_team: str, match_date: str) -> Optional[str]:
+        # Não se aplica — a CornerPro é acessada direto pela URL do alerta
+        # (já vem certa, sem ambiguidade de nome), nunca por busca.
+        return None
+
+    def get_match_statistics(self, match_id: str) -> Dict[str, Any]:
+        return {"error": "nao_implementado"}
+
+    # --- Sistema de 4 níveis de erro ---
+
+    def _registrar_sucesso(self) -> None:
+        self._falhas_auth_consecutivas = 0
+        self._falhas_por_decisao.clear()
+
+    def _registrar_falha_nivel1(self, decision_id: str, detalhe: str) -> None:
+        """Nível 1 — falha isolada (timeout, site fora do ar, parse falhou
+        numa execução). Não avisa nada; a fila tenta de novo no próprio
+        ciclo seguinte (5 minutos), e se na 2ª vez falhar de novo entra no
+        nível 2."""
+        if not decision_id:
+            return
+        contagem = self._falhas_por_decisao.get(decision_id, 0) + 1
+        self._falhas_por_decisao[decision_id] = contagem
+        if contagem >= 2:
+            self._avisar_canal(
+                f"⚠️ <b>Auditor CornerPro — jogo não auditado</b>\n"
+                f"Decisão: <code>{decision_id}</code>\n"
+                f"Motivo: {detalhe}\n"
+                f"Duas tentativas falharam. Marcado como não auditado por essa fonte "
+                f"— a cascata segue tentando as outras fontes normalmente."
+            )
+
+    def _registrar_falha_auth(self, decision_id: str) -> None:
+        """Nível 3/4 — falha de autenticação (401/403). Acumula falhas
+        CONSECUTIVAS (de qualquer jogo); ao atingir o limite, abre o
+        circuito (para de tentar) e avisa em linguagem simples como
+        renovar a sessão."""
+        self._falhas_auth_consecutivas += 1
+        limite = config.cornerpro_max_falhas_auth_consecutivas
+        if self._falhas_auth_consecutivas < limite:
+            return
+        if self._circuito_aberto:
+            return
+        self._circuito_aberto = True
+        self._avisar_canal(
+            "🛑 <b>Auditor CornerPro pausado — sessão provavelmente expirou</b>\n\n"
+            f"{self._falhas_auth_consecutivas} tentativas seguidas foram recusadas pela "
+            "CornerPro (erro de login/sessão).\n\n"
+            "<b>O que fazer:</b>\n"
+            "1. Abra o navegador e entre normalmente no site da CornerPro.\n"
+            "2. Abra as Ferramentas do Desenvolvedor (F12) → aba Application/Armazenamento → Cookies.\n"
+            "3. Copie os valores novos de <code>PHPSESSID</code> e <code>token</code>.\n"
+            "4. Atualize as variáveis <code>CORNERPRO_PHPSESSID</code> e <code>CORNERPRO_TOKEN</code> no Railway.\n"
+            "5. Reinicie o serviço do auditor.\n\n"
+            "A auditoria continua funcionando com as outras fontes (sem interrupção), "
+            "só esta fonte específica está pausada até a sessão ser renovada."
+        )
+
+
+# (Removida a nota de "CornerPro fora da cascata" — ver bloco acima.)
 
 
 # ============================================================================
@@ -1736,7 +2073,10 @@ class AuditManagerV2:
     def _init_providers(self):
         """Inicializa os providers na ordem de prioridade"""
         self.providers = []
-        
+
+        if 'cornerpro' in config.provider_priority:
+            self.providers.append(CornerProProvider())
+
         for name in ['api1', 'api2', 'api3']:
             if name in config.provider_priority:
                 self.providers.append(
@@ -1752,8 +2092,6 @@ class AuditManagerV2:
         
         if 'flashscore' in config.provider_priority:
             self.providers.append(FlashScoreProvider())
-        
-        # CornerPro removido de propósito — ver Config.provider_priority.
         
         self.providers.sort(key=lambda p: p.priority)
     
@@ -1844,15 +2182,42 @@ class AuditManagerV2:
         em cada provider; se não achar com segurança, pula esse provider
         e tenta o próximo, sem nunca arriscar confirmar resultado de jogo
         errado.
+
+        ATUALIZADO (30/06): a CornerPro é tratada como caso especial — não
+        precisa resolver nome (a URL já vem certa do próprio alerta, salva
+        dentro do snapshot bruto como 'cornerpro_url') e recebe um contexto
+        extra (minuto da decisão + horário de registro) pra calcular a
+        janela de espera antes de tentar buscar o resultado.
         """
         match_id = match.get('match_id')
         fixture_id = match.get('fixture_id')
         home_team = match.get('home_team', '')
         away_team = match.get('away_team', '')
         match_date = match.get('match_date', '')
-        
+
+        try:
+            snapshot_bruto = json.loads(match.get('snapshot_raw') or '{}')
+        except Exception:
+            snapshot_bruto = {}
+        cornerpro_url = snapshot_bruto.get('cornerpro_url') or ''
+
         for provider in self.providers:
             try:
+                if provider.provider_name == "cornerpro":
+                    if not cornerpro_url:
+                        continue  # sem link salvo no alerta original — pula pro próximo provider
+                    match_context = {
+                        "decision_id": match.get('decision_id', ''),
+                        "decision_minute": match.get('decision_minute'),
+                        "created_at": match.get('created_at'),
+                        "cornerpro_url": cornerpro_url,
+                    }
+                    result = provider.get_match_result(cornerpro_url, match_context=match_context)
+                    if result and result.get('ft_score_home') is not None:
+                        result['source'] = provider.provider_name
+                        return result
+                    continue  # 'aguardando_fim_jogo'/'auth'/'not_finished' etc. — cascata segue
+
                 id_resolvido = fixture_id or match_id
                 if not id_resolvido and home_team and away_team:
                     id_resolvido = provider.find_match_by_teams(home_team, away_team, match_date)
