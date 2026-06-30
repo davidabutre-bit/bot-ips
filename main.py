@@ -1,3 +1,4 @@
+
 # -*- coding: utf-8 -*-
 """
 COUTIPS / ALFA — SISTEMA AO VIVO (DC01.2)
@@ -3943,6 +3944,10 @@ def montar_snapshot_auditor_v2(m: Metricas, decisao_py: DecisaoPython, decisao_i
     return {
         "fixture_id": None,
         "match_id": None,
+        # Adicionado em 30/06 — link da CornerPro pro próprio jogo, que já
+        # chega em todo alerta. Sem isso, o CornerProProvider do Auditor V2
+        # não tem como saber qual URL buscar depois que o jogo termina.
+        "cornerpro_url": m.cornerpro or None,
         "league": m.liga,
         "country": None,
         "season": None,
