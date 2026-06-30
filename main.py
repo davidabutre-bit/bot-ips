@@ -1,22 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-COUTIPS / ALFA — DC01.2 COM SISTEMA PRÉ-LIVE V2 (REFATORADO)
-Base DC01.2 com todas as correções anteriores + Sistema Pré-Live V2
+COUTIPS / ALFA — SISTEMA AO VIVO (DC01.2)
 
-Mudanças no Sistema Pré-Live V2:
-1. Normalizador único (FeatureNormalizerPreLiveV2)
-2. Feature Builder (separação de dados e scoring)
-3. Market Engine por mercado (cada mercado com lógica própria)
-4. Feature Cache (performance)
-5. Lazy loading das abas (só carrega o necessário)
-6. H2H como feature real
-7. Sugestão de mercado específica (Over 8.5, etc.)
-8. Cruzamento favorito × zebra (dados incompletos)
-9. Separação de canais (Pre_cout + Cout_aud)
-10. IA contextual mais integrada
-11. Correção da extração de odds (múltiplos seletores + regex)
-12. Correção do carregamento de abas (requisições reais)
-13. Canais separados: múltiplas → Pre_cout | logs → Cout_aud
+Isolado do Pré-Live em 30/06/2026 — o motor pré-live (scraper TheoBorges,
+market engine, dataclasses) virou um processo próprio em prelive.py, com
+sessão Telegram própria (SESSION_STRING_PRELIVE). Esta separação foi feita
+depois do crash de 27/06/2026 (AuthKeyDuplicatedError), causado por uma
+falha do pré-live que derrubou o ao vivo por compartilharem o mesmo
+processo e a mesma sessão. A partir desta versão, isso não pode mais
+acontecer — cada um roda isolado, com seu próprio lock de instância única.
 
 Start command: python main.py
 """
@@ -124,10 +116,11 @@ AUDITORIA_CHAT_IDS = {
 }
 
 # =========================================================
-# CANAL DE AUDITORIA HTML (v13) — usado pelo ao vivo, não pelo pré-live
-# (pré-live agora é processo separado, ver prelive.py)
+# NOVOS CANAIS PRÉ-LIVE V2 (CRIADOS POR VOCÊ)
 # =========================================================
 
+# CANAL_LOGS_PRELIVE: nome legado, mas usado pelo AO VIVO como canal de
+# destino da auditoria HTML (v13) — não remover, não é exclusivo do pré-live.
 CANAL_LOGS_PRELIVE = os.getenv("CANAL_LOGS_PRELIVE", "")             # https://t.me/Cout_aud
 
 MODO_TESTE = os.getenv("MODO_TESTE", "false").lower() == "true"
@@ -428,6 +421,43 @@ def pegar_float_par(pattern: str, texto: str) -> Tuple[float, float]:
 
 def clamp(valor: float, minimo: int = 0, maximo: int = 100) -> int:
     return max(minimo, min(maximo, int(round(valor))))
+
+
+# Competições de seleção/torneio internacional — jogadas em campo neutro
+# (ou onde "casa" não significa o que significa no futebol de clube).
+# Usado pelo pré-live pra não aplicar o mercado "Vitória Casa/Fora" nesses
+# jogos, já que a vantagem de jogar em casa simplesmente não existe ali.
+_TORNEIOS_CAMPO_NEUTRO = (
+    "copa do mundo", "world cup", "mundial", "eliminatorias", "eliminatoria",
+    "qualifiers", "euro ", "eurocopa", "european championship",
+    "copa america", "copa américa", "nations league", "liga das nacoes",
+    "liga das nações", "gold cup", "copa africa", "copa áfrica", "afcon",
+    "africa cup of nations", "uefa nations", "concacaf", "asian cup",
+    "copa asiatica",
+)
+
+_TERMOS_AMISTOSO = ("amistoso", "friendly", "friendlies", "preseason", "pre-season")
+
+
+def eh_campo_neutro(liga: str) -> bool:
+    """True se a competição é de seleção/torneio internacional — onde o
+    conceito de "jogar em casa" não vale do jeito que vale em clube."""
+    if not liga:
+        return False
+    l = remover_acentos(liga).lower()
+    return any(remover_acentos(termo) in l for termo in _TORNEIOS_CAMPO_NEUTRO)
+
+
+def eh_amistoso(liga: str) -> bool:
+    """Item 13 (28/06): amistoso é categoria de atenção PRÓPRIA, separada
+    de campo neutro. Time reserva, sem pressão real de resultado — mas
+    amistoso de clube ainda tem casa/fora de verdade (não bloqueia
+    Vitória Casa/Fora como campo neutro faz), só reduz a confiança geral.
+    """
+    if not liga:
+        return False
+    l = remover_acentos(liga).lower()
+    return any(remover_acentos(termo) in l for termo in _TERMOS_AMISTOSO)
 
 
 def now_iso() -> str:
@@ -794,7 +824,6 @@ class Alerta:
 # MODELOS DE DADOS PRÉ-LIVE V2 (ADICIONADOS - MUDANÇA 8)
 # =========================================================
 
-@dataclass
 def chave_alerta_unica(texto: str) -> str:
     limpo = remover_acentos(texto)
     jogo = extrair_jogo(limpo)
@@ -1406,16 +1435,7 @@ async def watchdog() -> None:
         await asyncio.sleep(WATCHDOG_SEGUNDOS)
 
 
-# =========================================================
-# SCRAPER PRÉ-LIVE V2 (REFATORADO)
-# =========================================================
 
-
-# =========================================================
-# CONFIG TEOLOGIN (login do scraper pre-live)
-# =========================================================
-
-@dataclass
 def contem_volume_ft_bruto(texto: str) -> bool:
     raw = remover_acentos(texto or "").upper()
     primeiros = raw[:350].replace("_", " ")
@@ -5580,7 +5600,6 @@ def logar_versao_inicial() -> None:
     log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
 
-
 async def main() -> None:
     global tarefa_envio
 
@@ -5670,6 +5689,7 @@ async def main() -> None:
     log(f"📡 Canais ativos: principal={TARGET_CHANNEL} | confirmação={CONFIRMATION_CHANNEL}")
     log(f"📡 Auditoria HTML Pré-Live={CANAL_LOGS_PRELIVE or 'NÃO CONFIGURADO'}")
     log("📡 Comandos disponíveis: /auditoria")
+    log("ℹ️ Pré-live agora roda em processo separado (prelive.py) — use /prelive nele.")
 
     await client.run_until_disconnected()
 
