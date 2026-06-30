@@ -1,4 +1,3 @@
-
 # -*- coding: utf-8 -*-
 """
 COUTIPS / ALFA — SISTEMA AO VIVO (DC01.2)
@@ -5652,6 +5651,36 @@ async def main() -> None:
             resumo = gerar_resumo_resultados()
             await client.send_message("me", resumo)
 
+    @client.on(events.NewMessage(incoming=True))
+    async def handler_status_auditor(event):
+        texto = event.raw_text or ""
+        if texto.strip().lower() == "/status_auditor":
+            log("📩 /status_auditor RECEBIDO (INCOMING)")
+            if _auditor_v2_manager is None:
+                await client.send_message(event.chat_id, "⚠️ Auditor V2 não está ativo nesta instância.")
+                return
+            try:
+                status = auditor_v2.formatar_resumo_diario_auditor(_auditor_v2_manager)
+                await client.send_message(event.chat_id, status, parse_mode="html")
+            except Exception as e:
+                log(f"⚠️ /status_auditor erro | {type(e).__name__}: {e}")
+                await client.send_message(event.chat_id, f"⚠️ Erro ao montar status do auditor: {e}")
+
+    @client.on(events.NewMessage(from_users='me'))
+    async def handler_status_auditor_me(event):
+        texto = event.raw_text or ""
+        if texto.strip().lower() == "/status_auditor":
+            log("📩 /status_auditor RECEBIDO (CHAT PRIVADO)")
+            if _auditor_v2_manager is None:
+                await client.send_message("me", "⚠️ Auditor V2 não está ativo nesta instância.")
+                return
+            try:
+                status = auditor_v2.formatar_resumo_diario_auditor(_auditor_v2_manager)
+                await client.send_message("me", status, parse_mode="html")
+            except Exception as e:
+                log(f"⚠️ /status_auditor erro | {type(e).__name__}: {e}")
+                await client.send_message("me", f"⚠️ Erro ao montar status do auditor: {e}")
+
     global _auditor_v2_manager, _auditor_v2_scheduler
     if AUDITOR_V2_DISPONIVEL:
         try:
@@ -5693,7 +5722,7 @@ async def main() -> None:
     log(f"🤖 OpenAI {'ATIVA' if OPENAI_HABILITADO and OPENAI_API_KEY else 'DESATIVADA'} ({OPENAI_MODEL})")
     log(f"📡 Canais ativos: principal={TARGET_CHANNEL} | confirmação={CONFIRMATION_CHANNEL}")
     log(f"📡 Auditoria HTML Pré-Live={CANAL_LOGS_PRELIVE or 'NÃO CONFIGURADO'}")
-    log("📡 Comandos disponíveis: /auditoria")
+    log("📡 Comandos disponíveis: /auditoria | /resumo | /status_auditor")
     log("ℹ️ Pré-live agora roda em processo separado (prelive.py) — use /prelive nele.")
 
     await client.run_until_disconnected()
