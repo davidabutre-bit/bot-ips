@@ -78,6 +78,12 @@ logging.basicConfig(
 
 API_ID_RAW = os.getenv("API_ID", "").strip()
 API_HASH = os.getenv("API_HASH", "").strip()
+
+# Interruptor de emergência (30/06): liga/desliga o Auditor V2 sem precisar
+# subir código novo. Default TRUE (auditor ligado) — só desliga se alguém
+# colocar AUDITOR_ENABLED=false/0/no no Railway. Nunca afeta o ao vivo —
+# o auditor é só uma camada de inteligência por cima, opcional por desenho.
+AUDITOR_ENABLED = os.getenv("AUDITOR_ENABLED", "true").strip().lower() not in ("false", "0", "no")
 if not API_ID_RAW or not API_HASH:
     raise RuntimeError("API_ID ou API_HASH não configurado no Railway/.env.")
 try:
@@ -5682,7 +5688,11 @@ async def main() -> None:
                 await client.send_message("me", f"⚠️ Erro ao montar status do auditor: {e}")
 
     global _auditor_v2_manager, _auditor_v2_scheduler
-    if AUDITOR_V2_DISPONIVEL:
+    if not AUDITOR_ENABLED:
+        log("🔌 Auditor V2 DESLIGADO pela variável AUDITOR_ENABLED — bot ao vivo segue 100% normal sem ele.")
+        _auditor_v2_manager = None
+        _auditor_v2_scheduler = None
+    elif AUDITOR_V2_DISPONIVEL:
         try:
             _auditor_v2_manager = auditor_v2.AuditManagerV2()
             _auditor_v2_scheduler = auditor_v2.AuditSchedulerV2()
