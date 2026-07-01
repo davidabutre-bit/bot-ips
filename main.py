@@ -63,7 +63,7 @@ except Exception:  # pragma: no cover
 # VERSÃO / CONFIGURAÇÃO BASE
 # =========================================================
 
-VERSAO_COUTIPS = "ALFA_COUTIPS_2026_07_01_UNIFICADO_V014"
+VERSAO_COUTIPS = "ALFA_COUTIPS_2026_07_01_UNIFICADO_V015"
 
 load_dotenv()
 
@@ -1468,23 +1468,38 @@ class MultipleBuilderPreLiveV1:
         )
 
     def _montar_multipla_diamond(self, nome: str, ancoras: List[Dict], complementares: List[Dict]) -> Optional[MultiplePreLive]:
-        """Monta a múltipla DIAMOND com combinação diversificada."""
+        """Monta a múltipla DIAMOND com diversidade máxima de mercados.
+        Regra: nenhum tipo de mercado pode se repetir se houver alternativa disponível."""
         mercados = []
+        jogos_incluidos = set()
+        tipos_usados = set()
 
-        # Âncoras (mercado fixo)
+        def _escolher_mercado_diverso(jogo_dict):
+            todos = jogo_dict["todos_mercados"]
+            # Prefere mercado de tipo ainda não usado
+            for m in todos:
+                if m.nome not in tipos_usados:
+                    return m
+            # Se todos os tipos já foram usados, pega o melhor disponível
+            return todos[0]
+
         for a in ancoras:
-            mercados.append(a["melhor_mercado"])
+            chave = a["chave"]
+            if chave in jogos_incluidos:
+                continue
+            m = _escolher_mercado_diverso(a)
+            mercados.append(m)
+            jogos_incluidos.add(chave)
+            tipos_usados.add(m.nome)
 
-        # Complementares com diversificação
-        for i, c in enumerate(complementares):
-            todos = c["todos_mercados"]
-            # Alterna entre os mercados disponíveis
-            if len(todos) >= 3 and i % 3 == 0:
-                mercados.append(todos[2])
-            elif len(todos) >= 2 and i % 2 == 0:
-                mercados.append(todos[1])
-            else:
-                mercados.append(todos[0])
+        for c in complementares:
+            chave = c["chave"]
+            if chave in jogos_incluidos:
+                continue
+            m = _escolher_mercado_diverso(c)
+            mercados.append(m)
+            jogos_incluidos.add(chave)
+            tipos_usados.add(m.nome)
 
         if not mercados:
             return None
@@ -2422,6 +2437,11 @@ async def varrer_site_theoborges_prelive() -> None:
 
     log(f"✅ {len(multiplas)} múltiplas construídas")
 
+    # Envia o resumo dos top 4 mercados por jogo primeiro
+    resumo = formatar_resumo_mercados_prelive(resultado["jogos_aprovados"])
+    await client.send_message(CANAL_MULTIPLAS_PRELIVE or "me", resumo)
+    await asyncio.sleep(1)
+
     for multiple in multiplas:
         msg = formatar_multipla_prelive_v1(multiple)
         await client.send_message(CANAL_MULTIPLAS_PRELIVE or "me", msg)
@@ -2432,15 +2452,17 @@ async def varrer_site_theoborges_prelive() -> None:
 
 
 def formatar_multipla_prelive_v1(multiple: MultiplePreLive) -> str:
-    """Formata a mensagem da múltipla para envio."""
+    """Formata a mensagem da múltipla para envio.
+    Estrutura: cabeçalho → jogos com mercado escolhido → resumo top 4 por jogo."""
+    aviso_confianca = "\n⚠️ CONFIANÇA REDUZIDA — poucos jogos hoje" if multiple.confianca_baixa else ""
+
     linhas = [
-        f"📊 **{multiple.nome}**",
-        f"📈 Média: **{multiple.score_medio:.1f}%**",
-        f"📝 {multiple.descricao}",
-        f"🔹 {multiple.num_ancoras} Âncoras | {multiple.num_complementares} Complementares",
+        f"📊 {multiple.nome}",
+        f"📈 Média: {multiple.score_medio:.1f}%",
+        f"📝 {multiple.descricao}{aviso_confianca}",
         "",
         "---",
-        ""
+        "",
     ]
 
     for i, m in enumerate(multiple.mercados, 1):
@@ -2449,30 +2471,44 @@ def formatar_multipla_prelive_v1(multiple: MultiplePreLive) -> str:
         prefixo = "⚓" if is_ancora else "🔸"
 
         linhas.append(
-            f"{prefixo} {i}. **{m.jogo.time_casa} x {m.jogo.time_fora}**\n"
-            f"   🎯 {nome_mercado} | Score: {m.score:.1f}%"
+            f"{prefixo} {i}. {m.jogo.time_casa} x {m.jogo.time_fora}\n"
+            f"   🎯 {nome_mercado} | Score: {m.score:.0f}%"
         )
-
-        # Mostra componentes para os primeiros 5 jogos
-        if i <= 5:
-            detalhes = []
-            if m.matchup_ofensivo:
-                detalhes.append(f"Matchup: {m.matchup_ofensivo:.0f}%")
-            if m.dna_arce:
-                detalhes.append(f"ARCE: {m.dna_arce:.0f}%")
-            if m.dna_chama:
-                detalhes.append(f"CHAMA: {m.dna_chama:.0f}%")
-            if detalhes:
-                linhas.append(f"   📊 " + " | ".join(detalhes))
 
     linhas.extend([
         "",
         "---",
         f"✅ Total: {len(multiple.mercados)} jogos",
-        f"🏆 Liga: {multiple.mercados[0].jogo.liga if multiple.mercados else 'N/A'}",
         "",
         "📝 SIGA SUA GESTÃO DE BANCA",
         "⛔ APOSTE COM RESPONSABILIDADE",
+    ])
+
+    return "\n".join(linhas)
+
+
+def formatar_resumo_mercados_prelive(jogos_aprovados: List[Dict]) -> str:
+    """Formata o resumo dos top 4 mercados por jogo — enviado uma vez
+    após todas as múltiplas, para o operador ver o que cada jogo oferece."""
+    linhas = ["📋 MERCADOS POR JOGO (TOP 4)", ""]
+
+    for jogo_dict in jogos_aprovados:
+        mercados = jogo_dict["todos_mercados"]
+        if not mercados:
+            continue
+        jogo = mercados[0].jogo
+        linhas.append(f"🏟️ {jogo.time_casa} x {jogo.time_fora}")
+
+        medalhas = ["🥇", "🥈", "🥉", "4️⃣"]
+        for idx, m in enumerate(mercados[:4]):
+            nome = m.nome.replace("_", " ")
+            medal = medalhas[idx] if idx < len(medalhas) else f"{idx+1}."
+            linhas.append(f"   {medal} {nome} ... {m.score:.0f}%")
+
+        linhas.append("")
+
+    linhas.extend([
+        f"📊 TOTAL: {len(jogos_aprovados)} jogos | {sum(len(j['todos_mercados'][:4]) for j in jogos_aprovados)} mercados analisados"
     ])
 
     return "\n".join(linhas)
