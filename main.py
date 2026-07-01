@@ -63,7 +63,7 @@ except Exception:  # pragma: no cover
 # VERSÃO / CONFIGURAÇÃO BASE
 # =========================================================
 
-VERSAO_COUTIPS = "ALFA_COUTIPS_2026_07_01_UNIFICADO_V011"
+VERSAO_COUTIPS = "ALFA_COUTIPS_2026_07_01_UNIFICADO_V014"
 
 load_dotenv()
 
@@ -1008,146 +1008,126 @@ class PreLiveScorer:
         }
 
     def _calcular_matchup_ofensivo(self, casa: EstatisticasTimePreLive, fora: EstatisticasTimePreLive) -> float:
-        """Calcula o matchup ofensivo: Ataque Casa × Defesa Fora."""
-        # Força ofensiva da casa
-        forca_casa = (
-            (casa.gols_marcados or 0) * 2.5 +
-            (casa.xg or 0) * 2.0 +
-            (casa.finalizacoes or 0) * 0.3 +
-            (casa.over_25_ft or 0) * 1.5 +
-            (casa.btts or 0) * 1.0 +
-            (casa.marcou_primeiro or 0) * 0.8
-        )
+        """Calcula o matchup ofensivo: Ataque Casa × Defesa Fora.
+        CORRIGIDO (01/07): os valores chegam do scraper como percentuais 0.0-1.0.
+        Convertemos para 0-100 antes de ponderar."""
+        # Força ofensiva da casa (0-100 cada componente)
+        gols_c   = min(100, (casa.gols_marcados or 0) * 40)   # 2.5 gols/jogo → 100
+        xg_c     = min(100, (casa.xg or 0) * 40)
+        over25_c = (casa.over_25_ft or 0) * 100
+        btts_c   = (casa.btts or 0) * 100
+        forca_casa = (gols_c * 0.30 + xg_c * 0.25 + over25_c * 0.30 + btts_c * 0.15)
 
-        # Fragilidade defensiva do fora
-        fragilidade_fora = (
-            (fora.gols_sofridos or 0) * 2.5 +
-            (fora.xga or 0) * 2.0 +
-            (fora.finalizacoes_sofridas or 0) * 0.3 +
-            (1 - (fora.nao_sofreu or 0)) * 1.5
-        )
+        # Fragilidade defensiva do fora (0-100)
+        gols_s_f  = min(100, (fora.gols_sofridos or 0) * 40)
+        xga_f     = min(100, (fora.xga or 0) * 40)
+        sem_ns_f  = (1.0 - (fora.nao_sofreu or 0)) * 100
+        fragilidade_fora = (gols_s_f * 0.35 + xga_f * 0.30 + sem_ns_f * 0.35)
 
         matchup = (forca_casa * 0.6) + (fragilidade_fora * 0.4)
         return clamp(matchup, 0, 100)
 
     def _calcular_matchup_defensivo(self, casa: EstatisticasTimePreLive, fora: EstatisticasTimePreLive) -> float:
         """Calcula o matchup defensivo: Defesa Casa × Ataque Fora."""
-        # Força defensiva da casa
-        forca_defesa_casa = (
-            (100 - (casa.gols_sofridos or 0) * 15) +
-            (100 - (casa.xga or 0) * 20) +
-            (casa.nao_sofreu or 0) * 20
-        ) / 3
+        # Solidez defensiva da casa (quanto menos sofre, maior)
+        ns_c      = (casa.nao_sofreu or 0) * 100
+        gols_s_c  = max(0, 100 - min(100, (casa.gols_sofridos or 0) * 40))
+        xga_c     = max(0, 100 - min(100, (casa.xga or 0) * 40))
+        solidez   = (ns_c * 0.40 + gols_s_c * 0.35 + xga_c * 0.25)
 
         # Força ofensiva do fora
-        forca_fora = (
-            (fora.gols_marcados or 0) * 2.5 +
-            (fora.xg or 0) * 2.0 +
-            (fora.finalizacoes or 0) * 0.3
-        )
+        gols_f  = min(100, (fora.gols_marcados or 0) * 40)
+        xg_f    = min(100, (fora.xg or 0) * 40)
+        over_f  = (fora.over_25_ft or 0) * 100
+        ataque_fora = (gols_f * 0.40 + xg_f * 0.30 + over_f * 0.30)
 
-        matchup = forca_defesa_casa - (forca_fora * 0.5)
+        matchup = solidez - (ataque_fora * 0.4)
         return clamp(matchup, 0, 100)
 
     def _calcular_dna_arce(self, casa: EstatisticasTimePreLive, fora: EstatisticasTimePreLive) -> float:
         """Calcula o DNA ARCE (comportamento de 1º tempo)."""
-        # DNA ARCE da casa
-        dna_casa = (
-            (casa.over_05_ht or 0) * 1.5 +
-            (casa.gols_ht or 0) * 3.0 +
-            (casa.marcou_primeiro or 0) * 1.5 +
-            (casa.nao_sofreu or 0) * 1.0 +
-            (casa.over_05_ht_casa or 0) * 0.5
-        )
+        over_ht_c = (casa.over_05_ht or 0) * 100
+        mp_c      = (casa.marcou_primeiro or 0) * 100
+        ns_c      = (casa.nao_sofreu or 0) * 100
+        dna_casa  = (over_ht_c * 0.45 + mp_c * 0.35 + ns_c * 0.20)
 
-        # DNA ARCE do fora
-        dna_fora = (
-            (fora.over_05_ht or 0) * 1.5 +
-            (fora.gols_ht or 0) * 3.0 +
-            (fora.marcou_primeiro or 0) * 1.5 +
-            (fora.nao_sofreu or 0) * 1.0 +
-            (fora.over_05_ht_fora or 0) * 0.5
-        )
+        over_ht_f = (fora.over_05_ht or 0) * 100
+        mp_f      = (fora.marcou_primeiro or 0) * 100
+        ns_f      = (fora.nao_sofreu or 0) * 100
+        dna_fora  = (over_ht_f * 0.45 + mp_f * 0.35 + ns_f * 0.20)
 
-        dna_total = (dna_casa * 0.6) + (dna_fora * 0.4)
-        return clamp(dna_total, 0, 100)
+        return clamp(dna_casa * 0.55 + dna_fora * 0.45, 0, 100)
 
     def _calcular_dna_chama(self, casa: EstatisticasTimePreLive, fora: EstatisticasTimePreLive) -> float:
         """Calcula o DNA CHAMA (comportamento de 2º tempo)."""
-        # DNA CHAMA da casa
-        dna_casa = (
-            (casa.over_15_ft or 0) * 1.2 +
-            (casa.over_25_ft or 0) * 1.5 +
-            (casa.gols_ft or 0) * 2.5 +
-            (casa.btts or 0) * 1.2 +
-            (casa.over_15_ft_casa or 0) * 0.5
-        )
+        o15_c  = (casa.over_15_ft or 0) * 100
+        o25_c  = (casa.over_25_ft or 0) * 100
+        btts_c = (casa.btts or 0) * 100
+        dna_casa = (o15_c * 0.30 + o25_c * 0.40 + btts_c * 0.30)
 
-        # DNA CHAMA do fora
-        dna_fora = (
-            (fora.over_15_ft or 0) * 1.2 +
-            (fora.over_25_ft or 0) * 1.5 +
-            (fora.gols_ft or 0) * 2.5 +
-            (fora.btts or 0) * 1.2 +
-            (fora.over_15_ft_fora or 0) * 0.5
-        )
+        o15_f  = (fora.over_15_ft or 0) * 100
+        o25_f  = (fora.over_25_ft or 0) * 100
+        btts_f = (fora.btts or 0) * 100
+        dna_fora = (o15_f * 0.30 + o25_f * 0.40 + btts_f * 0.30)
 
-        dna_total = (dna_casa * 0.5) + (dna_fora * 0.5)
-        return clamp(dna_total, 0, 100)
+        return clamp(dna_casa * 0.50 + dna_fora * 0.50, 0, 100)
 
     def _calcular_consistencia(self, casa: EstatisticasTimePreLive, fora: EstatisticasTimePreLive) -> float:
         """Calcula a consistência do jogo."""
         forma_casa = min(100, (casa.forma or 0) * 10) if casa.forma else 50
         forma_fora = min(100, (fora.forma or 0) * 10) if fora.forma else 50
 
-        # Baixa variabilidade (quanto menor a diferença entre gols marcados e sofridos, mais consistente)
-        variabilidade_casa = abs((casa.gols_marcados or 0) - (casa.gols_sofridos or 0))
-        variabilidade_fora = abs((fora.gols_marcados or 0) - (fora.gols_sofridos or 0))
-        baixa_var = max(0, 100 - (variabilidade_casa + variabilidade_fora) * 10)
+        # Equilíbrio gols: times com razão equilibrada são mais previsíveis
+        gm_c = (casa.gols_marcados or 0)
+        gs_c = (casa.gols_sofridos or 0)
+        gm_f = (fora.gols_marcados or 0)
+        gs_f = (fora.gols_sofridos or 0)
+        var_c = abs(gm_c - gs_c)
+        var_f = abs(gm_f - gs_f)
+        # Quanto mais equilibrado, mais previsível → score mais alto
+        baixa_var = max(0, 100 - (var_c + var_f) * 15)
 
-        consistencia = (forma_casa * 0.3) + (forma_fora * 0.3) + (baixa_var * 0.4)
-        return clamp(consistencia, 0, 100)
+        return clamp(forma_casa * 0.30 + forma_fora * 0.30 + baixa_var * 0.40, 0, 100)
 
     def _calcular_contexto(self, jogo: JogoPreLive) -> float:
         """Calcula o contexto do jogo (liga, posição, odds)."""
         liga = jogo.liga.lower()
 
-        # Liga Reliability
         if any(x in liga for x in ["premier", "championship", "bundesliga", "serie a", "la liga"]):
             liga_score = 95
         elif any(x in liga for x in ["brasileirão", "brazil", "argentina", "netherlands", "portugal"]):
             liga_score = 85
-        elif any(x in liga for x in ["turkey", "greece", "denmark", "sweden", "norway"]):
+        elif any(x in liga for x in ["turkey", "greece", "denmark", "sweden", "norway", "copa chile", "copa paraguay", "serie b", "usl", "canadian"]):
             liga_score = 75
         else:
-            liga_score = 70
+            liga_score = 65
 
-        # Posição (usando dados da tabela)
-        pos_casa = jogo.estatisticas_casa.posicao or 10
-        pos_fora = jogo.estatisticas_fora.posicao or 10
-        pos_diff = abs(pos_casa - pos_fora)
+        pos_casa  = jogo.estatisticas_casa.posicao or 10
+        pos_fora  = jogo.estatisticas_fora.posicao or 10
+        pos_diff  = abs(pos_casa - pos_fora)
         pos_score = min(100, 50 + pos_diff * 3)
-
-        # Mando de campo
         mando_score = 70 if pos_casa < pos_fora else 50
 
-        # Odds do favorito
-        odd_fav = jogo.odd_favorito or 2.0
-        if odd_fav <= 1.55:
+        odd_fav = jogo.odd_favorito or 0.0
+        if odd_fav <= 0:
+            odd_score = 60   # sem odd disponível — valor neutro, não penaliza
+        elif odd_fav <= 1.40:
+            odd_score = 95
+        elif odd_fav <= 1.55:
             odd_score = 90
         elif odd_fav <= 1.85:
             odd_score = 80
         elif odd_fav <= 2.20:
             odd_score = 70
         else:
-            odd_score = 50
+            odd_score = 55
 
         contexto = (
-            liga_score * 0.35 +
-            pos_score * 0.20 +
-            mando_score * 0.15 +
-            odd_score * 0.15 +
-            jogo.estatisticas_casa.team_reliability * 0.15
+            liga_score   * 0.30 +
+            pos_score    * 0.15 +
+            mando_score  * 0.10 +
+            odd_score    * 0.25 +
+            jogo.estatisticas_casa.team_reliability * 0.20
         )
         return clamp(contexto, 0, 100)
 
@@ -1349,14 +1329,10 @@ class CandidateSelectorPreLiveV1:
         for chave, mercados in melhores_por_jogo.items():
             ordenados = sorted(mercados, key=lambda x: x.score, reverse=True)
             melhores_4_por_jogo[chave] = ordenados[:4]
-
-            # Verifica dominância (melhor mercado deve ter vantagem mínima)
-            if len(ordenados) >= 2:
-                melhor = ordenados[0].score
-                segundo = ordenados[1].score
-                if melhor - segundo < PRELIVE_DOMINANCIA_MINIMA:
-                    # Se não houver dominância, mantém apenas os mercados com score >= 85
-                    melhores_4_por_jogo[chave] = [m for m in ordenados if m.score >= 85][:4]
+            # Nota: filtro de dominância removido (01/07) — ele descartava jogos
+            # válidos que tinham scores próximos entre os melhores mercados,
+            # exigindo score >= 85 quando o corte é 60. Isso impedia a aprovação
+            # de qualquer jogo que não fosse excepcional.
 
         # Filtra jogos com pelo menos um mercado aprovado
         jogos_aprovados = []
@@ -1412,27 +1388,20 @@ class MultipleBuilderPreLiveV1:
             )
             return [safe_reduzida]
 
-        # Define quantidade de âncoras e complementares
-        if total >= 8:
-            num_ancoras = 4
-            num_complementares = 4
-        elif total == 7:
-            num_ancoras = 4
-            num_complementares = 3
-        elif total == 6:
-            num_ancoras = 3
-            num_complementares = 3
-        else:  # 5 jogos
-            num_ancoras = 2
-            num_complementares = 3
+        # Sem mínimo de jogos (01/07): qualquer quantidade acima do piso
+        # absoluto vai para a múltipla. O sistema ordena por score — os
+        # melhores entram primeiro. Máximo de 10 jogos por múltipla.
+        # Complementares proporcionais: max_comp = total_jogos // 2.
+        jogos_ordenados = sorted(jogos_aprovados, key=lambda x: x["score"], reverse=True)
+        total_limitado = min(total, 10)
+        jogos_na_multipla = jogos_ordenados[:total_limitado]
 
-        ancoras = jogos_aprovados[:num_ancoras]
-        complementares = jogos_aprovados[num_ancoras:num_ancoras + num_complementares]
+        # Metade são âncoras (os melhores), metade são complementares
+        num_ancoras = max(1, total_limitado - (total_limitado // 2))
+        num_complementares = total_limitado // 2
 
-        # Se não houver complementares suficientes, ajusta
-        if len(complementares) < 1:
-            log(f"⚠️ Não há complementares suficientes. Apenas {len(ancoras)} âncoras.")
-            return []
+        ancoras = jogos_na_multipla[:num_ancoras]
+        complementares = jogos_na_multipla[num_ancoras:]
 
         multiplas = []
 
@@ -1441,19 +1410,19 @@ class MultipleBuilderPreLiveV1:
         if safe:
             multiplas.append(safe)
 
-        # PRO1: âncoras + segundo melhor mercado (se disponível)
+        # PRO1: âncoras + segundo melhor mercado dos complementares
         pro1 = self._montar_multipla("PRO1", ancoras, complementares, 1)
-        if pro1 and len(pro1.mercados) >= PRELIVE_QTD_MINIMA_JOGOS:
+        if pro1:
             multiplas.append(pro1)
 
-        # PRO2: âncoras + terceiro melhor mercado (se disponível)
+        # PRO2: âncoras + terceiro melhor mercado dos complementares
         pro2 = self._montar_multipla("PRO2", ancoras, complementares, 2)
-        if pro2 and len(pro2.mercados) >= PRELIVE_QTD_MINIMA_JOGOS:
+        if pro2:
             multiplas.append(pro2)
 
-        # DIAMOND: âncoras + combinação diversificada
+        # DIAMOND: combinação diversificada
         diamond = self._montar_multipla_diamond("DIAMOND", ancoras, complementares)
-        if diamond and len(diamond.mercados) >= PRELIVE_QTD_MINIMA_JOGOS:
+        if diamond:
             multiplas.append(diamond)
 
         return multiplas
@@ -1484,7 +1453,7 @@ class MultipleBuilderPreLiveV1:
                 mercados.append(todos[0])  # fallback para o melhor
             jogos_incluidos.add(chave)
 
-        if len(mercados) < PRELIVE_QTD_MINIMA_JOGOS:
+        if not mercados:
             return None
 
         score_medio = sum(m.score for m in mercados) / len(mercados)
@@ -1517,7 +1486,7 @@ class MultipleBuilderPreLiveV1:
             else:
                 mercados.append(todos[0])
 
-        if len(mercados) < PRELIVE_QTD_MINIMA_JOGOS:
+        if not mercados:
             return None
 
         score_medio = sum(m.score for m in mercados) / len(mercados)
@@ -2434,11 +2403,11 @@ async def varrer_site_theoborges_prelive() -> None:
 
     log(f"📊 {resultado['total_aprovados']} jogos aprovados (Score ≥ {PRELIVE_SCORE_MINIMO})")
 
-    if resultado['total_aprovados'] < PRELIVE_QTD_MINIMA_JOGOS:
-        log(f"❌ Menos de {PRELIVE_QTD_MINIMA_JOGOS} jogos aprovados")
+    if resultado['total_aprovados'] < PRELIVE_QTD_MINIMA_ABSOLUTA:
+        log(f"❌ Menos de {PRELIVE_QTD_MINIMA_ABSOLUTA} jogos aprovados (piso absoluto)")
         await client.send_message(
-            "me",
-            f"❌ Apenas {resultado['total_aprovados']} jogos aprovados. Mínimo: {PRELIVE_QTD_MINIMA_JOGOS}."
+            CANAL_MULTIPLAS_PRELIVE or "me",
+            f"❌ Apenas {resultado['total_aprovados']} jogos aprovados. Mínimo absoluto: {PRELIVE_QTD_MINIMA_ABSOLUTA}."
         )
         return
 
