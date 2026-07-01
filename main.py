@@ -1461,18 +1461,28 @@ class MultipleBuilderPreLiveV1:
     def _montar_multipla(self, nome: str, ancoras: List[Dict], complementares: List[Dict], idx: int) -> Optional[MultiplePreLive]:
         """Monta uma múltipla com âncoras fixas e complementares no índice especificado."""
         mercados = []
+        jogos_incluidos = set()  # PRECAUÇÃO 9 (01/07): evita jogo duplicado
 
         # Âncoras (mercado fixo = o melhor de cada âncora)
         for a in ancoras:
-            mercados.append(a["melhor_mercado"])
+            chave = a["chave"]
+            if chave not in jogos_incluidos:
+                mercados.append(a["melhor_mercado"])
+                jogos_incluidos.add(chave)
 
         # Complementares (mercado no índice especificado, ou o melhor se não houver)
         for c in complementares:
+            chave = c["chave"]
+            # PRECAUÇÃO 9: pula complementar se o jogo já está como âncora
+            if chave in jogos_incluidos:
+                log(f"⚠️ Pré-live: jogo '{chave}' já é âncora — complementar ignorado")
+                continue
             todos = c["todos_mercados"]
             if idx < len(todos):
                 mercados.append(todos[idx])
             else:
                 mercados.append(todos[0])  # fallback para o melhor
+            jogos_incluidos.add(chave)
 
         if len(mercados) < PRELIVE_QTD_MINIMA_JOGOS:
             return None
@@ -2222,11 +2232,25 @@ class TeoBorgesScraperPreLive:
         return odds
 
     def _parse_valor(self, valor: str) -> float:
-        """Converte string para float, tratando porcentagens."""
-        valor = valor.strip().replace(",", ".").replace("%", "").replace("'", "")
+        """Converte string para float — blindado contra NaN, None, inf e strings vazias.
+        PRECAUÇÃO 1 (01/07): score zerado acontecia quando qualquer valor None ou
+        string inesperada chegava do HTML e passava silenciosamente como 0.0 — o
+        zero se propagava pelo motor de score e zerrava a múltipla inteira.
+        Agora qualquer valor inválido é explicitamente capturado e retorna 0.0 com
+        consistência, sem propagar NaN nem inf que quebrariam os cálculos downstream.
+        """
+        if valor is None:
+            return 0.0
         try:
-            return float(valor)
-        except:
+            v = str(valor).strip().replace(",", ".").replace("%", "").replace("'", "")
+            if not v:
+                return 0.0
+            resultado = float(v)
+            # Bloqueia NaN e inf — ambos quebrariam os cálculos de score
+            if resultado != resultado or abs(resultado) == float('inf'):
+                return 0.0
+            return resultado
+        except Exception:
             return 0.0
 
     async def close(self):
@@ -2244,9 +2268,20 @@ async def varrer_site_theoborges_prelive() -> None:
 
     scraper = TeoBorgesScraperPreLive()
 
-    if not await scraper.login():
-        log("❌ Falha no login. Encerrando.")
-        await client.send_message(CANAL_MULTIPLAS_PRELIVE or "me", "❌ Falha no login no clube.theoborges.com. Verifique TEOLOGIN_EMAIL e TEOLOGIN_SENHA.")
+    # PRECAUÇÃO 2 (01/07): retry de login — login pode falhar por instabilidade
+    # temporária do site, CSRF token ausente ou sessão expirada. Tenta até 3
+    # vezes com 10s de espera entre tentativas antes de desistir e avisar.
+    login_ok = False
+    for tentativa_login in range(1, 4):
+        login_ok = await scraper.login()
+        if login_ok:
+            break
+        log(f"⚠️ Login falhou (tentativa {tentativa_login}/3). Aguardando 10s...")
+        await asyncio.sleep(10)
+
+    if not login_ok:
+        log("❌ Falha no login após 3 tentativas. Encerrando.")
+        await client.send_message(CANAL_MULTIPLAS_PRELIVE or "me", "❌ Falha no login no clube.theoborges.com após 3 tentativas. Verifique TEOLOGIN_EMAIL e TEOLOGIN_SENHA.")
         return
 
     todos_links = []
@@ -5879,6 +5914,20 @@ async def send_resiliente(canal: str, mensagem: str, parse_mode: Optional[str] =
             await asyncio.sleep(2)
             await client.connect()
         except Exception as e:
+            erro_str = str(e).lower()
+            # PRECAUÇÃO 8 (01/07): canal inválido ou bot sem permissão —
+            # "forbidden", "chat not found", "peer not found" indicam que o
+            # canal configurado não existe ou o bot não tem acesso. Em vez de
+            # tentar 3 vezes e descartar silenciosamente, manda para "me"
+            # (chat privado do operador) para o alerta não se perder, e loga
+            # o canal problemático para correção.
+            if any(x in erro_str for x in ["forbidden", "chat not found", "peer not found", "not found"]):
+                log(f"❌ Canal '{canal}' inválido ou sem permissão — redirecionando para 'me'")
+                try:
+                    await client.send_message("me", f"⚠️ Canal '{canal}' inválido. Mensagem redirecionada:\n\n{mensagem[:500]}")
+                except Exception:
+                    pass
+                return False
             log(f"⚠️ Erro tent={tentativa}/{max_tentativas} | {type(e).__name__}: {e}")
             await asyncio.sleep(2 ** tentativa)
     log(f"❌ ALERTA NÃO ENVIADO | canal={canal}")
@@ -5891,7 +5940,17 @@ async def trabalhador_fila_envio() -> None:
         item = await fila_envio.get()
         try:
             canal, mensagem, parse_mode = item
-            await send_resiliente(canal, mensagem, parse_mode=parse_mode)
+            # PRECAUÇÃO 6 (01/07): timeout de 30s no envio — se o Telegram
+            # estiver lento ou com flood limit, o trabalhador não trava
+            # indefinidamente bloqueando todos os alertas seguintes na fila.
+            # Se o timeout estourar, o item é descartado e a fila segue.
+            try:
+                await asyncio.wait_for(
+                    send_resiliente(canal, mensagem, parse_mode=parse_mode),
+                    timeout=30.0
+                )
+            except asyncio.TimeoutError:
+                log(f"⚠️ Timeout de 30s no envio para {canal} — item descartado, fila segue")
             await asyncio.sleep(INTERVALO_ENVIO_SEGUNDOS)
         except Exception as e:
             log(f"❌ Erro trabalhador_fila_envio: {type(e).__name__}: {e}")
@@ -7366,6 +7425,9 @@ async def agendador_prelive() -> None:
     except Exception:
         hora, minuto = 8, 0
     log(f"🕐 Agendador pré-live iniciado — envio diário às {hora:02d}:{minuto:02d}")
+
+    ultimo_disparo: Optional[str] = None  # guarda a data do último envio
+
     while True:
         try:
             agora = datetime.now()
@@ -7375,6 +7437,19 @@ async def agendador_prelive() -> None:
             espera = (proximo - agora).total_seconds()
             log(f"🕐 Próximo envio pré-live em {int(espera // 3600)}h{int((espera % 3600) // 60)}m")
             await asyncio.sleep(espera)
+
+            # PRECAUÇÃO 7 (01/07): janela de tolerância — se o processo
+            # reiniciar perto do horário agendado, o agendador calcula espera
+            # quase zero e dispara imediatamente. Com esta verificação, se já
+            # rodou hoje, espera até amanhã — nunca dispara duas vezes no mesmo
+            # dia independente de quantos redeployments acontecerem.
+            hoje = datetime.now().strftime("%Y-%m-%d")
+            if ultimo_disparo == hoje:
+                log("🕐 Pré-live já rodou hoje — aguardando amanhã")
+                await asyncio.sleep(3600)  # dorme 1h e recalcula
+                continue
+
+            ultimo_disparo = hoje
             await varrer_site_theoborges_prelive_v2()
         except asyncio.CancelledError:
             break
