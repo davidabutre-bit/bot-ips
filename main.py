@@ -63,7 +63,7 @@ except Exception:  # pragma: no cover
 # VERSÃO / CONFIGURAÇÃO BASE
 # =========================================================
 
-VERSAO_COUTIPS = "ALFA_COUTIPS_2026_07_01_UNIFICADO_V015"
+VERSAO_COUTIPS = "ALFA_COUTIPS_2026_07_02_V016"
 
 load_dotenv()
 
@@ -2737,6 +2737,15 @@ async def _aplicar_filtros_v29(m: Metricas, chave: str, chave_jogo_base: str) ->
             return True
 
     if m.estrategia == "CHAMA_FT":
+        # T-C3: trava de dominância mínima — CHAMA não pode aprovar com U5/U10 empatados
+        lado_c3 = m.lado_pressionante
+        if lado_c3 in {"CASA", "FORA"}:
+            d_c3 = dados_lado(m, lado_c3)
+            od_c3 = dados_lado(m, "FORA" if lado_c3 == "CASA" else "CASA")
+            u5_dom = d_c3["u5"] > od_c3["u5"]
+            u10_dom = d_c3["u10"] >= od_c3["u10"] + 2
+            if not (u5_dom or u10_dom):
+                return False, 80, f"CHAMA_FT_SEM_DOMINANCIA | U5={d_c3['u5']}x{od_c3['u5']} U10={d_c3['u10']}x{od_c3['u10']}", {}
         bloqueio_dec, motivo_dec = v29_trava_decaimento_pressao_2p(m)
         if bloqueio_dec:
             m.fluxo_decisao = "V29_TRAVA_DECAIMENTO_PRESSAO_2P"
@@ -2785,6 +2794,152 @@ async def _processar_ht_moderado(m: Metricas) -> bool:
 
     return False
 
+
+
+
+# =========================================================
+# PROJETO BACIA DAS ALMAS — BCA_HT e BCA_FT
+# Filosofia: IP sustentado na janela final de cada tempo.
+# Não procura quem pressionou mais no jogo.
+# Procura quem está "morrendo atacando" nos minutos finais.
+# =========================================================
+
+def _bca_extrair_ip_janela(m: "Metricas", lado: str, min_inicio: int, min_fim: int) -> List[float]:
+    """Extrai os valores de IP do lado pressionante dentro da janela de interesse."""
+    if lado not in {"CASA", "FORA"}:
+        return []
+    idx = 0 if lado == "CASA" else 1
+    valores = []
+    # ip_sequencia: lista de tuplas (minuto, ip_casa, ip_fora)
+    for entrada in (m.ip_sequencia or []):
+        try:
+            minuto = int(entrada[0])
+            if min_inicio <= minuto <= min_fim:
+                valores.append(float(entrada[idx + 1]))
+        except Exception:
+            continue
+    return valores
+
+
+def _bca_ip_sustentado(valores_ip: List[float], limiar: float = 10.0) -> Tuple[bool, float, int]:
+    """Verifica se o IP se manteve acima do limiar na maior parte da janela.
+    Retorna (sustentado, media, minutos_acima_limiar)."""
+    if not valores_ip:
+        return False, 0.0, 0
+    acima = sum(1 for v in valores_ip if v >= limiar)
+    media = sum(valores_ip) / len(valores_ip)
+    # Sustentado = pelo menos 70% dos minutos da janela acima do limiar
+    sustentado = acima >= max(1, int(len(valores_ip) * 0.70))
+    return sustentado, media, acima
+
+
+def _bca_score(m: "Metricas", lado: str, min_inicio: int, min_fim: int) -> Tuple[int, str]:
+    """Calcula o score do Bacia das Almas com base no IP sustentado."""
+    valores = _bca_extrair_ip_janela(m, lado, min_inicio, min_fim)
+    d = dados_lado(m, lado)
+    ip = ip_lado(m, lado)
+
+    if not valores:
+        # Fallback: usar ip_lado quando ip_sequencia não disponível
+        media_ip = float(ip["pico"] + ip.get("c18", 0)) / 2
+        valores_fallback = True
+    else:
+        media_ip = sum(valores) / len(valores)
+        valores_fallback = False
+
+    sustentado, _, minutos_acima = _bca_ip_sustentado(valores, limiar=10.0) if valores else (media_ip >= 15, media_ip, 0)
+
+    score = 50  # base
+
+    # IP sustentado — critério central
+    if media_ip >= 25:
+        score += 40
+    elif media_ip >= 20:
+        score += 30
+    elif media_ip >= 15:
+        score += 20
+    elif media_ip >= 10:
+        score += 10
+
+    # Bonus por sustentação contínua
+    if sustentado:
+        score += 5
+
+    # Bonus por consequência real
+    if d["rb"] >= 2:
+        score += 5
+    if d["cantos"] >= 2:
+        score += 3
+    if d["chance"] >= 5:
+        score += 3
+    if d["xg"] >= 0.30:
+        score += 3
+    if d["u5"] >= 4:
+        score += 3
+
+    motivo = (
+        f"BCA_SCORE | media_ip={media_ip:.1f} sustentado={sustentado} "
+        f"min_acima={minutos_acima} rb={d['rb']} cantos={d['cantos']} "
+        f"chance={d['chance']} xg={d['xg']:.2f} u5={d['u5']} fallback={valores_fallback}"
+    )
+    return min(score, 99), motivo
+
+
+def filtro_bca(m: "Metricas", is_ht: bool) -> Tuple[bool, str]:
+    """Filtro exclusivo do Bacia das Almas.
+    HT: alerta chega no ~40', leitura foi 30-39'.
+    FT: alerta chega no ~85', leitura foi 75-84'.
+    """
+    # Trava 1: favorito não pode estar vencendo
+    if lado_vencendo(m) == m.lado_favorito:
+        return False, f"BCA_BLOQUEADO_FAVORITO_VENCENDO | placar={m.placar}"
+
+    # Trava 2: diferença máxima de 2 gols
+    diff = diferenca_placar(m)
+    if diff > 2:
+        return False, f"BCA_BLOQUEADO_DIFF_ACIMA_2 | diff={diff} placar={m.placar}"
+
+    # Trava 3: minuto esperado
+    tempo = int(m.tempo or 0)
+    if is_ht and not (37 <= tempo <= 44):
+        return False, f"BCA_HT_FORA_JANELA | tempo={tempo}"
+    if not is_ht and not (83 <= tempo <= 88):
+        return False, f"BCA_FT_FORA_JANELA | tempo={tempo}"
+
+    # Trava 4: lado pressionante identificado
+    lado = m.lado_pressionante
+    if lado not in {"CASA", "FORA"}:
+        return False, "BCA_SEM_LADO_PRESSIONANTE"
+
+    # Trava 5: IP mínimo — precisa ter alguma pressão
+    ip = ip_lado(m, lado)
+    if ip["pico"] < 10:
+        return False, f"BCA_IP_PICO_INSUFICIENTE | pico={ip['pico']}"
+
+    # Janelas de leitura
+    min_inicio = 29 if is_ht else 74
+    min_fim = 40 if is_ht else 85
+
+    score_bca, motivo_bca = _bca_score(m, lado, min_inicio, min_fim)
+    return True, f"BCA_PASSOU | score_bca={score_bca} | {motivo_bca}"
+
+
+async def _processar_bca(m: Metricas) -> bool:
+    """Processamento dos bots BCA_HT e BCA_FT."""
+    is_ht = m.estrategia == "BCA_HT"
+    ok, motivo = filtro_bca(m, is_ht=is_ht)
+
+    if not ok:
+        m.fluxo_decisao = "BCA_BLOQUEADO"
+        m.fluxo_motivo = motivo
+        log(f"⛔ BCA BLOQUEADO | {m.jogo} | {motivo}")
+        await registrar_bloqueio_fluxo(m, motivo, score=0)
+        return True
+
+    log(f"✅ BCA PASSOU FILTRO | {m.jogo} | {motivo}")
+    # Renomeia para ALFA_HT/ALFA_FT — entra no pipeline padrão
+    m.estrategia = "ALFA_HT" if is_ht else "ALFA_FT"
+    return False
 
 async def _processar_sniper_v2(m: Metricas) -> bool:
     if not eh_sniper_ft(m.estrategia):
@@ -3095,6 +3250,9 @@ async def processar_alerta(alerta: Alerta) -> None:
         return
 
     # 6. SNIPER V2 (Mudança 10: antes do V29)
+    if m.estrategia in {"BCA_HT", "BCA_FT"}:
+        if await _processar_bca(m):
+            return
     if await _processar_sniper_v2(m):
         return
 
@@ -3302,6 +3460,10 @@ def detectar_estrategia(texto: str) -> str:
     ):
         return "ALFA_FT_CONFIRMACAO"
 
+    if "BCAHT" in compacto or ("BACIA" in compacto and "HT" in compacto):
+        return "BCA_HT"
+    if "BCAFT" in compacto or ("BACIA" in compacto and "FT" in compacto):
+        return "BCA_FT"
     if "ARCEHT" in compacto or compacto == "ARCE":
         return "ARCE_HT"
     if "CHAMAFT" in compacto or compacto == "CHAMA":
@@ -3340,11 +3502,11 @@ def detectar_estrategia(texto: str) -> str:
 
 
 def eh_ht(estrategia: str) -> bool:
-    return estrategia in {"ALFA_HT", "ALFA_HT_CONFIRMACAO", "ARCE_HT"}
+    return estrategia in {"ALFA_HT", "ALFA_HT_CONFIRMACAO", "ARCE_HT", "BCA_HT"}
 
 
 def eh_ft(estrategia: str) -> bool:
-    return estrategia in {"ALFA_FT", "ALFA_FT_CONFIRMACAO", "CHAMA_FT", "VOLUME_FT", "SNIPER_FT"}
+    return estrategia in {"ALFA_FT", "ALFA_FT_CONFIRMACAO", "CHAMA_FT", "VOLUME_FT", "SNIPER_FT", "BCA_FT"}
 
 
 def eh_sniper_ft(estrategia: str) -> bool:
@@ -3468,14 +3630,14 @@ def massacre_contextual_ht(m: "Metricas", lado: str, pos_gol_recente: bool = Fal
 
     ap_diff = ap_diff_lado(m, lado)
     finalizacao = d["rb"] >= 1 or (d["rb"] + d["rl"]) >= 4 or d["chance"] >= 8 or d["xg"] >= 0.25
-    territorio = d["u5"] >= 5 and d["u10"] >= 10 and ap_diff >= 15
+    territorio = d["u5"] >= 4 and d["u10"] >= 10 and ap_diff >= 15  # T-A3: u5 5→4
     pressao_ip = ip["pico"] >= 22 or ip["c18"] >= 2 or ip["c22"] >= 1
     favorito_ok = (m.lado_favorito == lado) or (m.odd_favorito and m.odd_favorito <= 1.60)
 
-    if pos_gol_recente:
-        finalizacao = d["rb"] >= 2 or (d["rb"] + d["rl"]) >= 5 or d["chance"] >= 10 or d["xg"] >= 0.35
-        territorio = d["u5"] >= 6 and d["u10"] >= 12 and ap_diff >= 20
-        pressao_ip = ip["pico"] >= 24 or ip["c18"] >= 3 or ip["c22"] >= 1
+    if pos_gol_recente:  # T-A4: só finalização e IP sobem; território mantém U5=5 (não 6)
+        finalizacao = d["rb"] >= 2 or (d["rb"] + d["rl"]) >= 6 or d["chance"] >= 11 or d["xg"] >= 0.40
+        territorio = d["u5"] >= 5 and d["u10"] >= 12 and ap_diff >= 20
+        pressao_ip = ip["pico"] >= 26 or ip["c18"] >= 3 or ip["c22"] >= 1
 
     gol_cedo_zebra = bool(m.ultimo_gol and m.ultimo_gol < 10 and m.ultimo_gol_lado == m.lado_zebra and m.lado_favorito == lado)
     if gol_cedo_zebra:
@@ -4393,7 +4555,7 @@ def aplicar_travas_finais(m: Metricas, score: int) -> Tuple[int, str, bool]:
     if pressao_morta_lado(m, lado):
         return min(score, 74), "PRESSAO_MORTA", True
     if not consequencia_real_lado(m, lado):
-        if not (m.odd_favorito <= 1.30 and favorito_nao_vencendo(m) and pressao_extrema_lado(m, lado)):
+        if not (m.odd_favorito <= 1.45 and favorito_nao_vencendo(m) and pressao_extrema_lado(m, lado)):  # T-G3
             return min(score, 76), "SEM_CONSEQUENCIA_REAL", True
     d = dados_lado(m, lado)
     ip = ip_lado(m, lado)
@@ -4429,13 +4591,13 @@ def aplicar_teto_score_v9(m: Metricas, score: int, detalhes_funil: Optional[Dict
         and (d["rb"] >= 2 or d["rl"] >= 7 or d["chance"] >= 12)
         and (d["u10"] >= 7 or ip["pico"] >= 24 or ip["c18"] >= 2)
     )
-    elite_contextual = (
+    elite_contextual = (  # T-G8: AP 45→50, diff 18→22, u10 6→7
         m.lado_favorito == lado
         and favorito_nao_vencendo(m)
-        and d["ap"] >= 45
-        and ap_diff >= 18
-        and (d["u10"] >= 6 or ip["pico"] >= 22)
-        and (d["rb"] >= 1 or d["rl"] >= 5 or d["chance"] >= 9 or d["xg"] >= 0.45)
+        and d["ap"] >= 50
+        and ap_diff >= 22
+        and (d["u10"] >= 7 or ip["pico"] >= 23)
+        and (d["rb"] >= 1 or d["rl"] >= 5 or d["chance"] >= 10 or d["xg"] >= 0.45)
     )
     if massacre_extremo:
         return score, "SCORE_V9_LIBERADO_MASSACRE_EXTREMO"
@@ -4919,6 +5081,12 @@ def funil_obrigatorio_hibrido(m: Metricas) -> Tuple[bool, int, str, Dict[str, An
 
         if not consequencia and not (super_fav and extremo and consequencia_minima):
             return False, 78, "FUNIL_HT_SEM_CONSEQUENCIA_MINIMA", detalhes
+        # T-A6: bloquear perfil 1x0 + gol recente ≤ 5 min + odd ≥ 1.35
+        if (total_gols_placar(m) == 1 and diferenca_placar(m) == 1
+                and lado_vencendo(m) == m.lado_favorito
+                and m.ultimo_gol and minutos_desde_ultimo_gol(m) <= 5
+                and m.odd_favorito and m.odd_favorito >= 1.35):
+            return False, 80, f"ARCE_HT_BLOQUEIO_1X0_GOL_RECENTE_ODD | odd={m.odd_favorito} gol={m.ultimo_gol}'", detalhes
         return True, 100, "FUNIL_HT_PREMIUM_MASSACRE_APROVADO", detalhes
 
     cenario = classificar_cenario_ft(m)
@@ -6137,7 +6305,13 @@ def comparar_alertas_confirmacao(old: Metricas, novo: Metricas) -> Tuple[bool, s
 
     pressao_ok = pressao_viva_lado(novo, lado)
     consequencia_ok = consequencia_minima_emocional(novo, lado) or consequencia_real_lado(novo, lado)
-    if melhoras >= 3 and pressao_ok and consequencia_ok:
+    # T-CF5: ao menos 1 melhora deve ser em U5, U10 ou AP
+    melhoras_primarias = sum([
+        detalhes.get("delta_u5", 0) > 0,
+        detalhes.get("delta_u10", 0) > 0,
+        detalhes.get("delta_ap", 0) > 0,
+    ])
+    if melhoras >= 3 and pressao_ok and consequencia_ok and melhoras_primarias >= 1:
         return True, "CONFIRMACAO_MANTEVE_OU_MELHOROU_PRESSAO | " + " | ".join(partes), detalhes
 
     return False, "CONFIRMACAO_FRACA_SEM_MELHORA_SUFFICIENTE | " + " | ".join(partes), detalhes
@@ -6681,7 +6855,7 @@ def filtro_sniper_ft_v2(m: "Metricas") -> Tuple[bool, str]:
     # 1.40 + super favorito (91.7% acerto / 46.7% ROI histórico) — o código
     # ainda usava 1.60, mais solto que o que foi validado manualmente.
     # Flag pra rollback instantâneo se o aperto cortar volume demais.
-    odd_maxima_sniper = 1.40 if HABILITAR_SNIPER_PERFIL_140 else 1.60
+    odd_maxima_sniper = 1.50 if HABILITAR_SNIPER_PERFIL_140 else 1.65  # T-S2: 1.40→1.50
     if m.odd_favorito and m.odd_favorito > odd_maxima_sniper:
         return False, f"SNIPER_ODD_FAVORITO_ACIMA_{odd_maxima_sniper} | odd={m.odd_favorito}"
     if press != fav:
@@ -6699,7 +6873,7 @@ def filtro_sniper_ft_v2(m: "Metricas") -> Tuple[bool, str]:
 
     d = dados_lado(m, fav)
     ip = ip_lado(m, fav)
-    pressao_minima = d["u5"] >= 2 or d["u10"] >= 6 or ip["pico"] >= 20 or ip["c18"] >= 2 or ip["c22"] >= 1
+    pressao_minima = d["u5"] >= 3 or d["u10"] >= 6 or ip["pico"] >= 20 or ip["c18"] >= 2 or ip["c22"] >= 1  # T-S6: u5 2→3
     consequencia_minima = d["rb"] >= 1 or d["rl"] >= 3 or d["chance"] >= 8 or d["xg"] >= 0.25 or d["cantos"] >= 2
     if not pressao_minima:
         return False, f"SNIPER_SEM_PRESSAO_VIVA | u5={d['u5']} u10={d['u10']} ip={ip['pico']}"
@@ -6720,7 +6894,7 @@ def filtro_sniper_ft_v2(m: "Metricas") -> Tuple[bool, str]:
             provas += 1
         if ip["pico"] >= 22 or ip["c18"] >= 2:
             provas += 1
-        if provas < 3:
+        if provas < 2:  # T-S8: 3/4 → 2/4
             return False, f"SNIPER_PRESSAO_PREMIADA_SEM_NOVO_CICLO | provas={provas}/4 | {motivo_premiada} | {cont_motivo}"
 
     contra_fluxo, motivo_contra = sniper_gol_contra_fluxo(m)
@@ -6769,9 +6943,9 @@ def volume_ft_favorito_vencendo_extremo_v21(m: "Metricas") -> Tuple[bool, str]:
     recente_dominante = d["u5"] > od["u5"] and d["u10"] > od["u10"]
 
     if diff == 1:
-        pressao_absurda = (
+        pressao_absurda = (  # T-V3: U10 12→10
             d["u5"] >= 6
-            and d["u10"] >= 12
+            and d["u10"] >= 10
             and ap_diff >= 30
             and recente_dominante
             and (ip["pico"] >= 26 or ip["c18"] >= 3 or ip["c22"] >= 2)
@@ -6856,8 +7030,11 @@ def _volume_ft_pressao_viva(m: "Metricas") -> Tuple[bool, str]:
     u5_adv = m.ultimos5[1 - idx]
     if (u10_fav - u10_adv) < 4:
         return False, f"VOLUME_FT_U10_INSUFICIENTE | {u10_fav}x{u10_adv}"
-    if (u5_fav - u5_adv) < 2:
-        return False, f"VOLUME_FT_U5_INSUFICIENTE | {u5_fav}x{u5_adv}"
+    if (u5_fav - u5_adv) < 2:  # T-V6: exceção IP pico ≥ 26
+        ip_fav = ip_lado(m, lado)
+        if ip_fav["pico"] >= 26:
+            return True, f"VOLUME_FT_U5_COMPENSADO_IP | U10={u10_fav}x{u10_adv} U5={u5_fav}x{u5_adv} ip={ip_fav['pico']}"
+        return False, f"VOLUME_FT_U5_INSUFICIENTE | {u5_fav}x{u5_adv} ip={ip_fav['pico']}"
     return True, f"VOLUME_FT_PRESSAO_VIVA | U10={u10_fav}x{u10_adv} U5={u5_fav}x{u5_adv}"
 
 
@@ -6891,14 +7068,19 @@ def _volume_ft_remates(m: "Metricas") -> Tuple[bool, str]:
 
 
 def _volume_ft_chance_golo(m: "Metricas") -> Tuple[bool, str]:
+    """T-V8: chance_golo pode chegar zerado da CornerPro.
+    Quando zero, aceitar via xG>=0.45 ou RB>=3."""
     lado = m.lado_pressionante
     if lado not in {"CASA", "FORA"}:
         return False, "VOLUME_FT_SEM_LADO_PRESSIONANTE_CHANCE"
     idx = 0 if lado == "CASA" else 1
     chance = m.chance_golo[idx]
-    if chance < 8:
-        return False, f"VOLUME_FT_CHANCE_INSUFICIENTE | chance={chance}"
-    return True, f"VOLUME_FT_CHANCE_OK | chance={chance}"
+    d = dados_lado(m, lado)
+    if chance >= 8:
+        return True, f"VOLUME_FT_CHANCE_OK | chance={chance}"
+    if chance == 0 and (d["xg"] >= 0.45 or d["rb"] >= 3):
+        return True, f"VOLUME_FT_CHANCE_ZERO_COMPENSADO | xg={d['xg']:.2f} rb={d['rb']}"
+    return False, f"VOLUME_FT_CHANCE_INSUFICIENTE | chance={chance} xg={d['xg']:.2f} rb={d['rb']}"
 
 
 def _volume_ft_favorito_pressionando(m: "Metricas") -> Tuple[bool, str]:
