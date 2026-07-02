@@ -1500,54 +1500,84 @@ class CornerProProvider(BaseProvider):
             return None
 
     def _extrair_resultado_da_pagina(self, html: str) -> Dict[str, Any]:
-        """Concatena os fragmentos self.__next_f.push([1,"...]) e procura o
-        objeto 'game' dentro do texto já desescapado. Devolve status + scores
-        se conseguir; nunca inventa valor — se não achar com segurança,
-        devolve erro de parse e a cascata segue pro próximo provider.
+        """Parser com diagnóstico específico por causa raiz.
+        Auditor Fase 1 (02/07): parse_fail genérico substituído por
+        códigos específicos que indicam a causa real do problema."""
 
-        CORRIGIDO (30/06, achado pela auditoria do próprio dia 30/06):
-        a versão anterior usava .encode("utf-8").decode("unicode_escape"),
-        que trata bytes UTF-8 multibyte como se fossem Latin-1 — qualquer
-        acento (nome de time/liga com é, ã, ç, etc.) corrompia o texto e
-        o parser nunca mais achava o bloco 'game' a partir daquele ponto.
-        Por isso TODOS os jogos davam parse_fail, não só os com acento —
-        o fragmento inteiro concatenado ficava ilegível depois do primeiro
-        caractere acentuado. Corrigido usando json.loads na própria string
-        entre aspas, que desescapa \\", \\\\, \\n, \\uXXXX corretamente sem
-        tocar em caracteres literais (a forma certa de desescapar uma
-        string de literal JS/JSON que o Python já decodificou como texto).
-        """
-        fragmentos = re.findall(r'self\.__next_f\.push\(\[1,\s*"((?:[^"\\]|\\.)*)"\]\)', html)
-        if not fragmentos:
-            return {"error": "parse_fail", "detalhe": "nenhum fragmento __next_f encontrado"}
+        # DIAGNÓSTICO 1: HTML vazio
+        if not html or len(html.strip()) < 200:
+            return {"error": "HTML_EMPTY", "bytes": len(html or "")}
 
-        texto_completo = ""
-        for frag in fragmentos:
+        # DIAGNÓSTICO 2: página de login (sessão expirada)
+        if ('action="/login"' in html or
+                'name="_token"' in html and 'password' in html and 'game' not in html):
+            return {"error": "SESSION_EXPIRED", "diagnostico": "LOGIN_PAGE_DETECTADA"}
+
+        # DIAGNÓSTICO 3: Cloudflare / anti-bot
+        if 'cf-browser-verification' in html or 'cf_clearance' in html or 'Just a moment' in html:
+            return {"error": "CLOUDFLARE_BLOCK", "diagnostico": "ANTI_BOT_DETECTADO"}
+
+        # Extrai fragmentos Next.js
+        import re as _re
+        import json as _json
+
+        frags = _re.findall(r'self\.__next_f\.push\(\[1,\s*"((?:[^"\]|\.)*)"\]\)', html)
+
+        # DIAGNÓSTICO 4: Next.js não encontrado
+        if not frags:
+            return {"error": "NEXTJS_NOT_FOUND", "html_size": len(html)}
+
+        texto = ""
+        for frag in frags:
             try:
-                texto_completo += json.loads(f'"{frag}"')
+                texto += _json.loads(f'"{frag}"')
             except Exception:
-                texto_completo += frag
+                continue
 
-        game = self._extrair_json_apos_chave(texto_completo, "game")
-        if not isinstance(game, dict):
-            return {"error": "parse_fail", "detalhe": "bloco 'game' não encontrado/inválido"}
+        # DIAGNÓSTICO 5: JSON vazio após concatenação
+        if not texto.strip():
+            return {"error": "JSON_EMPTY_AFTER_CONCAT", "frags": len(frags)}
 
-        status = game.get("status")
-        scores = game.get("scores") or {}
+        # Tenta extrair objeto game
+        game = None
+        for pattern in [r'"game"\s*:\s*(\{.*?\})\s*,\s*"', r'"match"\s*:\s*(\{.*?\})\s*[,}]']:
+            try:
+                m_game = _re.search(pattern, texto, _re.DOTALL)
+                if m_game:
+                    game = _json.loads(m_game.group(1))
+                    break
+            except Exception:
+                continue
 
-        def _par(valor) -> Tuple[Optional[int], Optional[int]]:
-            """PRECAUÇÃO 5 (01/07): o CornerPro já retornou scores em pelo menos
-            4 formatos diferentes dependendo da liga e da versão da API Next.js.
-            Tenta todos os formatos conhecidos antes de desistir."""
+        # DIAGNÓSTICO 6: objeto game não encontrado
+        if not game:
+            return {"error": "GAME_OBJECT_NOT_FOUND", "texto_size": len(texto)}
+
+        # Extrai status e scores
+        status = game.get("status") or game.get("state")
+        scores = game.get("scores") or game.get("score")
+
+        # DIAGNÓSTICO 7: jogo não terminou
+        try:
+            status_int = int(status) if status is not None else 0
+        except Exception:
+            status_int = 0
+
+        if status_int != 3:
+            return {"error": "MATCH_NOT_FINISHED", "status_bruto": status}
+
+        # DIAGNÓSTICO 8: placar não encontrado
+        if not scores:
+            return {"error": "SCORE_NOT_FOUND", "status": status}
+
+        def _par(valor):
             if valor is None:
                 return None, None
-            # Formato 1: lista/tupla [home, away]
             if isinstance(valor, (list, tuple)) and len(valor) >= 2:
                 try:
                     return int(valor[0]), int(valor[1])
                 except Exception:
                     pass
-            # Formato 2: dict {"home": X, "away": Y}
             if isinstance(valor, dict):
                 try:
                     h = valor.get("home") or valor.get("homeScore") or valor.get("h")
@@ -1556,25 +1586,21 @@ class CornerProProvider(BaseProvider):
                         return int(h), int(a)
                 except Exception:
                     pass
-            # Formato 3: string "2-1" ou "2:1"
             if isinstance(valor, str):
                 for sep in ["-", ":", "x", "X"]:
                     if sep in valor:
                         try:
-                            partes = valor.split(sep)
-                            return int(partes[0].strip()), int(partes[1].strip())
+                            p = valor.split(sep)
+                            return int(p[0].strip()), int(p[1].strip())
                         except Exception:
                             pass
-            # Formato 4: número inteiro único (improvável mas defensivo)
-            if isinstance(valor, (int, float)):
-                return int(valor), 0
             return None, None
 
         ft_home, ft_away = _par(scores.get("FT") or scores.get("ft") or scores.get("fullTime"))
         ht_home, ht_away = _par(scores.get("HT") or scores.get("ht") or scores.get("halfTime"))
 
-        if status != 3 or ft_home is None:
-            return {"error": "not_finished", "status_bruto": status}
+        if ft_home is None:
+            return {"error": "SCORE_PARSE_FAILED", "scores_raw": str(scores)[:200]}
 
         return {
             "source": self.provider_name,
@@ -1584,6 +1610,7 @@ class CornerProProvider(BaseProvider):
             "ht_score_away": ht_away,
             "status": "finished",
         }
+
 
     def get_match_result(self, match_id: str, fixture_id: str = None,
                           match_context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
