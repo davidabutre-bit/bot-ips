@@ -63,7 +63,7 @@ except Exception:  # pragma: no cover
 # VERSÃO / CONFIGURAÇÃO BASE
 # =========================================================
 
-VERSAO_COUTIPS = "ALFA_COUTIPS_2026_07_02_V016"
+VERSAO_COUTIPS = "ALFA_COUTIPS_2026_07_02_V018"
 
 load_dotenv()
 
@@ -2643,6 +2643,9 @@ def marcar_enviado(chave: str, m: Metricas, score: int) -> None:
 
 
 def destino_principal(m: Metricas, score_medio: int) -> str:
+    # BCA_HT e BCA_FT vão para o canal do pré-live (operador)
+    if getattr(m, "_bca_canal_prelive", False) and CANAL_MULTIPLAS_PRELIVE:
+        return CANAL_MULTIPLAS_PRELIVE
     return COMPLETE_CHANNEL
 
 
@@ -2834,38 +2837,58 @@ def _bca_ip_sustentado(valores_ip: List[float], limiar: float = 10.0) -> Tuple[b
 
 
 def _bca_score(m: "Metricas", lado: str, min_inicio: int, min_fim: int) -> Tuple[int, str]:
-    """Calcula o score do Bacia das Almas com base no IP sustentado."""
-    valores = _bca_extrair_ip_janela(m, lado, min_inicio, min_fim)
+    """Calcula o score do Bacia das Almas.
+    Cruza: IP médio do jogo todo + IP dos últimos 10 min (sequência) + consequência.
+    """
+    suf = "casa" if lado == "CASA" else "fora"
     d = dados_lado(m, lado)
     ip = ip_lado(m, lado)
 
-    if not valores:
-        # Fallback: usar ip_lado quando ip_sequencia não disponível
-        media_ip = float(ip["pico"] + ip.get("c18", 0)) / 2
-        valores_fallback = True
+    # Média do IP durante todo o tempo (campo "Média Indíce Pressão" da CornerPro)
+    media_ip_jogo = float(m.pressao_alfa.get(f"ip_media_{suf}", 0))
+
+    # IP dos últimos 10 minutos (sequência da janela)
+    valores_janela = _bca_extrair_ip_janela(m, lado, min_inicio, min_fim)
+    if valores_janela:
+        media_ip_recente = sum(valores_janela) / len(valores_janela)
+        pico_recente = max(valores_janela)
     else:
-        media_ip = sum(valores) / len(valores)
-        valores_fallback = False
+        media_ip_recente = ip["pico"]
+        pico_recente = ip["pico"]
 
-    sustentado, _, minutos_acima = _bca_ip_sustentado(valores, limiar=10.0) if valores else (media_ip >= 15, media_ip, 0)
+    sustentado, _, minutos_acima = _bca_ip_sustentado(valores_janela, limiar=10.0) if valores_janela else (media_ip_recente >= 15, media_ip_recente, 0)
 
-    score = 50  # base
+    # Score base: cruza média geral com recente
+    # Se o time pressionou o jogo todo E continua agora = confirmação de domínio real
+    score = 45
 
-    # IP sustentado — critério central
-    if media_ip >= 25:
-        score += 40
-    elif media_ip >= 20:
-        score += 30
-    elif media_ip >= 15:
-        score += 20
-    elif media_ip >= 10:
+    # Média geral (mostra se é domínio estrutural ou explosão pontual)
+    if media_ip_jogo >= 20:
+        score += 10
+    elif media_ip_jogo >= 15:
+        score += 7
+    elif media_ip_jogo >= 10:
+        score += 4
+
+    # IP recente (últimos 10 min) — critério central
+    if media_ip_recente >= 25:
+        score += 35
+    elif media_ip_recente >= 20:
+        score += 27
+    elif media_ip_recente >= 15:
+        score += 18
+    elif media_ip_recente >= 10:
         score += 10
 
-    # Bonus por sustentação contínua
+    # Pico recente alto confirma explosão ofensiva
+    if pico_recente >= 25:
+        score += 5
+
+    # Sustentação contínua na janela
     if sustentado:
         score += 5
 
-    # Bonus por consequência real
+    # Consequência real (secundária — não aprova sozinha)
     if d["rb"] >= 2:
         score += 5
     if d["cantos"] >= 2:
@@ -2878,9 +2901,9 @@ def _bca_score(m: "Metricas", lado: str, min_inicio: int, min_fim: int) -> Tuple
         score += 3
 
     motivo = (
-        f"BCA_SCORE | media_ip={media_ip:.1f} sustentado={sustentado} "
-        f"min_acima={minutos_acima} rb={d['rb']} cantos={d['cantos']} "
-        f"chance={d['chance']} xg={d['xg']:.2f} u5={d['u5']} fallback={valores_fallback}"
+        f"BCA_SCORE | media_jogo={media_ip_jogo:.1f} media_recente={media_ip_recente:.1f} "
+        f"pico_recente={pico_recente:.1f} sustentado={sustentado} min_acima={minutos_acima} "
+        f"rb={d['rb']} cantos={d['cantos']} chance={d['chance']} xg={d['xg']:.2f} u5={d['u5']}"
     )
     return min(score, 99), motivo
 
@@ -2937,7 +2960,10 @@ async def _processar_bca(m: Metricas) -> bool:
         return True
 
     log(f"✅ BCA PASSOU FILTRO | {m.jogo} | {motivo}")
-    # Renomeia para ALFA_HT/ALFA_FT — entra no pipeline padrão
+    # BCA aprovado vai para CANAL_MULTIPLAS_PRELIVE (canal do operador)
+    # Marca o canal de destino antes de renomear a estratégia
+    m._bca_canal_prelive = True
+    # Renomeia para ALFA_HT/ALFA_FT — entra no pipeline padrão de score + IA
     m.estrategia = "ALFA_HT" if is_ht else "ALFA_FT"
     return False
 
@@ -3809,12 +3835,22 @@ def extrair_pressao_alfa(texto: str) -> Dict[str, float]:
     casa_vals: List[float] = []
     fora_vals: List[float] = []
 
-    for seg in re.split(r"[;|,]", bloco):
+    segmentos = re.split(r"[;|]", bloco)
+
+    # O primeiro segmento sempre é o cabeçalho: "minuto,flag1,flag2,flag3"
+    # Tem 4 números — não é IP. Pular sempre o primeiro segmento.
+    # Os demais têm exatamente 2 números (ip_casa, ip_fora).
+    for seg in segmentos[1:]:
         nums = re.findall(r"\d+(?:[.,]\d+)?", seg)
         if len(nums) == 2:
             try:
-                casa_vals.append(float(nums[0].replace(",", ".")))
-                fora_vals.append(float(nums[1].replace(",", ".")))
+                v1 = float(nums[0].replace(",", "."))
+                v2 = float(nums[1].replace(",", "."))
+                # Ignora o último par que é sempre "0,1" ou "1,0" (flag de encerramento)
+                if (v1 == 0 and v2 <= 1) or (v1 <= 1 and v2 == 0):
+                    continue
+                casa_vals.append(v1)
+                fora_vals.append(v2)
             except Exception:
                 continue
 
